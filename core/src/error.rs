@@ -33,6 +33,13 @@ pub enum Error {
     #[error("output could not be written: {0}")]
     Io(#[source] io::Error),
 
+    /// A HEIF container this build could not read. Distinct from
+    /// `UnknownFormat` because the file is a real image and we know exactly what
+    /// it is — we are the limitation, and saying so is the whole difference
+    /// between "this file is broken" and "we cannot read this one yet".
+    #[error("{0}")]
+    Heic(#[from] crate::heic::HeicError),
+
     #[error("metadata could not be parsed: {0}")]
     Metadata(#[from] exif::Error),
 

@@ -1,0 +1,159 @@
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 853a3f1..3394307 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -14,7 +14,15 @@ enum OutputFormat {
+   tiff,
+   bmp,
+   ico,
+-  avif;
++  avif,
++
++  /// Read-only formats. The engine recognises them on input and refuses to
++  /// write them, so they appear in a `detectedFormat` and never in a request.
++  ///
++  /// `fromJson` throws on an unknown name, so a format the engine reports that
++  /// is missing here is a crash in the app, not a fallback.
++  heic,
++  heif;
+ 
+   String toJson() => name;
+ 
+@@ -395,6 +403,7 @@ final class Capabilities {
+     required this.version,
+     required this.webpLossy,
+     required this.avifEncode,
++    required this.heicDecode,
+     required this.maxInputBytes,
+     required this.maxPixels,
+   });
+@@ -402,6 +411,12 @@ final class Capabilities {
+   final String version;
+   final bool webpLossy;
+   final bool avifEncode;
++
++  /// Whether HEVC-coded HEIC/HEIF can be read. False means the build refuses
++  /// iPhone photos, so the picker has to say so before the user chooses one —
++  /// not after the export fails. Separate from [avifEncode] because reading and
++  /// writing are different questions.
++  final bool heicDecode;
+   final int maxInputBytes;
+   final int maxPixels;
+ 
+@@ -411,6 +426,7 @@ final class Capabilities {
+       version: json['version'] as String,
+       webpLossy: caps['webp_lossy'] as bool,
+       avifEncode: caps['avif_encode'] as bool,
++      heicDecode: caps['heic_decode'] as bool,
+       maxInputBytes: (caps['max_input_bytes'] as num).toInt(),
+       maxPixels: (caps['max_pixels'] as num).toInt(),
+     );
+diff --git a/test/ffi_contract_test.dart b/test/ffi_contract_test.dart
+index b754f98..01256e9 100644
+--- a/test/ffi_contract_test.dart
++++ b/test/ffi_contract_test.dart
+@@ -1,9 +1,11 @@
++import 'dart:convert';
+ import 'dart:ffi' as ffi;
+ import 'dart:io';
+ 
+ import 'package:ffi/ffi.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/bindings.dart';
++import 'package:shrinkray/rust/models.dart';
+ 
+ /// The contract test: every `px_*` function the engine exports must have a
+ /// matching Dart declaration, and the `PxBuffer` layout must match byte for
+@@ -25,6 +27,36 @@ void main() {
+     expect(ffi.sizeOf<PxBuffer>(), 32);
+   });
+ 
++  test('the capability list parses through the Dart model', () {
++    // `Capabilities.fromJson` reads every field with a cast, so a field the
++    // engine and the model disagree about throws on this line instead of
++    // quietly reading as absent in the UI. The engine sends `heic_decode`;
++    // without it in the model this test fails rather than passing.
++    final lib = _tryLoad();
++    if (lib == null) {
++      markTestSkipped(
++        'native library not built — run the native build first (see README.md)',
++      );
++      return;
++    }
++    final px = PxBindings(lib);
++    final buffer = px.version();
++    try {
++      final json =
++          jsonDecode(
++                utf8.decode(
++                  buffer.data.cast<ffi.Uint8>().asTypedList(buffer.len),
++                ),
++              )
++              as Map<String, Object?>;
++      final caps = Capabilities.fromJson(json);
++      expect(caps.maxPixels, greaterThan(0));
++      expect(caps.maxInputBytes, greaterThan(0));
++    } finally {
++      px.bufferFree(buffer);
++    }
++  });
++
+   test('every px_* function resolves in the native library', () {
+     final lib = _tryLoad();
+     if (lib == null) {
+diff --git a/test/models_test.dart b/test/models_test.dart
+index 949c83d..8f4162f 100644
+--- a/test/models_test.dart
++++ b/test/models_test.dart
+@@ -12,6 +12,8 @@ void main() {
+       expect(OutputFormat.bmp.toJson(), 'bmp');
+       expect(OutputFormat.ico.toJson(), 'ico');
+       expect(OutputFormat.avif.toJson(), 'avif');
++      expect(OutputFormat.heic.toJson(), 'heic');
++      expect(OutputFormat.heif.toJson(), 'heif');
+     });
+ 
+     test('round-trips every value', () {
+@@ -21,6 +23,42 @@ void main() {
+     });
+   });
+ 
++  group('Capabilities', () {
++    test('reads the snake_case keys the engine sends', () {
++      final caps = Capabilities.fromJson({
++        'version': '0.1.0',
++        'capabilities': {
++          'webp_lossy': false,
++          'avif_encode': false,
++          'heic_decode': true,
++          'max_input_bytes': 134217728,
++          'max_pixels': 40000000,
++        },
++      });
++      expect(caps.heicDecode, isTrue);
++      expect(caps.webpLossy, isFalse);
++      expect(caps.maxInputBytes, 134217728);
++      expect(caps.maxPixels, 40000000);
++    });
++
++    test('a missing field is an error, not a default', () {
++      // Silently reading a capability as absent is how a build that cannot open
++      // an iPhone photo ends up offering to.
++      expect(
++        () => Capabilities.fromJson({
++          'version': '0.1.0',
++          'capabilities': {
++            'webp_lossy': false,
++            'avif_encode': false,
++            'max_input_bytes': 1,
++            'max_pixels': 1,
++          },
++        }),
++        throwsA(isA<TypeError>()),
++      );
++    });
++  });
++
+   group('FitMode', () {
+     test('serialises snake_case, matching the Rust serde convention', () {
+       expect(FitMode.contain.toJson(), 'contain');

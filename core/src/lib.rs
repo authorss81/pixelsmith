@@ -12,6 +12,7 @@ pub mod exif;
 pub mod ffi;
 pub mod ffi_abi;
 pub mod format;
+pub mod heic;
 pub mod pipeline;
 pub mod presets;
 pub mod target;
@@ -39,6 +40,10 @@ pub struct Capabilities {
     pub webp_lossy: bool,
     pub webp_lossless: bool,
     pub avif_encode: bool,
+    /// Whether HEVC-coded HEIC/HEIF can be *read*. Separate from the encode
+    /// flags above because the two directions answer different questions, and a
+    /// user with an iPhone photo only ever asks the first one.
+    pub heic_decode: bool,
     pub gif: bool,
     pub tiff: bool,
     pub bmp: bool,
@@ -60,6 +65,11 @@ pub fn capabilities() -> Capabilities {
         // `format::encode` rejects it explicitly. phase-07 adds the encoder and
         // turns this into a real flag.
         avif_encode: false,
+        // A `cfg!`, not a constant: HEIC decode is real but opt-in until
+        // phase-08 has built it for every shipped target. A `cfg!` rather than a
+        // probe of the codec, so the flag cannot lie about a decoder that is
+        // present but broken.
+        heic_decode: cfg!(feature = "heic"),
         gif: true,
         tiff: true,
         bmp: true,
@@ -108,11 +118,22 @@ pub fn process(
 
 /// Decode with all limits enforced.
 pub fn decode_bounded(input: &[u8], limits: &Limits) -> Result<image::DynamicImage> {
-    validate::validate_bytes(input, limits)?;
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(input)).with_guessed_format()?;
-    limits.apply_to_decoder(&mut reader);
-    let img = reader.decode()?;
-    limits.check_decoded(&img)?;
+    let format = validate::validate_bytes(input, limits)?.format;
+    let img = match format {
+        // A HEIF file's geometry is in a container box, so the decoder that
+        // understands the container is also the one that enforces the limits.
+        // Routing by the format `detect_format` already reported keeps this from
+        // parsing the file twice.
+        OutputFormat::Heic | OutputFormat::Heif => heic::decode(input, limits)?,
+        _ => {
+            let mut reader =
+                image::ImageReader::new(std::io::Cursor::new(input)).with_guessed_format()?;
+            limits.apply_to_decoder(&mut reader);
+            let img = reader.decode()?;
+            limits.check_decoded(&img)?;
+            img
+        }
+    };
     Ok(img)
 }
 
@@ -134,6 +155,7 @@ mod tests {
         let caps = capabilities();
         assert!(caps.jpeg && caps.png && caps.webp_lossless);
         assert_eq!(caps.webp_lossy, cfg!(feature = "webp-lossy"));
+        assert_eq!(caps.heic_decode, cfg!(feature = "heic"));
         assert!(caps.max_pixels > 0 && caps.max_input_bytes > 0);
     }
 

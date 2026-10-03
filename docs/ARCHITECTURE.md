@@ -9,16 +9,17 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Eleven modules, no submodules, no circular references. Dependencies point downward:
-`lib.rs` → `worker.rs` / `pipeline.rs` → `validate.rs` → `error.rs`. Nothing
-below `error.rs` knows anything exists above it.
+Twelve modules, no submodules, no circular references. Dependencies point downward:
+`lib.rs` → `worker.rs` / `pipeline.rs` → `validate.rs` / `heic.rs` → `error.rs`.
+Nothing below `error.rs` knows anything exists above it.
 
 | Module | Owns | Key types |
 | --- | --- | --- |
 | `core/src/lib.rs` | The crate root: the re-export surface, the honest capability list, and the four functions that make up the plain-Rust API (decode, transform, encode, encode-to-target). | `Capabilities`, `capabilities()`, `process()`, `decode_bounded()`, `encode_fixed()`, `encode_to_target()` |
 | `core/src/error.rs` | Every failure mode in the engine, as one enum, plus the `Result<T>` alias. Nothing unwinds out of a public entry point, so a malformed file cannot take down the host process. | `Error`, `Result<T>` |
 | `core/src/format.rs` | What a format *is*: the `OutputFormat` enum, magic-byte detection, the encode dispatch, JPEG APP1 splicing, and output-capacity estimation. Reading is broader than writing, which is normal. | `OutputFormat`, `detect_format()`, `encode()`, `append_exif()` |
-| `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
+| `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
+| `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
@@ -36,6 +37,7 @@ and a one-off result cannot drift apart.
 ```
 bytes off disk
   → validate::validate_bytes   input size, magic bytes, header dimensions
+                              (heic::header for HEIF, image header otherwise)
   → lib::decode_bounded        decoder limits applied, then decode, then re-check
   → pipeline::Pipeline::apply  crop → orient → resize (one resampling pass)
   → exif::strip                re-encode from raw samples (drops EXIF for real)
@@ -85,8 +87,8 @@ enforcement points, in the order a file meets them:
 | 1 | `validate::validate_bytes` (`validate.rs:112`) | `input.len() > max_input_bytes` before any parsing. |
 | 2 | `validate::validate_bytes` → `format::detect_format` | Bytes that are not an image at all. |
 | 3 | `Limits::apply_to_decoder` (`validate.rs:46`) | Pushes `image::Limits` into the reader *before* decode: `max_image_width`/`max_image_height` = `max_dimension`, `max_alloc` = `max_pixels × 4`. This is the point that stops a 60000×60000 header, which costs ~14 GB once decoded. |
-| 4 | `reader.into_dimensions()` in `validate_bytes` | Reads the header only — no pixel buffer exists yet — and records a human-readable `suspicious` note when dimensions or pixel count are over budget. |
-| 5 | `lib::decode_bounded` → `Limits::check_decoded` (`validate.rs:68`) | Post-decode assertion, for headers that lied about their size. Zero dimensions are rejected here too. |
+| 4 | `reader.into_dimensions()` in `validate_bytes`, or `heic::header` for a HEIF | Reads the header only — no pixel buffer exists yet — and records a human-readable `suspicious` note when dimensions or pixel count are over budget. A HEIF states its geometry in an `ispe` property box that no image decoder reads, so `heic::header` is the header read for that format, and it is the only place the HEIC limit can be enforced before the codec allocates. |
+| 5 | `lib::decode_bounded` → `Limits::check_decoded` (`validate.rs:68`), or `heic::decode`'s `Limits::check_header` | Post-decode assertion, for headers that lied about their size. Zero dimensions are rejected here too. |
 | 6 | `worker::process_one` (`worker.rs:134`) | Runs 1–5 for every file, so the batch path cannot skip what the single-file path enforces. |
 | 7 | `ffi::px_inspect` (`ffi.rs:177`) | Selects `Limits::mobile()` when Dart passes `mobile_limits = true`. |
 | 8 | `pipeline::Pipeline::output_dimensions` | Rejects a crop rectangle that runs past the source edges, before the UI predicts a size for it. |
@@ -95,6 +97,15 @@ Steps 1–4 are cheap and run on a whole folder before the user commits to
 anything; step 5 is the belt to step 3's braces.
 
 ## Metadata
+
+A HEIF file keeps its metadata in a *separate container item*, referenced from
+the picture by a `cdsc` relation — not in a JPEG APP1 segment and not in a PNG
+chunk. `exif::read` cannot see one, so `heic::header` reports `has_exif` from
+the container and `validate_bytes` uses it, or the UI would tell a user their
+iPhone photo carries no metadata while a GPS fix is sitting in the file. Reading
+the tags themselves is phase-12 work; until then they are neither read nor
+written back, which means they are also not carried through, because the pipeline
+re-encodes from raw samples.
 
 `exif::strip` strips by **re-encoding from raw samples** — it builds a fresh
 `RgbaImage` and drops the original container — not by clearing tags. Clearing
@@ -120,6 +131,20 @@ and is documented as untrusted until `detect_format` agrees. A file called
 enum because it is recognised on input, and `format::encode` rejects it with
 `Error::UnsupportedFormat`. What the build can actually write is
 `lib::capabilities()`, which is what the UI greys out.
+
+**HEIF is detected by reading the container, not by asking a codec.** `image`
+has no HEIF sniffer, so `detect_format` falls back to `heic::detect`, which
+parses the `ftyp` box's major brand and then its compatible brands. That
+fallback is deliberately *not* behind the `heic` feature: a build without the
+codec should still be able to say "this is a HEIC" before it says "this build
+cannot open it", which is a more useful thing to tell a user than "unknown
+format". `Avif` is reachable from the same fallback, so an AV1-coded file in a
+HEIF container is named rather than misreported — `image`'s sniffer only claims
+`ftypavif`, and a file may be stamped `mif1` with `avif` in its compatible list.
+
+Three formats are read-only: `Avif`, `Heic` and `Heif`. `is_read_only()` is the
+flag the UI reads, and a test asserts it against `format::encode` so the two
+cannot drift into a format the UI offers and the encoder refuses.
 
 ## The FFI boundary
 
@@ -173,10 +198,13 @@ Buffer ownership, in full:
 | Flag | Default | Effect |
 | --- | --- | --- |
 | `webp-lossy` | off | Swaps in the `webp` crate (libwebp) for lossy WebP. Off by default so the pure-Rust build needs no C toolchain and compiles fast in CI; with it off, WebP output is lossless. |
+| `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default until phase-08 has cross-compiled it for all four shipped targets; CI builds it on every run because CI uses `--all-features`. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
 `default = []`. `lib::capabilities()` is generated from these flags, so adding a
 codec means adding a flag *and* a field there — a capability the UI cannot see
-is a capability the UI will offer and then fail at export time.
+is a capability the UI will offer and then fail at export time. The HEIC flag is
+`heic_decode`, deliberately not an encode flag: the engine can read HEIC and
+cannot write it, and one boolean cannot honestly say both.
 
 ## Gotchas
 
@@ -251,6 +279,24 @@ named so you can check the handling rather than re-derive it.
     path, not the working directory, so a library in `app/src/rust/` is invisible
     to it and the FFI tests skip themselves — green, and checking nothing. The
     gate now exports `LD_LIBRARY_PATH` and fails if any test skipped.
+14. **A HEIF file's dimensions are in a container box, and `Limits` is only real
+    if something reads it before the codec allocates.** `image::ImageReader` is
+    the header read for every other format, and a HEIF cannot go through it: its
+    geometry is in an `ispe` property inside `iprp`, which no image decoder
+    looks at. Without the separate `heic::header` step, a 60000×60000 `ispe`
+    would be enforced *after* `heic_rs::decode` had allocated for it — and the
+    codec's own ceiling (256 MP) is far above `Limits::mobile()`'s 40 MP, so the
+    engine's bound would be the only thing standing between a phone and an OOM.
+    That is also why `Limits::check_header` exists separately from
+    `check_decoded`. Handled in `core/src/heic.rs` (`decode`) and
+    `core/src/validate.rs` (`check_header`).
+15. **`ftyp` brand detection must not sit behind the `heic` feature.** Gating it
+    would make a build without the decoder call an iPhone photo "unknown format"
+    instead of "a HEIC this build cannot open", which is the less useful of two
+    true statements, and hard rule 9 asks for the useful one. The same applies to
+    reporting `OutputFormat::Avif` for an AV1-coded HEIF: naming a format is not
+    the same as being able to read it. Handled in `core/src/heic.rs` (`detect`,
+    which has no `cfg` on it) and `core/src/format.rs` (`detect_format`).
 
 ## Verification
 

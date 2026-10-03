@@ -42,15 +42,40 @@ default = []
 # toolchain requirement and stays fast to compile in CI; WebP output then falls
 # back to the lossless encoder, which still beats PNG for photographs.
 webp-lossy = ["dep:webp"]
+# HEIC/HEIF decode, the format an iPhone actually photographs in. Off by
+# default until phase-08 has built it for all four shipped targets: an opt-in
+# feature that has never been cross-compiled is a promise nobody has checked,
+# and the engine is more useful with a HEIC photo than with one fewer row in
+# the capability list. See docs/HEIC.md for the comparison this choice rests on.
+#
+# `default-features = false` with only `std`: the `parallel` feature would give
+# heic-rs its own rayon pool, and the engine already owns a rayon pool for the
+# batch path. Decoding inside one of our own rayon workers would either nest
+# pools or oversubscribe the machine, so the codec stays serial per file and
+# parallelism stays where it belongs: across files.
+heic = ["dep:heic-rs"]
 
 [dependencies.webp]
 version = "0.3"
 optional = true
 
+[dependencies.heic-rs]
+version = "0.1.1"
+optional = true
+default-features = false
+features = ["std"]
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# The same crate as the dependency above, plus `bench`, which is what publishes
+# `heic_rs::hevc::synth`. That module builds complete HEVC bitstreams bit by bit,
+# so the HEIC fixtures in `core/src/heic.rs`'s tests are generated rather than
+# committed: no binary blobs in the repository, and no third-party photograph
+# whose licence we would have to reason about. A dev-dependency's features are
+# not unified into a plain `cargo build --release`, so nothing here reaches the
+# shipped library.
+heic-rs = { version = "0.1.1", default-features = false, features = ["std", "bench"] }
 
 [profile.release]
 opt-level = 3

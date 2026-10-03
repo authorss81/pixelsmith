@@ -60,6 +60,21 @@ impl Limits {
         if w == 0 || h == 0 {
             return Err(Error::ZeroDimension);
         }
+        self.check_header(w, h)
+    }
+
+    /// The same bounds, applied to a size read out of a *header* rather than
+    /// after a decode.
+    ///
+    /// Split out from [`Limits::check_decoded`] because two formats state their
+    /// geometry somewhere an image decoder cannot reach: a HEIF file keeps it in
+    /// an `ispe` property box, and reading it costs nothing while decoding costs
+    /// the whole picture. A limit that only exists after the decode is not a
+    /// limit; this is where a decompression bomb is actually stopped.
+    pub fn check_header(&self, w: u32, h: u32) -> Result<()> {
+        if w == 0 || h == 0 {
+            return Err(Error::ZeroDimension);
+        }
         if w > self.max_dimension || h > self.max_dimension {
             return Err(Error::SuspiciousDimensions {
                 w,
@@ -121,9 +136,25 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
     }
     let format = crate::format::detect_format(input)?;
 
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(input)).with_guessed_format()?;
-    limits.apply_to_decoder(&mut reader);
-    let (w, h) = reader.into_dimensions()?;
+    // A HEIF file states its geometry in an `ispe` property box, which no image
+    // decoder reads, so the container is asked instead. Read once: the answer
+    // serves the dimensions *and* the metadata report below.
+    let heif_header = match format {
+        crate::format::OutputFormat::Heic | crate::format::OutputFormat::Heif => {
+            Some(crate::heic::header(input)?)
+        }
+        _ => None,
+    };
+
+    let (w, h) = match &heif_header {
+        Some(header) => (header.width, header.height),
+        None => {
+            let mut reader =
+                image::ImageReader::new(std::io::Cursor::new(input)).with_guessed_format()?;
+            limits.apply_to_decoder(&mut reader);
+            reader.into_dimensions()?
+        }
+    };
 
     let suspicious = if w > limits.max_dimension || h > limits.max_dimension {
         Some(format!(
@@ -141,13 +172,18 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
     };
 
     let exif = crate::exif::read(input).unwrap_or_default();
+    // A HEIF file keeps its EXIF in a separate item, so `exif::read` cannot see
+    // it. Asking the container is what keeps the report honest: a photo with a
+    // GPS fix in it must not be reported as carrying no metadata, or the app
+    // tells the user there is nothing to strip.
+    let heif_exif = heif_header.is_some_and(|header| header.has_exif);
 
     Ok(ValidateReport {
         format,
         width: w,
         height: h,
         megapixels: megapixels(w, h),
-        has_exif: !exif.entries.is_empty(),
+        has_exif: !exif.entries.is_empty() || heif_exif,
         has_animated: format.supports_animation() && count_frames(input, format) > 1,
         sensitive_tags: exif.sensitive_tags.clone(),
         orientation: exif.orientation,

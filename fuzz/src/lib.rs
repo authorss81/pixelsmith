@@ -274,6 +274,10 @@ pub fn seed_magic(format: OutputFormat, tail: &[u8]) -> Vec<u8> {
         // Recognised on input, no decoder wired up in this build. There is no
         // target for it, because there is nothing to reach.
         OutputFormat::Avif => b"".to_vec(),
+        // Same story: recognised by `ftyp` brand bytes, and only decodable
+        // behind the `heic` feature, which this crate does not enable. `ftyp`
+        // would be the header, but there is no code behind it to reach.
+        OutputFormat::Heic | OutputFormat::Heif => b"".to_vec(),
     }
 }
 

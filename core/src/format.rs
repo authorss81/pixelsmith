@@ -14,9 +14,15 @@ pub enum OutputFormat {
     Tiff,
     Bmp,
     Ico,
-    /// Recognised on input. Encoding needs `ravif`, which is a heavy build and
+    /// Recognised on input. Encoding needs `rav1`, which is a heavy build and
     /// is therefore opt-in via the `avif` feature.
     Avif,
+    /// HEVC-coded HEIF, the ordinary iPhone photograph. Read-only: recognised,
+    /// bounded, decoded behind the `heic` feature, and never written.
+    Heic,
+    /// The generic HEIF brand (`mif1`), for a still image coded some other way.
+    /// Read-only, and refused by name rather than by "damaged file".
+    Heif,
 }
 
 impl OutputFormat {
@@ -30,6 +36,8 @@ impl OutputFormat {
             Self::Bmp => "bmp",
             Self::Ico => "ico",
             Self::Avif => "avif",
+            Self::Heic => "heic",
+            Self::Heif => "heif",
         }
     }
 
@@ -43,6 +51,8 @@ impl OutputFormat {
             Self::Bmp => "image/bmp",
             Self::Ico => "image/x-icon",
             Self::Avif => "image/avif",
+            Self::Heic => "image/heic",
+            Self::Heif => "image/heif",
         }
     }
 
@@ -54,14 +64,25 @@ impl OutputFormat {
             // GIF is palette-quantised, and the `image` encoder emits a single
             // full-colour frame, so quality has no meaningful effect.
             Self::Gif | Self::Png | Self::Bmp | Self::Tiff | Self::Ico | Self::Avif => true,
+            // Read-only: there is no encoder to hand a quality to.
+            Self::Heic | Self::Heif => true,
         }
     }
 
+    /// True when this build can write the format at all.
+    ///
+    /// The distinction matters in two directions. A read-only format must not be
+    /// offered as an export target, because the user would discover it at save
+    /// time; and it must still be reported when *reading*, because "we can open
+    /// your iPhone photo and convert it to JPEG" is the product's headline
+    /// capability. Hard rule 10 is about not promising the first, not about
+    /// hiding the second.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::Avif | Self::Heic | Self::Heif)
+    }
+
     pub fn supports_alpha(self) -> bool {
-        matches!(
-            self,
-            Self::Png | Self::WebP | Self::Gif | Self::Ico | Self::Avif
-        )
+        matches!(self, Self::Png | Self::WebP | Self::Gif | Self::Ico)
     }
 
     pub fn supports_animation(self) -> bool {
@@ -94,6 +115,12 @@ impl OutputFormat {
             "bmp" => Self::Bmp,
             "ico" => Self::Ico,
             "avif" => Self::Avif,
+            "heic" => Self::Heic,
+            // `heif` is the container, not a codec: a `.heif` file is a HEIF whose
+            // still image may be HEVC, AV1 or something else. It gets its own
+            // variant so the UI never tells a user their file is a .heic when
+            // they can see it is not.
+            "heif" => Self::Heif,
             _ => return None,
         })
     }
@@ -108,6 +135,8 @@ impl OutputFormat {
             Self::Bmp,
             Self::Ico,
             Self::Avif,
+            Self::Heic,
+            Self::Heif,
         ]
     }
 }
@@ -132,17 +161,21 @@ const fn lossy_webp_enabled() -> bool {
 /// giving the *caller* an answer it can act on.
 pub fn detect_format(input: &[u8]) -> Result<OutputFormat> {
     use image::ImageFormat as F;
-    let format = image::guess_format(input).map_err(|_| Error::UnknownFormat)?;
-    Ok(match format {
-        F::Jpeg => OutputFormat::Jpeg,
-        F::Png => OutputFormat::Png,
-        F::WebP => OutputFormat::WebP,
-        F::Gif => OutputFormat::Gif,
-        F::Tiff => OutputFormat::Tiff,
-        F::Bmp => OutputFormat::Bmp,
-        F::Ico => OutputFormat::Ico,
-        F::Avif => OutputFormat::Avif,
-        _ => return Err(Error::UnknownFormat),
+    Ok(match image::guess_format(input).ok() {
+        Some(F::Jpeg) => OutputFormat::Jpeg,
+        Some(F::Png) => OutputFormat::Png,
+        Some(F::WebP) => OutputFormat::WebP,
+        Some(F::Gif) => OutputFormat::Gif,
+        Some(F::Tiff) => OutputFormat::Tiff,
+        Some(F::Bmp) => OutputFormat::Bmp,
+        Some(F::Ico) => OutputFormat::Ico,
+        Some(F::Avif) => OutputFormat::Avif,
+        // `image` has no HEIF sniffer, so a HEIC arrives here as "not an image I
+        // know" unless something reads the container's own brand bytes. The
+        // fallback runs for every format `image` did not claim, including AVIF
+        // inside a HEIF container, which `image` does not claim either — so the
+        // answer is read from the box rather than from a codec's opinion.
+        _ => return crate::heic::detect(input).ok_or(Error::UnknownFormat),
     })
 }
 
@@ -225,6 +258,16 @@ pub fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> R
             // whichever version actually resolves, with a test that compiles.
             return Err(Error::UnsupportedFormat(
                 "AVIF encoding is not implemented yet",
+            ));
+        }
+        OutputFormat::Heic | OutputFormat::Heif => {
+            // Read-only, and saying so is the whole point. A user who reaches
+            // this has asked for a HEIC because their input was one, and the
+            // useful answer is what to pick instead — the same file as a JPEG or
+            // PNG, which is what the rest of this engine is for.
+            return Err(Error::UnsupportedFormat(
+                "this build reads HEIC/HEIF but cannot write it: choose JPEG, PNG or WebP \
+                 as the output format and the photo will be converted",
             ));
         }
     }
@@ -405,6 +448,29 @@ mod tests {
         let bytes = encode(&img, OutputFormat::Png, 1).unwrap();
         let back = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(img.to_rgb8().into_raw(), back.into_raw());
+    }
+
+    #[test]
+    fn a_read_only_format_is_refused_by_the_encoder() {
+        // `is_read_only` is what the UI greys formats out with, so it has to
+        // agree with what `encode` does rather than merely intend to.
+        for format in OutputFormat::all().iter().filter(|f| f.is_read_only()) {
+            let err = encode(&sample(), *format, 80)
+                .err()
+                .unwrap_or_else(|| panic!("{format:?} is marked read-only but encoded"));
+            assert!(
+                matches!(err, Error::UnsupportedFormat(_)),
+                "{format:?} failed for the wrong reason: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_jpeg_with_a_heic_extension_is_never_reported_as_heic() {
+        // The extension is never consulted, so this holds for a *real* HEIC
+        // signature too: the only bytes that decide are the container's.
+        let jpeg = encode(&sample(), OutputFormat::Jpeg, 80).unwrap();
+        assert_eq!(detect_format(&jpeg).unwrap(), OutputFormat::Jpeg);
     }
 
     #[test]

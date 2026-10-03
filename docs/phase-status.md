@@ -17,7 +17,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-03 | Hostile-input corpus and property tests | PENDING | | |
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
 | phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
-| phase-06 | HEIC/HEIF decode | PENDING | | |
+| phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | PENDING | | |
 | phase-08 | Lossy WebP via libwebp, verified on every target | PENDING | | |
 | phase-09 | SIMD resize path behind a feature flag | PENDING | | |
@@ -217,6 +217,89 @@ separately; `flutter build linux` and `flutter build windows` were not. macOS is
 unwired by design — the Apple targets link statically and adding a build phase to
 `project.pbxproj` without a Mac would be a guess. Full detail, including the
 console output, is in `workspace/phase-05/FINDINGS.md`.
+
+## phase-06 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with
+`--all-features` (124 Rust tests, 20 Flutter tests, none skipped).
+
+**The codec is `heic-rs` 0.1.1, behind an off-by-default `heic` feature.**
+`docs/HEIC.md` is the comparison — `libheif-rs`, `heic` (AGPL, rejected on
+licence) and `oxideav-heif` against it, with licence, transitive-crate count,
+build complexity per target, and whether each can cross-compile to Android and
+iOS from one source. Two facts decided it: `heic-rs` adds **zero** crates to the
+dependency tree, and `libheif-sys` needs a 5.5 MB vendored C++ build (or a
+libheif installed on the machine, which this runner does not have —
+`pkg-config --exists libheif` fails). The doc names the one thing libheif wins
+at — it reads more real-world files — and says where to reopen the question.
+
+**`heic-decode`, named in the phase prompt, is not a crate on crates.io.** The
+pure-Rust crate it stands for is `heic-rs`. Recorded in the doc rather than in a
+commit message nobody reads later.
+
+**Detection is not behind the feature; decoding is.** `image` has no HEIF
+sniffer, so `detect_format` falls back to `heic::detect`, which parses the `ftyp`
+major brand and then the compatible brands. That fallback has no `cfg` on it, so
+a build without the codec still answers "this is a HEIC" and then says "this
+build cannot open it" — naming the feature — instead of "unknown format", which
+is the less useful of two true statements. The same fallback reports `Avif` for
+an AV1-coded file in a HEIF container, which `image`'s sniffer misses when the
+file is stamped `mif1` with `avif` in its compatible list.
+
+**The synthetic HEIC in the tests is generated, not committed.** A HEIC needs an
+HEVC-coded primary item, and there is no HEVC encoder in this tree, so
+`core/src/heic.rs`'s `synthetic` module builds the container byte by byte
+(`ftyp`, `meta`, `hdlr`, `pitm`, `iinf`, `iloc`, `iprp`, `ipma`, `mdat`) and gets
+the bitstream from `heic_rs::hevc::synth`, which writes the parameter sets and
+the CABAC slice itself. The consequence is that the pixels going in are known
+exactly, so the round-trip test asserts them: a flat DC-predicted field, every
+channel equal and near mid-grey. That is a stronger test than a fixture would
+give, and there is no third-party photograph in the tree whose licence anybody
+would have to reason about. `synth` is behind `heic-rs`'s `bench` feature, pulled
+in as a **dev-dependency** so it never reaches a `cargo build --release`.
+
+**The 14 tests cover the phase's four machine-checkable criteria** and one thing
+none of them asked for: a HEIC declaring 60000×60000 is refused by `Limits` from
+a few hundred bytes of container, on both the desktop and the mobile profile,
+while still being *reported* as a 60000×60000 HEIC — so the UI can say "too big
+to open" rather than "unsupported". One test found a real over-claim while being
+written: truncating a HEIC inside its picture data still passes `validate_bytes`,
+because the header read never promised to look at pixels. That is now the
+asserted behaviour with the reasoning attached, rather than a weakened test.
+
+**Two structural changes to the engine, both small:**
+
+- `Limits::check_header(w, h)` split out of `check_decoded`. A HEIF states its
+  geometry in an `ispe` property box that `image::ImageReader` cannot read, so
+  `heic::decode` has to apply the bounds itself before the codec allocates.
+  Without it, the codec's own 256 MP ceiling would be the only thing between a
+  phone and an OOM on a 60000×60000 `ispe`, because `Limits::mobile()` is 40 MP.
+- `OutputFormat::Heic` and `Heif` are new **read-only** variants.
+  `is_read_only()` is the flag the UI reads, `encode()` refuses both with a
+  message naming JPEG/PNG/WebP instead, and a test asserts the flag and the
+  behaviour cannot drift apart. `Capabilities.heic_decode` reports decode support
+  separately from `avif_encode`, because one boolean cannot honestly say both.
+
+**Not done, and named rather than glossed:**
+
+- **Colour management.** A Display-P3 iPhone photo decodes with its declared
+  matrix and range but the ICC profile is not applied to the output, so it comes
+  out washed out until phase-12.
+- **HEIC metadata tags.** `exif::read` cannot see a HEIF's `Exif` item — it lives
+  in a separate container item, not an APP1 segment — so `heic::header` reports
+  `has_exif` from the container and `ValidateReport` stays honest, but the tags
+  are not parsed. A HEIC's GPS is therefore never *read*; and because the
+  pipeline re-encodes from raw samples and `exif::write_back` only writes what
+  `exif::read` returns, it is never carried through either.
+- **AV1-in-HEIF decode** (refused by name, not as a broken file) and HEVC
+  inter prediction, which a still-picture decoder does not need.
+- **`app/` is delivered as `workspace/phase-06/shrinkray-phase-06.patch`**, for
+  the same reason as phase-05: only `authorss81/pixelsmith` is writable from this
+  pipeline. It adds `heic`/`heif` to the Dart `OutputFormat` enum (whose
+  `fromJson` throws on an unknown name, so a format the engine reports and Dart
+  lacks is a crash) and `heicDecode` to `Capabilities`. It applies cleanly to
+  `3ed1eb4` and was run through `flutter analyze` and `flutter test` (20 passed)
+  before being captured.
 
 ## Status values
 
