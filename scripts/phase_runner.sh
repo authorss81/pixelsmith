@@ -342,6 +342,20 @@ clear_wip() {
 run_phase() {
   echo "== [phase] Running: ${PHASE} =="
   resume_wip
+  # Continuation context for ANY resumed phase, not just WIP merges. When a
+  # previous tick's work was committed straight to main by the workflow — the
+  # normal case after a wall-clock kill — there is no branch to merge, but the
+  # agent still needs to know it is continuing rather than starting. Without
+  # this, a resumed agent may redo completed work or contradict prior decisions.
+  # Signals, in order of cheapness: a deferral marker, an attempt counter, or a
+  # prior phase commit on main.
+  if [ -f "${DEFERRED_FILE}" ] \
+    || [ -f "${ATTEMPTS_FILE}" ] \
+    || [ -f "${DEFERRED_ATTEMPTS_FILE}" ] \
+    || git log --oneline -30 2>/dev/null | grep -q "px: ${PHASE}"; then
+    echo "== [phase] prior work detected — continuation mode =="
+    touch "${PHASE_DIR}/.checkpoint"
+  fi
   build_context_header
   local SESSION_ARGS=()
   if [ -f "${SESSION_FILE}" ]; then
@@ -515,6 +529,15 @@ fi
 DEFERRAL_REASON="RATE-LIMITED"
 if grep -qi "wall clock exceeded (self-enforced" "${LOG_DIR}/${PHASE}.log" 2>/dev/null; then
   DEFERRAL_REASON="WALL CLOCK"
+fi
+# Progress resets the clock. A tick that left real changes or commits is slow,
+# not stuck — so it does not consume the deferral budget. Without this, a phase
+# that legitimately needs six ticks of productive work would block on the fifth
+# despite advancing every single time. WORK_BEFORE and HEAD_BEFORE are the
+# snapshots from before this tick's run, so anything new is this tick's work.
+if has_new_work "${WORK_BEFORE}" || has_new_commits "${HEAD_BEFORE}"; then
+  echo "== [phase] this tick left real changes — deferral budget reset (slow, not stuck) =="
+  rm -f "${DEFERRED_ATTEMPTS_FILE}"
 fi
 if [ "${DEFERRAL_REASON}" = "WALL CLOCK" ] || log_is_rate_limited "${LOG_DIR}/${PHASE}.log"; then
   DEFERRED_ATTEMPT=0
