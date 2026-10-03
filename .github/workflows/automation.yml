@@ -183,6 +183,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # The branch tip, NOT the triggering SHA. verify and review both read
+          # markers that run-phase pushes during THIS run, so checking out the
+          # event SHA gives them the tree from before the phase ran. That made
+          # verify conclude "phase-01 did no work" on a phase that had in fact
+          # produced four files.
+          ref: main
           fetch-depth: 0
 
       - name: Setup Rust
@@ -361,6 +367,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # The branch tip, NOT the triggering SHA. verify and review both read
+          # markers that run-phase pushes during THIS run, so checking out the
+          # event SHA gives them the tree from before the phase ran. That made
+          # verify conclude "phase-01 did no work" on a phase that had in fact
+          # produced four files.
+          ref: main
           fetch-depth: 0
 
       - name: Setup Rust
@@ -498,6 +510,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # The branch tip, NOT the triggering SHA. verify and review both read
+          # markers that run-phase pushes during THIS run, so checking out the
+          # event SHA gives them the tree from before the phase ran. That made
+          # verify conclude "phase-01 did no work" on a phase that had in fact
+          # produced four files.
+          ref: main
           fetch-depth: 0
 
       - name: Setup Rust
@@ -564,6 +582,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          # The branch tip, NOT the triggering SHA. verify and review both read
+          # markers that run-phase pushes during THIS run, so checking out the
+          # event SHA gives them the tree from before the phase ran. That made
+          # verify conclude "phase-01 did no work" on a phase that had in fact
+          # produced four files.
+          ref: main
           fetch-depth: 0
 
       - name: Setup Rust
