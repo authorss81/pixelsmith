@@ -100,10 +100,19 @@ jobs:
 
           # Per-phase job budget. Phases that build Flutter for a release
           # platform need much more than a pure-Rust phase.
+          #
+          # ALWAYS returns a number in [10, 120]. An unbounded or unparseable
+          # value here silently disables the job timeout downstream, which once
+          # let a phase run for 6 hours against a 90-minute budget. The clamp
+          # below is load-bearing, not cosmetic.
           phase_timeout() {
             local n="$1" t
-            t=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${n}/.timeout" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]')
-            if [ -n "$t" ] && [ "$t" -ge 1 ] 2>/dev/null; then printf '%s' "$t"; else printf '60'; fi
+            t=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${n}/.timeout" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -dc '0-9')
+            if [ -n "$t" ] && [ "$t" -ge 10 ] 2>/dev/null && [ "$t" -le 120 ] 2>/dev/null; then
+              printf '%s' "$t"
+            else
+              printf '60'
+            fi
           }
 
           # 0) Hard halt switch.
@@ -180,6 +189,9 @@ jobs:
     needs: select-phase
     if: needs.select-phase.outputs.exists == 'true'
     runs-on: ubuntu-latest
+    # First of two timeouts. The second lives inside phase_runner.sh, which
+    # stops itself with time left to commit. Both must exist: GitHub's timeout
+    # once failed to fire on a job that ran 6 hours against a 90-minute budget.
     timeout-minutes: ${{ fromJSON(needs.select-phase.outputs.timeout) }}
     outputs:
       phase: ${{ steps.meta.outputs.phase }}

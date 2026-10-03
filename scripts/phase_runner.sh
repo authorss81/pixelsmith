@@ -71,9 +71,35 @@ MAX_VERIFY_FAILURES="${MAX_VERIFY_FAILURES:-3}"
 # times at up to 90 minutes each is expensive and almost always ends in the same
 # place, so it gets a tighter cap.
 MAX_NOWORK_ATTEMPTS="${MAX_NOWORK_ATTEMPTS:-2}"
-CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL_SECONDS:-300}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL_SECONDS:-120}"
 WIP_BRANCH="px-wip/${PHASE}"
 REVIEWER_AGENT="${REVIEWER_AGENT:-reviewer}"
+
+# --- Self-enforced wall clock ---------------------------------------------------
+# Second of two timeouts. The first is the job's `timeout-minutes`, which is fed
+# by this same file and clamped to [10, 120] in the workflow. The second lives
+# here, because GitHub's timeout once failed to fire on a job that ran 6 hours
+# against a 90-minute budget.
+#
+# The phase reads its own budget the same way select-phase does, subtracts a
+# 10-minute margin for commit, push with retries, and the safety-net review
+# write, and kills `opencode run` when the margin arrives. GNU `timeout`
+# reports 124 on a kill, which is classified as retryable further down —
+# exactly like a job timeout — rather than as a phase failure.
+read_budget_minutes() {
+  local t
+  t=$(tr -dc '0-9' < "${PHASE_DIR}/.timeout" 2>/dev/null || echo 60)
+  t=${t:-60}
+  if [ "$t" -ge 10 ] 2>/dev/null && [ "$t" -le 180 ] 2>/dev/null; then
+    printf '%s' "$t"
+  else
+    printf '60'
+  fi
+}
+BUDGET_MIN="$(read_budget_minutes)"
+WORK_SECONDS=$(( (BUDGET_MIN - 10) * 60 ))
+if [ "${WORK_SECONDS}" -lt 0 ] 2>/dev/null; then WORK_SECONDS=0; fi
+echo "== [phase] self-enforced budget: ${BUDGET_MIN} min total, opencode gets $((WORK_SECONDS / 60)) min, 10 min reserved for commit =="
 
 [ -f "${PROMPT_FILE}" ] || { echo "ERROR: no PROMPT.md for ${PHASE}" >&2; exit 2; }
 mkdir -p "${LOG_DIR}"
@@ -111,12 +137,22 @@ run_models() {
     # Re-open the context file per attempt. Piping it once from the outer scope
     # leaves stdin exhausted after the first model, so the fallback could never
     # actually retry.
+    #
+    # GNU `timeout` enforces the phase's own wall clock. Without it, a model
+    # that never returns would outlive the job's `timeout-minutes`, which is
+    # what happened when a phase ran 6 hours against a 90-minute budget.
     if [ -f "${LOG_DIR}/${PHASE}.ctx" ]; then
-      opencode run --model "${m}" "$@" < "${LOG_DIR}/${PHASE}.ctx" >> "${logfile}" 2>&1 || code=$?
+      timeout "${WORK_SECONDS}" opencode run --model "${m}" "$@" < "${LOG_DIR}/${PHASE}.ctx" >> "${logfile}" 2>&1 || code=$?
     else
-      opencode run --model "${m}" "$@" >> "${logfile}" 2>&1 || code=$?
+      timeout "${WORK_SECONDS}" opencode run --model "${m}" "$@" >> "${logfile}" 2>&1 || code=$?
     fi
     code="${code:-0}"
+    if [ "${code}" -eq 124 ]; then
+      echo "== [models] ${m} hit the self-enforced wall clock (${WORK_SECONDS}s) — stopping this tick so there is time left to commit =="
+      echo "== [wallclock] ${PHASE} exceeded its own deadline" >> "${logfile}"
+      WALLCLOCK_HIT=1
+      return 124
+    fi
     post="$(wc -c < "${logfile}" 2>/dev/null || echo 0)"
     growth=$((post - pre))
     # NOTE: do not `unset code` here. `code` is declared `local`, so it starts
@@ -332,6 +368,19 @@ run_phase() {
 
   [ -n "${ACTIVE_MODEL}" ] && echo "== [phase] model used: ${ACTIVE_MODEL} =="
 
+  # The self-enforced wall clock fired. This is not a failure: the tick ends
+  # now, while there is still time to checkpoint and commit, and the next tick
+  # resumes from the WIP branch. Exit 42 is the same signal a rate limit uses,
+  # so the existing deferral path — session save, attempt counting, retry —
+  # applies unchanged. Only the printed reason differs, and it must: "rate
+  # limited" would send the next debugger after an API throttle that never
+  # happened.
+  if [ "${code}" -eq 124 ]; then
+    echo "== [phase] WALL CLOCK: ${PHASE} used its ${BUDGET_MIN}-minute budget — deferring, not failing =="
+    printf '\nwall clock exceeded (self-enforced deadline, not a rate limit)\n' >> "${LOG_DIR}/${PHASE}.log"
+    return 42
+  fi
+
   # Sessions live on the runner's local disk, which is wiped between runs. A
   # committed .session id then points at nothing and every retry fails with
   # "Session not found". Clear it and return a retryable code.
@@ -459,20 +508,28 @@ else
 fi
 
 # --- Failure classification ---------------------------------------------------
-if log_is_rate_limited "${LOG_DIR}/${PHASE}.log"; then
+# A deferral is a deferral regardless of cause: the tick ends quickly, the
+# session is saved, and the next tick retries. The two causes share the counter
+# but not the label. Labelling a wall-clock timeout "RATE-LIMITED" would send the
+# next debugger after an API throttle that never happened.
+DEFERRAL_REASON="RATE-LIMITED"
+if grep -qi "wall clock exceeded (self-enforced" "${LOG_DIR}/${PHASE}.log" 2>/dev/null; then
+  DEFERRAL_REASON="WALL CLOCK"
+fi
+if [ "${DEFERRAL_REASON}" = "WALL CLOCK" ] || log_is_rate_limited "${LOG_DIR}/${PHASE}.log"; then
   DEFERRED_ATTEMPT=0
   [ -f "${DEFERRED_ATTEMPTS_FILE}" ] && DEFERRED_ATTEMPT="$(cat "${DEFERRED_ATTEMPTS_FILE}" 2>/dev/null || echo 0)"
   DEFERRED_ATTEMPT=$((DEFERRED_ATTEMPT + 1))
   printf '%s' "${DEFERRED_ATTEMPT}" > "${DEFERRED_ATTEMPTS_FILE}"
 
   if [ "${DEFERRED_ATTEMPT}" -ge "${MAX_DEFERRALS}" ]; then
-    echo "== [phase] RATE-LIMITED ${DEFERRED_ATTEMPT}/${MAX_DEFERRALS}: ${PHASE} BLOCKED =="
+    echo "== [phase] ${DEFERRAL_REASON} ${DEFERRED_ATTEMPT}/${MAX_DEFERRALS}: ${PHASE} BLOCKED =="
     touch "${BLOCKED_FILE}"
     rm -f "${DEFERRED_FILE}" "${SESSION_FILE}" "${ATTEMPTS_FILE}" "${DEFERRED_ATTEMPTS_FILE}"
     exit 3
   fi
 
-  echo "== [phase] RATE-LIMITED ${DEFERRED_ATTEMPT}/${MAX_DEFERRALS}: deferred, will retry =="
+  echo "== [phase] ${DEFERRAL_REASON} ${DEFERRED_ATTEMPT}/${MAX_DEFERRALS}: deferred, will retry =="
   touch "${DEFERRED_FILE}"
   LAST_SID="$(find_session)"
   [ -n "${LAST_SID}" ] && printf '%s' "${LAST_SID}" > "${SESSION_FILE}"
