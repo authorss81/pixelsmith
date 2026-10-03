@@ -211,7 +211,7 @@ pub fn long(value: u32) -> exif::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::OutputFormat;
+    use crate::format::{EncodingOptions, OutputFormat};
 
     fn noisy(w: u32, h: u32) -> image::DynamicImage {
         image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
@@ -221,7 +221,12 @@ mod tests {
 
     #[test]
     fn png_has_no_exif() {
-        let png = crate::encode_fixed(&noisy(16, 16), OutputFormat::Png, 80).unwrap();
+        let png = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Png,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
         assert!(!has_exif(&png));
         assert!(read(&png).unwrap().entries.is_empty());
     }
@@ -235,7 +240,12 @@ mod tests {
 
     #[test]
     fn strip_produces_a_container_with_no_metadata() {
-        let mut jpeg = crate::encode_fixed(&noisy(32, 32), OutputFormat::Jpeg, 85).unwrap();
+        let mut jpeg = crate::encode_fixed(
+            &noisy(32, 32),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(85),
+        )
+        .unwrap();
         let block = build_block(&[field(
             exif::Tag::CameraOwnerName,
             exif::In::PRIMARY,
@@ -246,7 +256,12 @@ mod tests {
         assert!(has_exif(&jpeg), "test fixture should carry EXIF");
 
         let stripped = strip(&noisy(32, 32)).unwrap();
-        let out = crate::encode_fixed(&stripped, OutputFormat::Jpeg, 85).unwrap();
+        let out = crate::encode_fixed(
+            &stripped,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(85),
+        )
+        .unwrap();
         assert!(read(&out).unwrap().entries.is_empty());
     }
 
@@ -278,7 +293,12 @@ mod tests {
 
     #[test]
     fn gps_and_orientation_are_detected_when_written() {
-        let mut jpeg = crate::encode_fixed(&noisy(16, 16), OutputFormat::Jpeg, 90).unwrap();
+        let mut jpeg = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         let block = build_block(&[
             field(exif::Tag::Orientation, exif::In::PRIMARY, long(6)),
             field(exif::Tag::GPSLatitude, GPS_IFD, long(51)),
@@ -296,7 +316,12 @@ mod tests {
 
     #[test]
     fn write_back_never_reintroduces_gps() {
-        let mut original = crate::encode_fixed(&noisy(16, 16), OutputFormat::Jpeg, 90).unwrap();
+        let mut original = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         let block = build_block(&[
             field(exif::Tag::GPSLatitude, GPS_IFD, long(51)),
             field(exif::Tag::Make, exif::In::PRIMARY, ascii("Nikon")),
@@ -304,7 +329,12 @@ mod tests {
         .unwrap();
         crate::format::append_exif(&mut original, &block).unwrap();
 
-        let mut clean = crate::encode_fixed(&noisy(16, 16), OutputFormat::Jpeg, 90).unwrap();
+        let mut clean = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         write_back(&original, &mut clean, false).unwrap();
 
         let info = read(&clean).unwrap();
@@ -318,11 +348,21 @@ mod tests {
 
     #[test]
     fn write_back_is_a_no_op_when_nothing_survives() {
-        let mut original = crate::encode_fixed(&noisy(16, 16), OutputFormat::Jpeg, 90).unwrap();
+        let mut original = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         let block = build_block(&[field(exif::Tag::GPSLatitude, GPS_IFD, long(51))]).unwrap();
         crate::format::append_exif(&mut original, &block).unwrap();
 
-        let mut clean = crate::encode_fixed(&noisy(16, 16), OutputFormat::Jpeg, 90).unwrap();
+        let mut clean = crate::encode_fixed(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         let before = clean.len();
         write_back(&original, &mut clean, false).unwrap();
         assert_eq!(clean.len(), before, "nothing should have been appended");

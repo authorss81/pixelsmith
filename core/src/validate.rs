@@ -213,7 +213,7 @@ mod tests {
         crate::encode_fixed(
             &image::DynamicImage::ImageRgb8(image::RgbImage::new(w, h)),
             crate::format::OutputFormat::Jpeg,
-            80,
+            crate::format::EncodingOptions::default().with_quality(80),
         )
         .unwrap()
     }

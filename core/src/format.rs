@@ -14,8 +14,9 @@ pub enum OutputFormat {
     Tiff,
     Bmp,
     Ico,
-    /// Recognised on input. Encoding needs `rav1`, which is a heavy build and
-    /// is therefore opt-in via the `avif` feature.
+    /// AV1-coded HEIF: the modern web format. Written through `image`'s AVIF
+    /// encoder (rav1e via ravif) behind the `avif` feature, which is on by
+    /// default; see `Cargo.toml` for why. Read-only when that feature is off.
     Avif,
     /// HEVC-coded HEIF, the ordinary iPhone photograph. Read-only: recognised,
     /// bounded, decoded behind the `heic` feature, and never written.
@@ -63,7 +64,14 @@ impl OutputFormat {
             Self::WebP => !lossy_webp_enabled(),
             // GIF is palette-quantised, and the `image` encoder emits a single
             // full-colour frame, so quality has no meaningful effect.
-            Self::Gif | Self::Png | Self::Bmp | Self::Tiff | Self::Ico | Self::Avif => true,
+            Self::Gif | Self::Png | Self::Bmp | Self::Tiff | Self::Ico => true,
+            // AV1 is a lossy codec, so with the encoder compiled in, quality and
+            // a byte ceiling are both real. Without it there is no encoder to
+            // hand either to, so the honest answer for *this build* is that
+            // quality cannot affect the output — which is what `is_lossless`
+            // means to the UI. The flag and the encoder cannot disagree,
+            // because they are the same `cfg!`.
+            Self::Avif => !avif_encode_enabled(),
             // Read-only: there is no encoder to hand a quality to.
             Self::Heic | Self::Heif => true,
         }
@@ -77,8 +85,42 @@ impl OutputFormat {
     /// your iPhone photo and convert it to JPEG" is the product's headline
     /// capability. Hard rule 10 is about not promising the first, not about
     /// hiding the second.
+    ///
+    /// `Avif` is the one format whose answer is a build-time decision rather
+    /// than a property of the format: without the `avif` feature it is as
+    /// read-only as HEIC, because there is genuinely no encoder behind it.
     pub fn is_read_only(self) -> bool {
-        matches!(self, Self::Avif | Self::Heic | Self::Heif)
+        match self {
+            Self::Avif => !avif_encode_enabled(),
+            Self::Heic | Self::Heif => true,
+            Self::Jpeg
+            | Self::Png
+            | Self::WebP
+            | Self::Gif
+            | Self::Tiff
+            | Self::Bmp
+            | Self::Ico => false,
+        }
+    }
+
+    /// True when the encoder writes scan-by-scan rather than in one pass.
+    ///
+    /// A progressive JPEG shows a coarse image immediately and refines it, so a
+    /// slow network shows something rather than a blank rectangle. It costs a
+    /// few per cent of file size for that, which is why it is not the default.
+    pub fn supports_progressive(self) -> bool {
+        matches!(self, Self::Jpeg)
+    }
+
+    /// True when the encoder honours a chroma resolution.
+    ///
+    /// Only JPEG does in this build. PNG, TIFF and BMP store colour per pixel;
+    /// WebP output is lossless unless `webp-lossy` is on (and libwebp's lossy
+    /// mode is not given a sampling factor here); AVIF is written by rav1e,
+    /// which always uses full-resolution chroma, so asking for 4:2:0 there would
+    /// be a promise the encoder cannot keep.
+    pub fn supports_chroma_subsampling(self) -> bool {
+        matches!(self, Self::Jpeg)
     }
 
     pub fn supports_alpha(self) -> bool {
@@ -153,6 +195,163 @@ const fn lossy_webp_enabled() -> bool {
     false
 }
 
+/// AVIF encode is in the default build, but it is a feature so a target that
+/// cannot afford the AV1 encoder can drop it — and then every flag in this
+/// module has to agree that AVIF is read-only. One `cfg!` feeds all of them, so
+/// "the capability list says we can write AVIF" and "we can write AVIF" cannot
+/// come to disagree.
+#[cfg(feature = "avif")]
+const fn avif_encode_enabled() -> bool {
+    true
+}
+#[cfg(not(feature = "avif"))]
+const fn avif_encode_enabled() -> bool {
+    false
+}
+
+/// Chroma resolution: how finely the two colour-difference channels are stored
+/// relative to luma.
+///
+/// This is a bigger lever on file size than most people expect — a 4:2:0 JPEG
+/// spends a quarter of the chroma samples of a 4:4:4 one, and most photographs
+/// cannot tell. What it costs is *colour detail*, not sharpness: luma stays
+/// full-resolution either way, so edges stay crisp while the colour along them
+/// smears. Text on a coloured background is where it shows: coloured glyph
+/// fringes appear against the background, because the glyph and the background
+/// are different colours at a one-pixel boundary.
+///
+/// The default is [`Luma420`](Self::Luma420) because this is a photo resizer and
+/// a photograph's chroma detail is mostly below the visible threshold. Anything
+/// whose content *is* colour — text, logos, UI screenshots, hard red-on-blue
+/// boundaries — wants [`Luma444`](Self::Luma444), and the argument for that is in
+/// `docs/ARCHITECTURE.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromaSubsampling {
+    /// 4:4:4 — chroma at full resolution. Biggest, and the only safe choice for
+    /// content with saturated colour edges.
+    Luma444,
+    /// 4:2:2 — chroma at half horizontal resolution, full vertical.
+    Luma422,
+    /// 4:2:0 — chroma at half resolution on both axes. The photo default.
+    #[default]
+    Luma420,
+}
+
+impl ChromaSubsampling {
+    /// Every level, most to least colour detail. The order the UI shows them in.
+    pub const ALL: [Self; 3] = [Self::Luma444, Self::Luma422, Self::Luma420];
+
+    /// The `4:4:4` spelling a person would use, for labels and error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Luma444 => "4:4:4",
+            Self::Luma422 => "4:2:2",
+            Self::Luma420 => "4:2:0",
+        }
+    }
+
+    /// One line explaining the trade-off, for a tooltip or a report field.
+    ///
+    /// The point is that this is never applied silently: a user who exports a
+    /// screenshot at 4:2:0 and sees colour fringes on the text needs to be able
+    /// to find out that the encoder halved their chroma and where the knob is.
+    pub fn trade_off(self) -> &'static str {
+        match self {
+            Self::Luma444 => {
+                "full colour resolution: the largest file, and the only one that keeps \
+                 colour detail on hard edges such as text"
+            }
+            Self::Luma422 => {
+                "half the horizontal colour resolution: smaller than 4:4:4, and text on a \
+                 coloured background still fringes on vertical strokes"
+            }
+            Self::Luma420 => {
+                "quarter of the colour samples: smallest of the three, and colour fringes \
+                 around text and hard colour edges — use 4:4:4 for screenshots and logos"
+            }
+        }
+    }
+
+    /// How many chroma samples per pixel this level stores, as a numerator over
+    /// the 4:4:4 baseline. Used by the UI to explain *why* the file got smaller.
+    pub fn chroma_sample_ratio(self) -> (u32, u32) {
+        match self {
+            Self::Luma444 => (4, 4),
+            Self::Luma422 => (2, 4),
+            Self::Luma420 => (2, 2),
+        }
+    }
+
+    /// The encoder-level sampling factor.
+    ///
+    /// 4:2:2 in JPEG terms is one chroma sample per two luma samples
+    /// horizontally, which is `F_2_1` here: the crate names factors by
+    /// *luma* samples per chroma sample, so the two spellings read backwards
+    /// relative to each other and this is the one place that translation lives.
+    fn sampling_factor(self) -> jpeg_encoder::SamplingFactor {
+        use jpeg_encoder::SamplingFactor as Sf;
+        match self {
+            Self::Luma444 => Sf::F_1_1,
+            Self::Luma422 => Sf::F_2_1,
+            Self::Luma420 => Sf::F_2_2,
+        }
+    }
+}
+
+impl std::fmt::Display for ChromaSubsampling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Everything the encoder is asked for, in one value.
+///
+/// This started as a bare `quality: u8` argument and grew one boolean and one
+/// enum; the fourth option would have been a fifth parameter on a function that
+/// already takes an image and a format. A struct also gives the options a home
+/// in the JSON contract and in the Dart model, so adding an encoder knob is a
+/// field rather than a signature change across three layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncodingOptions {
+    /// 1..=100. Clamped on the way in, so a caller cannot panic an encoder by
+    /// asking for quality 0 — several of them assert on their range.
+    pub quality: u8,
+    /// Scan-by-scan JPEG. Ignored by formats that have no such concept; see
+    /// [`OutputFormat::supports_progressive`].
+    pub progressive: bool,
+    /// Chroma resolution. Ignored by formats that store colour per pixel; see
+    /// [`OutputFormat::supports_chroma_subsampling`].
+    pub chroma_subsampling: ChromaSubsampling,
+}
+
+impl Default for EncodingOptions {
+    /// 85 is the quality every existing preset assumed, so this default changes
+    /// no preset's output.
+    fn default() -> Self {
+        Self {
+            quality: 85,
+            progressive: false,
+            chroma_subsampling: ChromaSubsampling::Luma420,
+        }
+    }
+}
+
+impl EncodingOptions {
+    /// The same options at a different quality. Used by the byte-target search,
+    /// which varies quality and nothing else.
+    pub fn with_quality(mut self, quality: u8) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    /// The same options at a different chroma resolution.
+    pub fn with_chroma(mut self, chroma_subsampling: ChromaSubsampling) -> Self {
+        self.chroma_subsampling = chroma_subsampling;
+        self
+    }
+}
+
 /// Identify the format from magic bytes only.
 ///
 /// This is the security-relevant check: the UI is handed a filename from an
@@ -180,23 +379,24 @@ pub fn detect_format(input: &[u8]) -> Result<OutputFormat> {
 }
 
 /// Encode a still image.
-pub fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> Result<Vec<u8>> {
-    let quality = quality.clamp(1, 100);
+///
+/// `options` carries quality, progressive scan and chroma resolution. Options a
+/// format has no use for are ignored rather than rejected, because a caller
+/// setting one global quality slider should not get an error for choosing PNG
+/// output; [`OutputFormat::supports_progressive`] and
+/// [`OutputFormat::supports_chroma_subsampling`] are what the UI reads to decide
+/// whether to show the control in the first place.
+pub fn encode(
+    img: &image::DynamicImage,
+    format: OutputFormat,
+    options: EncodingOptions,
+) -> Result<Vec<u8>> {
+    let quality = options.quality.clamp(1, 100);
     let mut out: Vec<u8> = Vec::with_capacity(estimate_capacity(img));
     let mut cursor = std::io::Cursor::new(&mut out);
 
     match format {
-        OutputFormat::Jpeg => {
-            // Flatten alpha onto white. JPEG has no alpha channel, and leaving
-            // it unset turns every transparent PNG into a black rectangle.
-            let flat = flatten_alpha(img);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, quality).write_image(
-                flat.as_raw(),
-                flat.width(),
-                flat.height(),
-                image::ExtendedColorType::Rgb8,
-            )?;
-        }
+        OutputFormat::Jpeg => encode_jpeg(img, &mut cursor, options, quality)?,
         OutputFormat::Png => {
             // Best compression + adaptive filtering. Larger encode time, smaller
             // file, and no readability cost on our side.
@@ -210,56 +410,47 @@ pub fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> R
                 img.width(),
                 img.height(),
                 img.color().into(),
-            )?;
+            )
+            .map_err(Error::Encode)?;
         }
         OutputFormat::WebP => encode_webp(img, &mut cursor, quality)?,
         OutputFormat::Gif => {
             image::codecs::gif::GifEncoder::new(&mut cursor)
-                .encode_frame(image::Frame::new(img.to_rgba8()))?;
+                .encode_frame(image::Frame::new(img.to_rgba8()))
+                .map_err(Error::Encode)?;
         }
         OutputFormat::Tiff => {
-            image::codecs::tiff::TiffEncoder::new(&mut cursor).write_image(
-                img.as_bytes(),
-                img.width(),
-                img.height(),
-                img.color().into(),
-            )?;
+            image::codecs::tiff::TiffEncoder::new(&mut cursor)
+                .write_image(
+                    img.as_bytes(),
+                    img.width(),
+                    img.height(),
+                    img.color().into(),
+                )
+                .map_err(Error::Encode)?;
         }
         OutputFormat::Bmp => {
-            image::codecs::bmp::BmpEncoder::new(&mut cursor).write_image(
-                img.as_bytes(),
-                img.width(),
-                img.height(),
-                img.color().into(),
-            )?;
+            image::codecs::bmp::BmpEncoder::new(&mut cursor)
+                .write_image(
+                    img.as_bytes(),
+                    img.width(),
+                    img.height(),
+                    img.color().into(),
+                )
+                .map_err(Error::Encode)?;
         }
         OutputFormat::Ico => {
             let rgba = to_rgba8(img);
-            image::codecs::ico::IcoEncoder::new(&mut cursor).write_image(
-                rgba.as_raw(),
-                rgba.width(),
-                rgba.height(),
-                image::ExtendedColorType::Rgba8,
-            )?;
+            image::codecs::ico::IcoEncoder::new(&mut cursor)
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .map_err(Error::Encode)?;
         }
-        OutputFormat::Avif => {
-            // No encoder yet.
-            //
-            // An earlier revision carried a `ravif`-based encoder behind an
-            // `avif` feature. It was written against the ravif 0.13 API while
-            // Cargo.toml resolved 0.11, so `--all-features` never compiled —
-            // which meant fmt, clippy, test, build and doc all failed on every
-            // verification run, so the pipeline could never verify a single
-            // phase. It also dragged in nasm, an unmaintained `paste`
-            // transitive dependency, and four duplicate crate versions.
-            //
-            // Speculative code that has never compiled is worse than no code, so
-            // it is gone. phase-07 implements AVIF properly, against the API of
-            // whichever version actually resolves, with a test that compiles.
-            return Err(Error::UnsupportedFormat(
-                "AVIF encoding is not implemented yet",
-            ));
-        }
+        OutputFormat::Avif => encode_avif(img, &mut cursor, options, quality)?,
         OutputFormat::Heic | OutputFormat::Heif => {
             // Read-only, and saying so is the whole point. A user who reaches
             // this has asked for a HEIC because their input was one, and the
@@ -273,6 +464,104 @@ pub fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> R
     }
 
     Ok(out)
+}
+
+/// rav1e's speed scale is 1 (slowest, smallest) to 10 (fastest, largest). The
+/// default of 4 makes a single phone photo take minutes, which in a resizer
+/// reads as a hung app; 8 keeps a photo well under a second at a cost of a few
+/// per cent in size. This is a constant rather than a setting because there is no
+/// honest way to expose "how many seconds may I take" as a slider.
+#[cfg(feature = "avif")]
+const AVIF_SPEED: u8 = 8;
+
+/// JPEG with the two knobs that matter: chroma resolution and scan order.
+///
+/// This uses `jpeg-encoder` rather than `image`'s JPEG encoder because
+/// `image`'s is baseline-only 4:4:4 with no way to ask for either. That is not a
+/// small gap: 4:2:0 is how JPEG gets small, and progressive is what makes a
+/// large image appear at all on a slow connection. See docs/JPEG.md.
+fn encode_jpeg(
+    img: &image::DynamicImage,
+    cursor: &mut std::io::Cursor<&mut Vec<u8>>,
+    options: EncodingOptions,
+    quality: u8,
+) -> Result<()> {
+    // Flatten alpha onto white. JPEG has no alpha channel, and leaving it unset
+    // turns every transparent PNG into a black rectangle.
+    let flat = flatten_alpha(img);
+
+    // The encoder takes u16 dimensions. `Limits` caps a side at 30 000, so this
+    // cannot overflow in practice — and it is checked rather than cast, because
+    // a truncation here would be a wrong-sized file rather than an error.
+    let width = u16::try_from(flat.width()).map_err(|_| Error::ZeroDimension)?;
+    let height = u16::try_from(flat.height()).map_err(|_| Error::ZeroDimension)?;
+
+    let mut encoder = jpeg_encoder::Encoder::new(&mut *cursor, quality);
+    // Always set the sampling factor explicitly: the encoder picks 4:2:0 below
+    // quality 90 and 4:4:4 at or above it, which would make our output depend on
+    // the quality slider in a way no caller asked for and could not see.
+    encoder.set_sampling_factor(options.chroma_subsampling.sampling_factor());
+    encoder.set_progressive(options.progressive);
+    encoder
+        .encode(flat.as_raw(), width, height, jpeg_encoder::ColorType::Rgb)
+        .map_err(Error::Jpeg)
+}
+
+/// AVIF through `image`'s encoder, which is rav1e via ravif: pure Rust, no C
+/// toolchain, no nasm.
+///
+/// When the `avif` feature is off this build has no AVIF encoder at all, and
+/// `is_read_only` says so, so the useful answer is the same one HEIC gets — what
+/// to pick instead.
+#[cfg(feature = "avif")]
+fn encode_avif(
+    img: &image::DynamicImage,
+    cursor: &mut std::io::Cursor<&mut Vec<u8>>,
+    _options: EncodingOptions,
+    quality: u8,
+) -> Result<()> {
+    // One thread per file. The batch path already runs files in parallel across a
+    // rayon pool, and a nested pool here would oversubscribe the machine — the
+    // same argument as the `heic` feature's "no own rayon pool".
+    let encoder =
+        image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut *cursor, AVIF_SPEED, quality)
+            .with_num_threads(Some(1));
+
+    if img.color().has_alpha() {
+        let rgba = to_rgba8(img);
+        encoder
+            .write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(Error::Encode)?;
+    } else {
+        let rgb = img.to_rgb8();
+        encoder
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(Error::Encode)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "avif"))]
+fn encode_avif(
+    _img: &image::DynamicImage,
+    _cursor: &mut std::io::Cursor<&mut Vec<u8>>,
+    _options: EncodingOptions,
+    _quality: u8,
+) -> Result<()> {
+    Err(Error::UnsupportedFormat(
+        "this build was compiled without the AVIF encoder: choose JPEG, PNG or WebP \
+         as the output format, or rebuild the engine with --features avif",
+    ))
 }
 
 fn encode_webp(
@@ -385,6 +674,92 @@ mod tests {
         }))
     }
 
+    /// A smooth, compressible, photo-like fixture.
+    ///
+    /// `sample` is a hard gradient with one constant channel, which is fine for
+    /// "does it encode" and useless for anything involving size: the only way a
+    /// size claim can be wrong is by being tested against the wrong kind of
+    /// picture.
+    fn photo(w: u32, h: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let fx = f64::from(x) / f64::from(w.max(1)) * 6.0;
+            let fy = f64::from(y) / f64::from(h.max(1)) * 4.0;
+            let wave = (fx).sin() * 80.0 + (fy).cos() * 55.0;
+            image::Rgb([
+                (128.0 + wave).clamp(0.0, 255.0) as u8,
+                (100.0 + wave * 0.6).clamp(0.0, 255.0) as u8,
+                (150.0 - wave * 0.5).clamp(0.0, 255.0) as u8,
+            ])
+        }))
+    }
+
+    /// Saturated colour edges on a coloured field: the content that decides
+    /// whether 4:2:0 is honest. Red bars 4px wide on pure blue, with thin white
+    /// rules across them — a logo or a screenshot rather than a landscape.
+    fn colour_bars(w: u32, h: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let on_bar = x % 12 < 4;
+            let on_rule = y % 24 == 7;
+            match (on_bar, on_rule) {
+                (_, true) => image::Rgb([255, 255, 255]),
+                (true, false) => image::Rgb([255, 0, 0]),
+                (false, false) => image::Rgb([0, 0, 255]),
+            }
+        }))
+    }
+
+    fn jpeg_options(quality: u8, chroma: ChromaSubsampling, progressive: bool) -> EncodingOptions {
+        EncodingOptions {
+            quality,
+            progressive,
+            chroma_subsampling: chroma,
+        }
+    }
+
+    /// Mean absolute error of the blue-difference chroma channel, `B - Y`.
+    ///
+    /// Luma is deliberately left out of the metric: chroma subsampling does not
+    /// touch luma resolution at all, so a metric that included it would dilute
+    /// the one thing under test with the part that never changes.
+    fn chroma_error(source: &image::RgbImage, decoded: &image::RgbImage) -> f64 {
+        assert_eq!(source.dimensions(), decoded.dimensions());
+        let mut total = 0.0f64;
+        let mut count = 0.0f64;
+        for (a, b) in source.pixels().zip(decoded.pixels()) {
+            let (ar, ag, ab) = (f64::from(a.0[0]), f64::from(a.0[1]), f64::from(a.0[2]));
+            let (br, bg, bb) = (f64::from(b.0[0]), f64::from(b.0[1]), f64::from(b.0[2]));
+            total += ((bb - (br + bg + bb) / 3.0) - (ab - (ar + ag + ab) / 3.0)).abs();
+            count += 1.0;
+        }
+        total / count
+    }
+
+    /// The `SOFn` marker that starts a frame: `0xC0` baseline, `0xC2` progressive.
+    ///
+    /// Asserting on the marker is what proves "progressive" rather than "a
+    /// different number of bytes", which is the only way to be sure the encoder
+    /// really changed the scan order.
+    fn jpeg_frame_marker(bytes: &[u8]) -> Option<u8> {
+        let mut at = 2usize; // past SOI
+        while at + 4 <= bytes.len() {
+            if bytes[at] != 0xFF {
+                return None;
+            }
+            let marker = bytes[at + 1];
+            // Standalone markers carry no length.
+            if (0xD0..=0xD9).contains(&marker) || marker == 0xFF {
+                at += 2;
+                continue;
+            }
+            if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 {
+                return Some(marker);
+            }
+            let len = usize::from(u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]));
+            at += 2 + len;
+        }
+        None
+    }
+
     #[test]
     fn sniffs_by_magic_bytes_not_extension() {
         for format in [
@@ -393,7 +768,12 @@ mod tests {
             OutputFormat::WebP,
             OutputFormat::Gif,
         ] {
-            let bytes = encode(&sample(), format, 80).unwrap();
+            let bytes = encode(
+                &sample(),
+                format,
+                EncodingOptions::default().with_quality(80),
+            )
+            .unwrap();
             assert_eq!(detect_format(&bytes).unwrap(), format);
         }
     }
@@ -409,11 +789,326 @@ mod tests {
             OutputFormat::Gif,
             OutputFormat::Ico,
         ] {
-            let bytes = encode(&sample(), format, 80).unwrap();
+            let bytes = encode(
+                &sample(),
+                format,
+                EncodingOptions::default().with_quality(80),
+            )
+            .unwrap();
             assert!(!bytes.is_empty(), "{format:?} produced nothing");
             let back = image::load_from_memory(&bytes).unwrap();
             assert_eq!((back.width(), back.height()), (64, 48), "{format:?} drift");
         }
+    }
+
+    #[test]
+    fn every_chroma_level_encodes_and_decodes_to_the_same_picture() {
+        let img = photo(160, 120);
+        let mut sizes = Vec::new();
+        for chroma in ChromaSubsampling::ALL {
+            let bytes = encode(&img, OutputFormat::Jpeg, jpeg_options(80, chroma, false)).unwrap();
+            assert!(!bytes.is_empty(), "{} produced nothing", chroma.label());
+            let back = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            assert_eq!(
+                back.dimensions(),
+                (160, 120),
+                "{} changed the dimensions",
+                chroma.label()
+            );
+            sizes.push((chroma, bytes.len()));
+        }
+        // More colour samples, more bytes: the ordering is the claim the size
+        // savings rest on, so it is asserted rather than assumed.
+        for pair in sizes.windows(2) {
+            assert!(
+                pair[0].1 > pair[1].1,
+                "{} ({}) should exceed {} ({})",
+                pair[0].0.label(),
+                pair[0].1,
+                pair[1].0.label(),
+                pair[1].1
+            );
+        }
+    }
+
+    #[test]
+    fn four_four_four_is_strictly_larger_than_four_two_zero_at_the_same_quality() {
+        let img = photo(600, 400);
+        let full = encode(
+            &img,
+            OutputFormat::Jpeg,
+            jpeg_options(80, ChromaSubsampling::Luma444, false),
+        )
+        .unwrap();
+        let subsampled = encode(
+            &img,
+            OutputFormat::Jpeg,
+            jpeg_options(80, ChromaSubsampling::Luma420, false),
+        )
+        .unwrap();
+        let dims = |bytes: &[u8]| -> (u32, u32) {
+            let img = image::load_from_memory(bytes).unwrap();
+            (img.width(), img.height())
+        };
+        assert_eq!(
+            dims(&full),
+            dims(&subsampled),
+            "the only difference between these two files is chroma resolution"
+        );
+        assert!(
+            full.len() > subsampled.len(),
+            "4:4:4 ({}) should exceed 4:2:0 ({})",
+            full.len(),
+            subsampled.len()
+        );
+    }
+
+    #[test]
+    fn four_four_four_keeps_a_saturated_colour_edge_that_four_two_zero_loses() {
+        // The evidence behind the default: on content whose *content* is colour,
+        // halving the chroma resolution is visible, and 4:4:4 is measurably
+        // closer to the source. This is what "text on a coloured background
+        // fringes at 4:2:0" means in numbers rather than in a warning label.
+        let img = colour_bars(240, 160);
+        let source = img.to_rgb8();
+        let error_for = |chroma: ChromaSubsampling| -> f64 {
+            let bytes = encode(&img, OutputFormat::Jpeg, jpeg_options(95, chroma, false)).unwrap();
+            chroma_error(&source, &image::load_from_memory(&bytes).unwrap().to_rgb8())
+        };
+        let full = error_for(ChromaSubsampling::Luma444);
+        let half = error_for(ChromaSubsampling::Luma422);
+        let quarter = error_for(ChromaSubsampling::Luma420);
+
+        assert!(
+            quarter > full * 3.0,
+            "4:2:0 should be far worse on colour edges than 4:4:4: {quarter} vs {full}"
+        );
+        assert!(
+            half < quarter && half > full,
+            "4:2:2 should sit between them: {half}, vs 4:4:4 {full} and 4:2:0 {quarter}"
+        );
+    }
+
+    #[test]
+    fn progressive_jpeg_is_progressive_and_decodes_to_the_same_size() {
+        let img = photo(600, 400);
+        let baseline = encode(
+            &img,
+            OutputFormat::Jpeg,
+            jpeg_options(80, ChromaSubsampling::Luma420, false),
+        )
+        .unwrap();
+        let progressive = encode(
+            &img,
+            OutputFormat::Jpeg,
+            jpeg_options(80, ChromaSubsampling::Luma420, true),
+        )
+        .unwrap();
+
+        // SOF0 is baseline, SOF2 is progressive. Anything else means the flag did
+        // not reach the encoder.
+        assert_eq!(jpeg_frame_marker(&baseline), Some(0xC0));
+        assert_eq!(jpeg_frame_marker(&progressive), Some(0xC2));
+
+        for (label, bytes) in [("baseline", &baseline), ("progressive", &progressive)] {
+            let back = image::load_from_memory(bytes).unwrap();
+            assert_eq!(
+                (back.width(), back.height()),
+                (600, 400),
+                "{label} decoded to a different size"
+            );
+        }
+    }
+
+    #[test]
+    fn progressive_costs_bytes_at_the_same_quality() {
+        // Not free, and the number is worth knowing: jpeg-encoder writes four
+        // scans with a spectral-selection and successive-approximation split,
+        // which costs 20-70% here depending on quality. That is the price of a
+        // picture that appears at all on a slow connection.
+        let img = photo(600, 400);
+        for quality in [50u8, 80, 95] {
+            let baseline = encode(
+                &img,
+                OutputFormat::Jpeg,
+                jpeg_options(quality, ChromaSubsampling::Luma420, false),
+            )
+            .unwrap();
+            let progressive = encode(
+                &img,
+                OutputFormat::Jpeg,
+                jpeg_options(quality, ChromaSubsampling::Luma420, true),
+            )
+            .unwrap();
+            assert!(
+                progressive.len() > baseline.len(),
+                "at q{quality} progressive ({}) should exceed baseline ({})",
+                progressive.len(),
+                baseline.len()
+            );
+        }
+    }
+
+    #[test]
+    fn an_option_a_format_cannot_honour_changes_nothing() {
+        // A caller with one quality slider should not get different PNGs
+        // depending on a progressive flag aimed at JPEG. Asserted byte-for-byte,
+        // because "the flag is ignored" is exactly the kind of claim that rots.
+        let img = photo(80, 60);
+        let quiet = encode(
+            &img,
+            OutputFormat::Png,
+            EncodingOptions {
+                quality: 80,
+                progressive: false,
+                chroma_subsampling: ChromaSubsampling::Luma420,
+            },
+        )
+        .unwrap();
+        let loud = encode(
+            &img,
+            OutputFormat::Png,
+            EncodingOptions {
+                quality: 80,
+                progressive: true,
+                chroma_subsampling: ChromaSubsampling::Luma444,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            quiet, loud,
+            "PNG output must not depend on JPEG-only options"
+        );
+    }
+
+    #[test]
+    fn every_format_and_option_combination_either_round_trips_or_fails_cleanly() {
+        let img = photo(48, 32);
+        for format in OutputFormat::all() {
+            for chroma in ChromaSubsampling::ALL {
+                for progressive in [false, true] {
+                    let options = jpeg_options(70, chroma, progressive);
+                    match encode(&img, *format, options) {
+                        Ok(bytes) => {
+                            assert!(
+                                !bytes.is_empty(),
+                                "{format:?} {}/progressive={progressive} produced nothing",
+                                chroma.label()
+                            );
+                            // Either it decodes, or it is a format this build
+                            // writes but cannot read. What it must never do is
+                            // panic, and a decode failure must say why.
+                            if let Err(e) = image::load_from_memory(&bytes) {
+                                assert!(
+                                    !e.to_string().is_empty(),
+                                    "{format:?} produced a file we cannot read or explain"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            assert!(
+                                !e.to_string().is_empty(),
+                                "{format:?} refused an option without saying why"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avif_is_offered_exactly_when_this_build_has_the_encoder() {
+        // Both branches of the acceptance criterion, asserted as agreement
+        // rather than as one hard-coded answer: the capability flag, the
+        // read-only flag and what `encode` actually does are one fact stated
+        // three ways, and a build with `--no-default-features` has to pass this
+        // too.
+        assert_eq!(
+            crate::capabilities().avif_encode,
+            cfg!(feature = "avif"),
+            "the capability list must not promise an encoder this build lacks"
+        );
+        assert_eq!(
+            OutputFormat::Avif.is_read_only(),
+            !cfg!(feature = "avif"),
+            "a format with no encoder must be read-only, or the UI will offer it"
+        );
+        let encoded = encode(&sample(), OutputFormat::Avif, EncodingOptions::default());
+        assert_eq!(
+            encoded.is_ok(),
+            cfg!(feature = "avif"),
+            "encode disagreed with the feature flag: {:?}",
+            encoded.err()
+        );
+        if let Err(e) = &encoded {
+            // Hard rule 9: a refusal has to say what to do instead.
+            let text = e.to_string();
+            assert!(
+                text.contains("JPEG") && text.contains("avif"),
+                "the AVIF refusal should name the alternatives: {text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "avif")]
+    #[test]
+    fn avif_output_is_a_real_avif_container() {
+        let img = photo(64, 48);
+        let bytes = encode(
+            &img,
+            OutputFormat::Avif,
+            EncodingOptions::default().with_quality(70),
+        )
+        .unwrap();
+        assert!(
+            bytes.len() > 100,
+            "an AVIF of 64x48 should not be {} bytes",
+            bytes.len()
+        );
+        // Recognised by our own detector from the container's brand bytes.
+        assert_eq!(detect_format(&bytes).unwrap(), OutputFormat::Avif);
+        assert_eq!(
+            crate::heic::detect(&bytes).unwrap(),
+            OutputFormat::Avif,
+            "the ftyp brand must name AVIF"
+        );
+        // And this build cannot read it back, which is why `avif_decode` is a
+        // separate flag. Asserted rather than assumed: if a future phase adds a
+        // decoder, this test fails and the flag gets revisited.
+        assert!(!crate::capabilities().avif_decode);
+        let Err(err) = image::load_from_memory(&bytes) else {
+            panic!("this build cannot decode AV1, which is what avif_decode: false says");
+        };
+        assert!(
+            err.to_string().contains("Avif"),
+            "the failure should name the format, not 'unsupported': {err}"
+        );
+    }
+
+    #[test]
+    fn chroma_levels_explain_themselves() {
+        for chroma in ChromaSubsampling::ALL {
+            assert!(!chroma.label().is_empty());
+            let (w, h) = chroma.chroma_sample_ratio();
+            assert!(
+                w <= 4 && h <= 4 && w > 0 && h > 0,
+                "{} has no ratio",
+                chroma.label()
+            );
+            // The trade-off text is user-facing, so it has to exist and to say
+            // what 4:2:0 costs rather than only what it is.
+            assert!(
+                chroma.trade_off().contains("chroma") || chroma.trade_off().contains("colour"),
+                "{} has no trade-off text",
+                chroma.label()
+            );
+        }
+        assert_eq!(
+            ChromaSubsampling::default(),
+            ChromaSubsampling::Luma420,
+            "the photo default is part of the JSON contract; changing it changes every export"
+        );
     }
 
     #[test]
@@ -423,7 +1118,12 @@ mod tests {
             16,
             image::Rgba([0, 0, 0, 0]),
         ));
-        let bytes = encode(&transparent, OutputFormat::Jpeg, 90).unwrap();
+        let bytes = encode(
+            &transparent,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
         let back = image::load_from_memory(&bytes).unwrap().to_rgb8();
         let px = back.get_pixel(8, 8).0;
         assert!(
@@ -437,15 +1137,32 @@ mod tests {
         if !OutputFormat::Jpeg.supports_quality() {
             return;
         }
-        let small = encode(&sample(), OutputFormat::Jpeg, 10).unwrap().len();
-        let large = encode(&sample(), OutputFormat::Jpeg, 95).unwrap().len();
+        let small = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(10),
+        )
+        .unwrap()
+        .len();
+        let large = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(95),
+        )
+        .unwrap()
+        .len();
         assert!(large > small, "q95 ({large}) should exceed q10 ({small})");
     }
 
     #[test]
     fn png_is_lossless() {
         let img = sample();
-        let bytes = encode(&img, OutputFormat::Png, 1).unwrap();
+        let bytes = encode(
+            &img,
+            OutputFormat::Png,
+            EncodingOptions::default().with_quality(1),
+        )
+        .unwrap();
         let back = image::load_from_memory(&bytes).unwrap().to_rgb8();
         assert_eq!(img.to_rgb8().into_raw(), back.into_raw());
     }
@@ -455,9 +1172,13 @@ mod tests {
         // `is_read_only` is what the UI greys formats out with, so it has to
         // agree with what `encode` does rather than merely intend to.
         for format in OutputFormat::all().iter().filter(|f| f.is_read_only()) {
-            let err = encode(&sample(), *format, 80)
-                .err()
-                .unwrap_or_else(|| panic!("{format:?} is marked read-only but encoded"));
+            let err = encode(
+                &sample(),
+                *format,
+                EncodingOptions::default().with_quality(80),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{format:?} is marked read-only but encoded"));
             assert!(
                 matches!(err, Error::UnsupportedFormat(_)),
                 "{format:?} failed for the wrong reason: {err:?}"
@@ -469,7 +1190,12 @@ mod tests {
     fn a_jpeg_with_a_heic_extension_is_never_reported_as_heic() {
         // The extension is never consulted, so this holds for a *real* HEIC
         // signature too: the only bytes that decide are the container's.
-        let jpeg = encode(&sample(), OutputFormat::Jpeg, 80).unwrap();
+        let jpeg = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
         assert_eq!(detect_format(&jpeg).unwrap(), OutputFormat::Jpeg);
     }
 
@@ -496,8 +1222,45 @@ mod tests {
     }
 
     #[test]
+    fn a_lossy_option_is_never_offered_where_it_cannot_act() {
+        // The phase's own rule: no lossy knob on a format that ignores it. The
+        // encoder-side half is that `is_lossless` is what `supports_quality` is
+        // derived from, so there is no way for the two to disagree quietly.
+        for format in OutputFormat::all() {
+            assert_eq!(
+                format.supports_quality(),
+                !format.is_lossless(),
+                "{format:?}: supports_quality must be the negation of is_lossless"
+            );
+            // Encoder options nobody can honour are advertised by nobody.
+            for (advertised, name) in [
+                (format.supports_progressive(), "progressive"),
+                (format.supports_chroma_subsampling(), "chroma"),
+            ] {
+                if advertised {
+                    assert!(
+                        !format.is_read_only(),
+                        "{format:?} advertises {name} but has no encoder in this build"
+                    );
+                }
+                if format.is_read_only() || format.is_lossless() {
+                    assert!(
+                        !advertised,
+                        "{format:?} must not advertise {name}: it has no lossy encoder"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn exif_segment_is_inserted_after_soi() {
-        let mut jpeg = encode(&sample(), OutputFormat::Jpeg, 80).unwrap();
+        let mut jpeg = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
         append_exif(&mut jpeg, b"II*\0fake").unwrap();
         assert_eq!(&jpeg[..2], &[0xFF, 0xD8]);
         assert_eq!(&jpeg[2..4], &[0xFF, 0xE1]);

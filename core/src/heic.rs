@@ -266,6 +266,7 @@ fn from_decoder(err: heic_rs::Error) -> Error {
 #[cfg(all(test, feature = "heic"))]
 mod tests {
     use super::*;
+    use crate::format::EncodingOptions;
     use crate::validate::Limits;
     use image::GenericImageView;
 
@@ -286,7 +287,7 @@ mod tests {
         let jpeg = crate::encode_fixed(
             &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
             OutputFormat::Jpeg,
-            80,
+            EncodingOptions::default().with_quality(80),
         )
         .unwrap();
         // The filename is the user's, not ours: only the bytes decide.
@@ -329,7 +330,7 @@ mod tests {
             &synthetic::heic(64, 64),
             &crate::Pipeline::new(),
             OutputFormat::Jpeg,
-            85,
+            EncodingOptions::default().with_quality(85),
             &Limits::default(),
         )
         .unwrap();
@@ -482,7 +483,7 @@ mod tests {
     fn writing_heic_is_refused_with_advice_rather_than_a_pretense() {
         let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4));
         for format in [OutputFormat::Heic, OutputFormat::Heif] {
-            let text = crate::format::encode(&img, format, 85)
+            let text = crate::format::encode(&img, format, EncodingOptions::default())
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -512,7 +513,7 @@ mod tests {
         let png = crate::encode_fixed(
             &image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2)),
             OutputFormat::Png,
-            80,
+            EncodingOptions::default().with_quality(80),
         )
         .unwrap();
         assert_eq!(ftyp(&png), None);

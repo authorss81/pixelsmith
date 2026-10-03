@@ -5,7 +5,7 @@
 //! and carry a `category` so the UI can present them as tabs, and the user can
 //! type a custom value when the preset is wrong.
 
-use crate::format::OutputFormat;
+use crate::format::{ChromaSubsampling, OutputFormat};
 use crate::pipeline::{FitMode, ResampleFilter, ResizeSpec};
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,15 @@ pub struct Preset {
     /// True when the preset is a square or a hard aspect ratio, i.e. cropping
     /// is expected rather than incidental.
     pub crops: bool,
+    /// Chroma resolution this preset exports at.
+    ///
+    /// Not a per-preset whim: the choice follows the *content*. 4:2:0 for
+    /// photographs, where chroma detail is below the visible threshold, and 4:4:4
+    /// for anything whose content is colour — the store-screenshot preset is a UI
+    /// capture, and text on a coloured background is exactly what 4:2:0 fringes.
+    /// Only formats that can honour it are affected; see
+    /// [`OutputFormat::supports_chroma_subsampling`].
+    pub chroma: ChromaSubsampling,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,6 +69,7 @@ const fn preset(
     quality: u8,
     max_bytes: Option<u64>,
     crops: bool,
+    chroma: ChromaSubsampling,
 ) -> Preset {
     Preset {
         id,
@@ -73,6 +83,7 @@ const fn preset(
         quality,
         max_bytes,
         crops,
+        chroma,
     }
 }
 
@@ -89,6 +100,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(2 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "ig-portrait",
@@ -101,6 +113,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(2 * 1024 * 1022),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "ig-story",
@@ -113,6 +126,7 @@ pub const PRESETS: &[Preset] = &[
         82,
         Some(4 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "fb-link",
@@ -125,6 +139,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "x-post",
@@ -137,6 +152,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "yt-thumb",
@@ -149,6 +165,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(2 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "yt-thumb-hd",
@@ -161,6 +178,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(2 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "li-cover",
@@ -173,6 +191,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "tt-post",
@@ -185,6 +204,7 @@ pub const PRESETS: &[Preset] = &[
         82,
         Some(4 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "wa-status",
@@ -197,6 +217,7 @@ pub const PRESETS: &[Preset] = &[
         82,
         Some(1024 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "pin-standard",
@@ -209,6 +230,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(2 * 1024 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "discord-banner",
@@ -221,6 +243,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     // --- Web: WebP/AVIF are the point here.
     preset(
@@ -234,6 +257,7 @@ pub const PRESETS: &[Preset] = &[
         80,
         Some(350 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-card",
@@ -246,6 +270,7 @@ pub const PRESETS: &[Preset] = &[
         80,
         Some(120 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-thumb",
@@ -258,6 +283,7 @@ pub const PRESETS: &[Preset] = &[
         78,
         Some(60 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-og",
@@ -270,6 +296,7 @@ pub const PRESETS: &[Preset] = &[
         85,
         Some(300 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-srcset-1x",
@@ -282,6 +309,7 @@ pub const PRESETS: &[Preset] = &[
         82,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-srcset-2x",
@@ -294,6 +322,7 @@ pub const PRESETS: &[Preset] = &[
         82,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-favicon",
@@ -306,6 +335,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         Some(8 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-pwa-192",
@@ -318,6 +348,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "web-pwa-512",
@@ -330,6 +361,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         true,
+        ChromaSubsampling::Luma420,
     ),
     // --- Print: dimensions in pixels at a stated DPI.
     preset(
@@ -343,6 +375,7 @@ pub const PRESETS: &[Preset] = &[
         92,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "print-a4-150",
@@ -355,6 +388,7 @@ pub const PRESETS: &[Preset] = &[
         90,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "print-letter-300",
@@ -367,6 +401,7 @@ pub const PRESETS: &[Preset] = &[
         92,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "print-4x6-300",
@@ -379,6 +414,7 @@ pub const PRESETS: &[Preset] = &[
         92,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "print-5x7-300",
@@ -391,6 +427,7 @@ pub const PRESETS: &[Preset] = &[
         92,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     // --- Device: wallpaper and launcher assets.
     preset(
@@ -404,6 +441,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(4 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "wall-1440",
@@ -416,6 +454,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(6 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "wall-tablet",
@@ -428,6 +467,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         Some(6 * 1024 * 1024),
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "desktop-1080",
@@ -440,6 +480,7 @@ pub const PRESETS: &[Preset] = &[
         88,
         None,
         true,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "desktop-4k",
@@ -452,6 +493,7 @@ pub const PRESETS: &[Preset] = &[
         90,
         None,
         true,
+        ChromaSubsampling::Luma420,
     ),
     // --- Email: the target-bytes case.
     preset(
@@ -465,6 +507,7 @@ pub const PRESETS: &[Preset] = &[
         0,
         Some(1024 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "email-500k",
@@ -477,6 +520,7 @@ pub const PRESETS: &[Preset] = &[
         0,
         Some(500 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "email-250k",
@@ -489,6 +533,7 @@ pub const PRESETS: &[Preset] = &[
         0,
         Some(250 * 1024),
         false,
+        ChromaSubsampling::Luma420,
     ),
     // --- Developer: icons and store listings.
     preset(
@@ -502,6 +547,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "android-hdpi",
@@ -514,6 +560,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "android-xhdpi",
@@ -526,6 +573,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "android-xxhdpi",
@@ -538,6 +586,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "android-xxxhdpi",
@@ -550,6 +599,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "ios-appicon",
@@ -562,6 +612,7 @@ pub const PRESETS: &[Preset] = &[
         100,
         None,
         false,
+        ChromaSubsampling::Luma420,
     ),
     preset(
         "store-screenshot",
@@ -574,6 +625,7 @@ pub const PRESETS: &[Preset] = &[
         90,
         Some(1024 * 1024),
         false,
+        ChromaSubsampling::Luma444,
     ),
 ];
 
@@ -607,6 +659,7 @@ pub fn to_pipeline(p: &Preset) -> (crate::pipeline::Pipeline, OutputFormat, u8, 
         orientation: None,
         resize: Some(resize),
         strip_metadata: true,
+        chroma_subsampling: p.chroma,
     };
     let max_bytes = p.max_bytes.filter(|_| p.format.supports_byte_target());
     (pipeline, p.format, p.quality, max_bytes)
@@ -643,6 +696,68 @@ mod tests {
             assert!(
                 PRESETS.iter().any(|p| p.category == cat),
                 "empty category {cat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_preset_exports_a_format_this_build_cannot_write() {
+        // A preset is a promise about an export: the user taps it and gets a
+        // file. One pointing at a format the build cannot produce fails at save
+        // time, which is exactly what hard rule 10 exists to prevent.
+        for p in PRESETS {
+            assert!(
+                !p.format.is_read_only(),
+                "{} exports {:?}, which this build cannot write",
+                p.id,
+                p.format
+            );
+        }
+    }
+
+    #[test]
+    fn presets_choose_chroma_by_what_the_content_is() {
+        // The rule the catalogue encodes: a photograph at 4:2:0, and anything
+        // whose content *is* colour — text, a logo, a UI capture — at 4:4:4.
+        // Asserted so that adding a preset means deciding, rather than drifting.
+        let screenshot = find_preset("store-screenshot").unwrap();
+        assert_eq!(screenshot.format, OutputFormat::Jpeg);
+        assert_eq!(
+            screenshot.chroma,
+            ChromaSubsampling::Luma444,
+            "a store screenshot is a UI capture; text on a coloured background frays at 4:2:0"
+        );
+
+        for p in PRESETS {
+            if p.category == Category::Social || p.category == Category::Print {
+                assert_eq!(
+                    p.chroma,
+                    ChromaSubsampling::Luma420,
+                    "{} is a photographic preset and should use the photo default",
+                    p.id
+                );
+            }
+            if !p.format.supports_chroma_subsampling() {
+                // Not a lie: the value is inert for this format, and the field's
+                // doc comment says so. What must not happen is a preset that
+                // advertises a chroma level it cannot honour.
+                assert!(
+                    p.format.is_lossless() || p.format.supports_quality(),
+                    "{} carries a chroma level for a format that ignores quality entirely",
+                    p.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_presets_chroma_reaches_the_pipeline() {
+        for p in PRESETS {
+            let (pipeline, _, _, _) = to_pipeline(p);
+            assert_eq!(
+                pipeline.chroma_subsampling, p.chroma,
+                "{} lost its chroma choice on the way to the pipeline",
+                p.id
             );
         }
     }

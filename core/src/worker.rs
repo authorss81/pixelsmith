@@ -11,7 +11,7 @@
 //!   unreadable file in a folder of 200 does not discard the other 199.
 
 use crate::error::{Error, Result};
-use crate::format::OutputFormat;
+use crate::format::{EncodingOptions, OutputFormat};
 use crate::pipeline::Pipeline;
 use crate::target::{TargetBytes, default_encoder};
 use crate::validate::Limits;
@@ -33,7 +33,10 @@ pub struct Job {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub format: OutputFormat,
-    pub quality: u8,
+    /// Quality, progressive scan and chroma resolution. One value rather than
+    /// three arguments, so the next encoder knob does not change the signature of
+    /// every function that encodes.
+    pub encoding: EncodingOptions,
     pub target: Option<TargetBytes>,
     pub limits: Limits,
 }
@@ -41,7 +44,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             format: OutputFormat::Jpeg,
-            quality: 85,
+            encoding: EncodingOptions::default(),
             target: None,
             limits: Limits::default(),
         }
@@ -146,17 +149,22 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         out
     };
 
+    // The pipeline's chroma choice is the authority: it is the one a UI sets on
+    // the picture, and `Settings::encoding` is the fallback for a caller that
+    // never touches the pipeline. See `Pipeline::chroma_subsampling`.
+    let options = settings.encoding.with_chroma(pipeline.chroma_subsampling);
+
     let mut target_met = true;
     let (mut bytes, quality_used) = match settings.target {
         Some(target) if settings.format.supports_byte_target() => {
             let (bytes, q, met) =
-                target.encode_with(&working, settings.format, &default_encoder)?;
+                target.encode_with(&working, settings.format, options, &default_encoder)?;
             target_met = met;
             (bytes, q)
         }
         _ => (
-            crate::encode_fixed(&working, settings.format, settings.quality)?,
-            settings.quality,
+            crate::encode_fixed(&working, settings.format, options)?,
+            options.quality,
         ),
     };
 
@@ -313,7 +321,12 @@ mod tests {
                 (150.0 - wave * 0.5).clamp(0.0, 255.0) as u8,
             ])
         }));
-        crate::encode_fixed(&img, OutputFormat::Jpeg, 95).unwrap()
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(95),
+        )
+        .unwrap()
     }
 
     /// High-entropy noise. Used where the point is that a file decodes at all.
@@ -325,7 +338,12 @@ mod tests {
                 seed,
             ])
         }));
-        crate::encode_fixed(&img, OutputFormat::Jpeg, 95).unwrap()
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(95),
+        )
+        .unwrap()
     }
 
     fn job(id: &str, name: &str, bytes: Vec<u8>) -> Job {
@@ -361,7 +379,7 @@ mod tests {
         let png = crate::encode_fixed(
             &image::DynamicImage::ImageRgb8(image::RgbImage::new(100, 100)),
             OutputFormat::Png,
-            100,
+            EncodingOptions::default().with_quality(100),
         )
         .unwrap();
         let j = job("1", "lying.jpg", png);
@@ -375,6 +393,142 @@ mod tests {
             crate::format::detect_format(&p.bytes).unwrap(),
             OutputFormat::WebP
         );
+    }
+
+    /// Small, smooth, saturated: colour detail is what the chroma option acts
+    /// on, so a fixture without it cannot tell the options apart.
+    fn colour(w: u32, h: u32) -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let wave = ((x as f32) * 0.3).sin() * 70.0 + ((y as f32) * 0.21).cos() * 60.0;
+            image::Rgb([
+                (140.0 + wave).clamp(0.0, 255.0) as u8,
+                (60.0 + wave * 0.4).clamp(0.0, 255.0) as u8,
+                (210.0 - wave * 0.7).clamp(0.0, 255.0) as u8,
+            ])
+        }))
+    }
+
+    fn options(chroma: crate::format::ChromaSubsampling, progressive: bool) -> Settings {
+        Settings {
+            format: OutputFormat::Jpeg,
+            encoding: EncodingOptions {
+                quality: 80,
+                progressive,
+                chroma_subsampling: chroma,
+            },
+            ..Settings::default()
+        }
+    }
+
+    /// The chroma choice on the pipeline has to reach the encoder through the
+    /// whole product path, or the UI's control is decoration.
+    #[test]
+    fn the_pipelines_chroma_choice_reaches_the_encoder() {
+        use crate::format::ChromaSubsampling as Cs;
+        let j = job(
+            "1",
+            "photo.jpg",
+            crate::encode_fixed(
+                &colour(300, 200),
+                OutputFormat::Jpeg,
+                EncodingOptions::default().with_quality(95),
+            )
+            .unwrap(),
+        );
+
+        let run = |chroma: Cs| -> Vec<u8> {
+            let pipeline = Pipeline {
+                chroma_subsampling: chroma,
+                ..pipeline(300)
+            };
+            process_one(&j, &pipeline, &options(Cs::Luma420, false))
+                .unwrap()
+                .bytes
+        };
+        let full = run(Cs::Luma444);
+        let subsampled = run(Cs::Luma420);
+        assert!(
+            full.len() > subsampled.len(),
+            "4:4:4 ({}) should exceed 4:2:0 ({}) end to end",
+            full.len(),
+            subsampled.len()
+        );
+    }
+
+    /// The precedence rule, asserted rather than left to the doc comment: the
+    /// pipeline describes the picture and wins over the file-level default.
+    #[test]
+    fn the_pipeline_overrides_the_file_level_chroma_default() {
+        use crate::format::ChromaSubsampling as Cs;
+        let j = job(
+            "1",
+            "photo.jpg",
+            crate::encode_fixed(
+                &colour(300, 200),
+                OutputFormat::Jpeg,
+                EncodingOptions::default().with_quality(95),
+            )
+            .unwrap(),
+        );
+        // Settings say 4:4:4; the pipeline says 4:2:0. The pipeline is what the
+        // UI sets, so the pipeline wins — otherwise a caller who set it in both
+        // places would silently get the one they did not look at.
+        let settings = Settings {
+            encoding: EncodingOptions {
+                chroma_subsampling: Cs::Luma444,
+                ..EncodingOptions::default()
+            },
+            ..options(Cs::Luma420, false)
+        };
+        let from_pipeline = Pipeline {
+            chroma_subsampling: Cs::Luma420,
+            ..pipeline(300)
+        };
+        let a = process_one(&j, &from_pipeline, &settings).unwrap().bytes;
+        let b = process_one(&j, &pipeline(300), &settings).unwrap().bytes;
+        assert_eq!(a, b, "the pipeline's chroma choice must win");
+    }
+
+    /// The byte-target search varies quality and nothing else: a chroma choice
+    /// that was dropped in one pass of the search would give a file that meets
+    /// the ceiling at a chroma resolution the user never asked for.
+    #[test]
+    fn a_byte_target_keeps_the_chroma_choice_throughout_the_search() {
+        use crate::format::ChromaSubsampling as Cs;
+        let j = job("1", "photo.jpg", photo(600, 400, 3));
+        let settings = Settings {
+            format: OutputFormat::Jpeg,
+            target: Some(TargetBytes::new(30 * 1024)),
+            ..options(Cs::Luma444, false)
+        };
+        let p = process_one(
+            &j,
+            &Pipeline {
+                chroma_subsampling: Cs::Luma444,
+                ..pipeline(600)
+            },
+            &settings,
+        )
+        .unwrap();
+        assert!(p.outcome.target_met, "the ceiling should be reachable");
+
+        // Same ceiling and same picture at 4:2:0, for the size comparison the
+        // search is supposed to preserve.
+        let settings_420 = Settings {
+            format: OutputFormat::Jpeg,
+            target: Some(TargetBytes::new(30 * 1024)),
+            ..options(Cs::Luma420, false)
+        };
+        let q = process_one(
+            &j,
+            &Pipeline {
+                chroma_subsampling: Cs::Luma420,
+                ..pipeline(600)
+            },
+            &settings_420,
+        )
+        .unwrap();
+        assert!(p.outcome.output_bytes > q.outcome.output_bytes);
     }
 
     #[test]

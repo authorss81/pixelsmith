@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::format::ChromaSubsampling;
 use image::imageops::FilterType;
 
 /// Resampling kernels, named honestly rather than as a 0-100 "quality" slider.
@@ -175,6 +176,16 @@ pub struct Pipeline {
     pub orientation: Option<Orientation>,
     pub resize: Option<ResizeSpec>,
     pub strip_metadata: bool,
+    /// Chroma resolution of the *output*, which is a decision about the picture
+    /// rather than about the file format, so it is made here alongside the resize
+    /// and not buried in the encoder settings.
+    ///
+    /// It overrides [`crate::format::EncodingOptions::chroma_subsampling`] on the
+    /// way to the encoder: one authority for a value the user sets once, and a
+    /// caller that sets it in only one of the two places gets the behaviour they
+    /// asked for on the path a UI uses (`Pipeline`) rather than a silent no-op.
+    #[serde(default)]
+    pub chroma_subsampling: ChromaSubsampling,
 }
 
 impl Pipeline {
@@ -490,7 +501,6 @@ mod tests {
         // so a 100px-wide result is 100x133, not 100x75. Getting this backwards
         // is the classic bug when an app rotates after resizing.
         let p = Pipeline {
-            crop: None,
             orientation: Some(Orientation::Rotate90),
             resize: Some(ResizeSpec {
                 width: Some(100),
@@ -498,7 +508,7 @@ mod tests {
                 fit: FitMode::Width,
                 ..Default::default()
             }),
-            strip_metadata: true,
+            ..Pipeline::new()
         };
         assert_eq!(p.output_dimensions(4000, 3000).unwrap(), (100, 133));
 

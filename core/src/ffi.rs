@@ -13,7 +13,7 @@
 //!   are checked and turned into an error result.
 
 use crate::error::Result;
-use crate::format::OutputFormat;
+use crate::format::{EncodingOptions, OutputFormat};
 use crate::pipeline::Pipeline;
 use crate::presets;
 use crate::target::TargetBytes;
@@ -233,6 +233,11 @@ struct ProcessRequest {
     format: OutputFormat,
     #[serde(default = "default_quality")]
     quality: u8,
+    /// Scan-by-scan JPEG. Off by default: progressive costs a few per cent of
+    /// file size and only pays off on a slow connection, so it is a choice rather
+    /// than a silent improvement.
+    #[serde(default)]
+    progressive: bool,
     target: Option<u64>,
     /// Human-readable name for the input, used only to suggest an output name.
     #[serde(default)]
@@ -296,7 +301,13 @@ pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> P
     };
     let settings = Settings {
         format: parsed.format,
-        quality: parsed.quality,
+        encoding: EncodingOptions {
+            quality: parsed.quality,
+            progressive: parsed.progressive,
+            // The pipeline carries the chroma decision; see
+            // `Pipeline::chroma_subsampling`.
+            ..EncodingOptions::default()
+        },
         target: parsed.target.map(TargetBytes::new),
         limits,
     };
@@ -405,6 +416,9 @@ struct BatchRequest {
     format: OutputFormat,
     #[serde(default = "default_quality")]
     quality: u8,
+    /// Scan-by-scan JPEG. See `ProcessRequest::progressive`.
+    #[serde(default)]
+    progressive: bool,
     target: Option<u64>,
     #[serde(default)]
     mobile_limits: bool,
@@ -448,7 +462,11 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
 
     let settings = Settings {
         format: parsed.format,
-        quality: parsed.quality,
+        encoding: EncodingOptions {
+            quality: parsed.quality,
+            progressive: parsed.progressive,
+            ..EncodingOptions::default()
+        },
         target: parsed.target.map(TargetBytes::new),
         limits: if parsed.mobile_limits {
             Limits::mobile()
@@ -542,7 +560,12 @@ mod tests {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 40])
         }));
-        crate::encode_fixed(&img, OutputFormat::Jpeg, 90).unwrap()
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap()
     }
 
     /// Base64-encode a fixture the way a Dart caller would send it.
@@ -568,7 +591,12 @@ mod tests {
                 (150.0 - wave * 0.5).clamp(0.0, 255.0) as u8,
             ])
         }));
-        crate::encode_fixed(&img, OutputFormat::Jpeg, 90).unwrap()
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap()
     }
 
     /// Reclaim a buffer exactly as Dart would.
@@ -794,6 +822,93 @@ mod tests {
                 OutputFormat::Jpeg
             );
         }
+    }
+
+    /// Run `px_process` and hand back the encoded image bytes.
+    ///
+    /// The JSON `bytes` field is a byte array, so this also proves the Dart-side
+    /// contract: the output really is the file, not a summary of it.
+    fn process_to_bytes(request: &serde_json::Value) -> (Vec<u8>, serde_json::Value) {
+        let body = serde_json::to_vec(request).unwrap();
+        unsafe {
+            let (status, data, msg) = take(px_process(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            let bytes: Vec<u8> = serde_json::from_value(v["bytes"].clone()).unwrap();
+            (bytes, v)
+        }
+    }
+
+    fn process_request(format: &str, chroma: &str, progressive: bool) -> serde_json::Value {
+        serde_json::json!({
+            "pipeline": {
+                "crop": null, "orientation": null, "resize": null,
+                "strip_metadata": true, "chroma_subsampling": chroma
+            },
+            "format": format,
+            "quality": 80,
+            "progressive": progressive,
+            "target": null,
+            "name": "photo.jpg",
+            "data_base64": b64(&photo(240, 160))
+        })
+    }
+
+    #[test]
+    fn px_process_honours_the_requested_chroma_subsampling() {
+        let (full, _) = process_to_bytes(&process_request("jpeg", "luma444", false));
+        let (subsampled, _) = process_to_bytes(&process_request("jpeg", "luma420", false));
+        assert!(
+            full.len() > subsampled.len(),
+            "4:4:4 ({}) should exceed 4:2:0 ({}) across the FFI boundary",
+            full.len(),
+            subsampled.len()
+        );
+        for bytes in [&full, &subsampled] {
+            let back = image::load_from_memory(bytes).unwrap();
+            assert_eq!((back.width(), back.height()), (240, 160));
+        }
+    }
+
+    #[test]
+    fn px_process_honours_a_progressive_request() {
+        let (baseline, _) = process_to_bytes(&process_request("jpeg", "luma420", false));
+        let (progressive, _) = process_to_bytes(&process_request("jpeg", "luma420", true));
+        // SOF0 baseline, SOF2 progressive.
+        let frame = |bytes: &[u8]| -> u8 {
+            bytes
+                .windows(2)
+                .position(|w| w[0] == 0xFF && (0xC0..=0xCF).contains(&w[1]))
+                .map(|at| bytes[at + 1])
+                .unwrap_or_else(|| panic!("no frame header in a JPEG"))
+        };
+        assert_eq!(frame(&baseline), 0xC0);
+        assert_eq!(frame(&progressive), 0xC2);
+    }
+
+    #[test]
+    fn an_older_dart_client_still_works() {
+        // No `chroma_subsampling` and no `progressive` in the request, which is
+        // what a Dart build from before this phase sends. The defaults have to be
+        // the documented ones rather than a deserialisation error, or every
+        // existing install breaks on an engine upgrade.
+        let request = serde_json::json!({
+            "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+            "format": "jpeg",
+            "quality": 80,
+            "target": null,
+            "name": "photo.jpg",
+            "data_base64": b64(&photo(240, 160))
+        });
+        let (bytes, v) = process_to_bytes(&request);
+        assert_eq!(v["width"], 240);
+        assert!(image::load_from_memory(&bytes).is_ok());
+        // The default is the photo default: same bytes as asking for 4:2:0.
+        let (explicit, _) = process_to_bytes(&process_request("jpeg", "luma420", false));
+        assert_eq!(
+            bytes, explicit,
+            "an absent chroma must mean the documented default"
+        );
     }
 
     #[test]

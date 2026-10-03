@@ -35,9 +35,14 @@ rayon = "1"
 zip = { version = "6", default-features = false, features = ["deflate", "time"] }
 thiserror = "2"
 base64 = { version = "0.23.1", features = ["alloc"] }
+# JPEG with a real encoder configuration. `image`'s own JPEG encoder writes
+# baseline 4:4:4 and exposes no sampling-factor or progressive control, so
+# phase-07 needs an encoder that has them; see docs/JPEG.md for why this one.
+# Pure Rust, no C, no build script.
+jpeg-encoder = "0.6"
 
 [features]
-default = []
+default = ["avif"]
 # Lossy WebP via libwebp. Off by default so the pure-Rust build has no C
 # toolchain requirement and stays fast to compile in CI; WebP output then falls
 # back to the lossless encoder, which still beats PNG for photographs.
@@ -54,6 +59,25 @@ webp-lossy = ["dep:webp"]
 # pools or oversubscribe the machine, so the codec stays serial per file and
 # parallelism stays where it belongs: across files.
 heic = ["dep:heic-rs"]
+# AVIF *write*. On by default, deliberately, and this comment is the reasoning.
+#
+# `avif` is `image`'s own AVIF encoder, which is rav1e through ravif: pure Rust,
+# no C toolchain, no nasm (that is `image/nasm`, which nothing here enables),
+# and no build script. So the two reasons the other opt-in codecs are off —
+# a C toolchain in the build, and an unverified cross-compile — do not apply in
+# the same way: the crate compiles anywhere Rust does, which is all four shipped
+# targets.
+#
+# What it costs is build time and AV1 encode being roughly two orders of
+# magnitude slower than JPEG, both documented in docs/ARCHITECTURE.md. The slow
+# part is per file and the batch path parallelises across files, so a 200-image
+# AVIF batch still uses every core.
+#
+# The build is on by default but the *decoder* is not, because this tree has no
+# AV1 decoder at all (`image`'s avif-native/dav1d path is not enabled, and
+# `heic-rs` decodes HEVC only). `capabilities().avif_decode` says so, so the UI
+# cannot imply a round trip it cannot make.
+avif = ["image/avif"]
 
 [dependencies.webp]
 version = "0.3"

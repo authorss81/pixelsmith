@@ -30,6 +30,13 @@ pub enum Error {
     #[error("encode failed: {0}")]
     Encode(#[source] image::ImageError),
 
+    /// The JPEG encoder refused these pixels. Separate from `Encode` because the
+    /// encoder is not `image`, and because the failure is almost always one of two
+    /// explainable things: dimensions past the format's 16-bit limit, or a buffer
+    /// whose length disagrees with the dimensions.
+    #[error("the JPEG encoder rejected these pixels: {0}")]
+    Jpeg(#[source] jpeg_encoder::EncodingError),
+
     #[error("output could not be written: {0}")]
     Io(#[source] io::Error),
 

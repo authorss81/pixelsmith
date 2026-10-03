@@ -20,7 +20,7 @@ pub mod validate;
 pub mod worker;
 
 pub use error::{Error, Result};
-pub use format::{OutputFormat, detect_format};
+pub use format::{ChromaSubsampling, EncodingOptions, OutputFormat, detect_format};
 pub use pipeline::{CropSpec, FitMode, Orientation, Pipeline, ResampleFilter, ResizeSpec};
 pub use presets::{Preset, all_presets, find_preset};
 pub use target::TargetBytes;
@@ -40,10 +40,21 @@ pub struct Capabilities {
     pub webp_lossy: bool,
     pub webp_lossless: bool,
     pub avif_encode: bool,
+    /// Whether AVIF can be *read*. Separate from `avif_encode` on purpose, and
+    /// currently false in every build: this tree has no AV1 decoder (`image`'s
+    /// dav1d path is not enabled and `heic-rs` decodes HEVC only), so a UI that
+    /// wrote an AVIF cannot preview it. One boolean for both directions would
+    /// have told a user we could open the file we just produced.
+    pub avif_decode: bool,
     /// Whether HEVC-coded HEIC/HEIF can be *read*. Separate from the encode
     /// flags above because the two directions answer different questions, and a
     /// user with an iPhone photo only ever asks the first one.
     pub heic_decode: bool,
+    /// Whether the JPEG encoder writes progressive scans, and whether it honours
+    /// a chroma resolution. Both are read off the format rather than written as
+    /// constants, so the flag cannot drift from what `format::encode` does.
+    pub jpeg_progressive: bool,
+    pub jpeg_chroma_subsampling: bool,
     pub gif: bool,
     pub tiff: bool,
     pub bmp: bool,
@@ -59,17 +70,21 @@ pub fn capabilities() -> Capabilities {
         png: true,
         webp_lossy: cfg!(feature = "webp-lossy"),
         webp_lossless: true,
-        // A constant, not a `cfg!`: there is no `avif` feature, because the
-        // `ravif`-based encoder was deleted rather than shipped broken.
-        // `OutputFormat::Avif` still exists so AVIF *input* is recognised, and
-        // `format::encode` rejects it explicitly. phase-07 adds the encoder and
-        // turns this into a real flag.
-        avif_encode: false,
+        // A `cfg!`, not a constant: `format::encode` dispatches on exactly the
+        // same feature, so the flag cannot promise an encoder this build has not
+        // got. It is on by default — see the reasoning in `Cargo.toml`.
+        avif_encode: cfg!(feature = "avif"),
+        // Not a `cfg!` because there is nothing to configure: no AV1 decoder is
+        // in the tree in any configuration. Stated rather than omitted so a UI
+        // cannot infer "writable implies readable".
+        avif_decode: false,
         // A `cfg!`, not a constant: HEIC decode is real but opt-in until
         // phase-08 has built it for every shipped target. A `cfg!` rather than a
         // probe of the codec, so the flag cannot lie about a decoder that is
         // present but broken.
         heic_decode: cfg!(feature = "heic"),
+        jpeg_progressive: OutputFormat::Jpeg.supports_progressive(),
+        jpeg_chroma_subsampling: OutputFormat::Jpeg.supports_chroma_subsampling(),
         gif: true,
         tiff: true,
         bmp: true,
@@ -93,9 +108,10 @@ pub fn encode_to_target(
     img: &image::DynamicImage,
     format: OutputFormat,
     target: TargetBytes,
+    encoding: EncodingOptions,
     encoder: target::Encoder<'_>,
 ) -> Result<(Vec<u8>, u8, bool)> {
-    target.encode_with(img, format, encoder)
+    target.encode_with(img, format, encoding, encoder)
 }
 
 /// Run the whole pipeline and encode once at a fixed quality.
@@ -103,7 +119,7 @@ pub fn process(
     input: &[u8],
     pipeline: &Pipeline,
     format: OutputFormat,
-    quality: u8,
+    encoding: EncodingOptions,
     limits: &Limits,
 ) -> Result<Vec<u8>> {
     let decoded = decode_bounded(input, limits)?;
@@ -113,7 +129,13 @@ pub fn process(
     } else {
         out
     };
-    encode_fixed(&stripped, format, quality)
+    // Same precedence as `worker::process_one`: the pipeline describes the
+    // picture, so it owns the chroma decision.
+    encode_fixed(
+        &stripped,
+        format,
+        encoding.with_chroma(pipeline.chroma_subsampling),
+    )
 }
 
 /// Decode with all limits enforced.
@@ -137,13 +159,13 @@ pub fn decode_bounded(input: &[u8], limits: &Limits) -> Result<image::DynamicIma
     Ok(img)
 }
 
-/// Encode at a fixed quality (no search).
+/// Encode at fixed options (no search).
 pub fn encode_fixed(
     img: &image::DynamicImage,
     format: OutputFormat,
-    quality: u8,
+    encoding: EncodingOptions,
 ) -> Result<Vec<u8>> {
-    format::encode(img, format, quality)
+    format::encode(img, format, encoding)
 }
 
 #[cfg(test)]
@@ -156,7 +178,38 @@ mod tests {
         assert!(caps.jpeg && caps.png && caps.webp_lossless);
         assert_eq!(caps.webp_lossy, cfg!(feature = "webp-lossy"));
         assert_eq!(caps.heic_decode, cfg!(feature = "heic"));
+        assert_eq!(caps.avif_encode, cfg!(feature = "avif"));
         assert!(caps.max_pixels > 0 && caps.max_input_bytes > 0);
+    }
+
+    #[test]
+    fn capabilities_do_not_claim_an_av1_decoder() {
+        // Writable and readable are different questions, and this tree answers
+        // only the first. A UI that inferred "we can write AVIF, therefore we can
+        // open one" would offer to preview a file it cannot decode.
+        let caps = capabilities();
+        assert!(!caps.avif_decode);
+        assert!(
+            !(caps.avif_encode && !caps.avif_decode) || !caps.avif_encode,
+            "if this ever gains a decoder, this test is the place to notice"
+        );
+    }
+
+    #[test]
+    fn the_jpeg_capabilities_are_read_off_the_format() {
+        // Not constants: derived from the same predicates the UI reads per
+        // format, so a change to what the encoder can do cannot leave the
+        // capability list describing the old build.
+        let caps = capabilities();
+        assert_eq!(
+            caps.jpeg_progressive,
+            OutputFormat::Jpeg.supports_progressive()
+        );
+        assert_eq!(
+            caps.jpeg_chroma_subsampling,
+            OutputFormat::Jpeg.supports_chroma_subsampling()
+        );
+        assert!(caps.jpeg_progressive && caps.jpeg_chroma_subsampling);
     }
 
     #[test]
@@ -164,7 +217,12 @@ mod tests {
         let src = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(800, 600, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 10])
         }));
-        let input = encode_fixed(&src, OutputFormat::Jpeg, 95).unwrap();
+        let input = encode_fixed(
+            &src,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(95),
+        )
+        .unwrap();
         let pipeline = Pipeline::new().with_resize(ResizeSpec {
             width: Some(400),
             height: None,
@@ -175,7 +233,7 @@ mod tests {
             &input,
             &pipeline,
             OutputFormat::Jpeg,
-            80,
+            EncodingOptions::default().with_quality(80),
             &Limits::default(),
         )
         .unwrap();
@@ -189,7 +247,7 @@ mod tests {
             &[0u8; 1024],
             &Pipeline::new(),
             OutputFormat::Jpeg,
-            80,
+            EncodingOptions::default().with_quality(80),
             &Limits::default(),
         )
         .unwrap_err();

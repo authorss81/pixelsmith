@@ -1,9 +1,13 @@
 use crate::error::Result;
-use crate::format::{OutputFormat, encode};
+use crate::format::{EncodingOptions, OutputFormat, encode};
 use serde::{Deserialize, Serialize};
 
 /// Pluggable encoder, so the search algorithm can be tested without pixels.
-pub type Encoder<'a> = &'a dyn Fn(&image::DynamicImage, OutputFormat, u8) -> Result<Vec<u8>>;
+///
+/// Options rather than a bare quality: the search varies only the quality, and
+/// the rest of the settings have to survive every pass in the loop unchanged.
+pub type Encoder<'a> =
+    &'a dyn Fn(&image::DynamicImage, OutputFormat, EncodingOptions) -> Result<Vec<u8>>;
 
 /// "Make this file fit under N bytes."
 ///
@@ -43,12 +47,13 @@ impl TargetBytes {
         &self,
         img: &image::DynamicImage,
         format: OutputFormat,
+        base: EncodingOptions,
         encoder: Encoder<'_>,
     ) -> Result<(Vec<u8>, u8, bool)> {
         if format.is_lossless() || !format.supports_byte_target() {
             // Lossless output does not respond to quality, so searching is
             // pointless: encode once and report honestly.
-            let bytes = encoder(img, format, self.min_quality)?;
+            let bytes = encoder(img, format, base.with_quality(self.min_quality))?;
             let len = bytes.len();
             return Ok((bytes, 100, len as u64 <= self.bytes));
         }
@@ -63,7 +68,7 @@ impl TargetBytes {
         let mut high = hi;
         while low <= high {
             let mid = low + (high - low) / 2;
-            let out = encoder(img, format, mid)?;
+            let out = encoder(img, format, base.with_quality(mid))?;
             let len = out.len() as u64;
             if len <= self.bytes {
                 best = Some((out, mid));
@@ -81,7 +86,7 @@ impl TargetBytes {
             None => {
                 // Nothing fit. Return the floor-quality attempt so the caller
                 // can show a real file plus a warning, instead of failing.
-                let bytes = encoder(img, format, lo)?;
+                let bytes = encoder(img, format, base.with_quality(lo))?;
                 Ok((bytes, lo, false))
             }
         }
@@ -93,9 +98,9 @@ impl TargetBytes {
 pub fn default_encoder(
     img: &image::DynamicImage,
     format: OutputFormat,
-    quality: u8,
+    options: EncodingOptions,
 ) -> Result<Vec<u8>> {
-    encode(img, format, quality)
+    encode(img, format, options)
 }
 
 #[cfg(test)]
@@ -107,8 +112,8 @@ mod tests {
     /// must too, or the search is being tested against the wrong shape.
     fn synthetic(
         size_at: impl Fn(u8) -> usize,
-    ) -> impl Fn(&image::DynamicImage, OutputFormat, u8) -> Result<Vec<u8>> {
-        move |_, _, q| Ok(vec![0u8; size_at(q)])
+    ) -> impl Fn(&image::DynamicImage, OutputFormat, EncodingOptions) -> Result<Vec<u8>> {
+        move |_, _, opts| Ok(vec![0u8; size_at(opts.quality)])
     }
 
     #[test]
@@ -121,7 +126,9 @@ mod tests {
             min_quality: 1,
             max_quality: 100,
         };
-        let (bytes, q, fits) = t.encode_with(&img, OutputFormat::Jpeg, &enc).unwrap();
+        let (bytes, q, fits) = t
+            .encode_with(&img, OutputFormat::Jpeg, EncodingOptions::default(), &enc)
+            .unwrap();
         assert!(fits);
         assert_eq!(q, 40);
         assert_eq!(bytes.len(), 40_000);
@@ -136,7 +143,9 @@ mod tests {
             min_quality: 40,
             max_quality: 90,
         };
-        let (bytes, q, fits) = t.encode_with(&img, OutputFormat::Jpeg, &enc).unwrap();
+        let (bytes, q, fits) = t
+            .encode_with(&img, OutputFormat::Jpeg, EncodingOptions::default(), &enc)
+            .unwrap();
         assert!(!fits, "must report that the target was not met");
         assert_eq!(q, 40);
         assert_eq!(bytes.len(), 5_000);
@@ -151,7 +160,9 @@ mod tests {
             min_quality: 30,
             max_quality: 95,
         };
-        let (_, q, fits) = t.encode_with(&img, OutputFormat::Jpeg, &enc).unwrap();
+        let (_, q, fits) = t
+            .encode_with(&img, OutputFormat::Jpeg, EncodingOptions::default(), &enc)
+            .unwrap();
         assert!(fits);
         assert_eq!(q, 95, "should not need to drop quality at all");
     }
@@ -160,7 +171,7 @@ mod tests {
     fn lossless_formats_do_not_search() {
         let img = image::DynamicImage::new_rgb8(8, 8);
         let calls = std::cell::Cell::new(0);
-        let enc = |_: &image::DynamicImage, _: OutputFormat, _: u8| {
+        let enc = |_: &image::DynamicImage, _: OutputFormat, _: EncodingOptions| {
             calls.set(calls.get() + 1);
             Ok(vec![0u8; 900])
         };
@@ -169,7 +180,9 @@ mod tests {
             min_quality: 30,
             max_quality: 95,
         };
-        let (_, _, fits) = t.encode_with(&img, OutputFormat::Png, &enc).unwrap();
+        let (_, _, fits) = t
+            .encode_with(&img, OutputFormat::Png, EncodingOptions::default(), &enc)
+            .unwrap();
         assert_eq!(calls.get(), 1, "PNG must be encoded exactly once");
         assert!(fits);
     }
@@ -191,7 +204,12 @@ mod tests {
         }));
         let target = TargetBytes::new(20_000);
         let (bytes, q, fits) = target
-            .encode_with(&img, OutputFormat::Jpeg, &default_encoder)
+            .encode_with(
+                &img,
+                OutputFormat::Jpeg,
+                EncodingOptions::default(),
+                &default_encoder,
+            )
             .unwrap();
         assert!(fits, "q={q} produced {} bytes", bytes.len());
         assert!(
@@ -215,7 +233,12 @@ mod tests {
         }));
         let target = TargetBytes::new(5_000);
         let (bytes, q, fits) = target
-            .encode_with(&img, OutputFormat::Jpeg, &default_encoder)
+            .encode_with(
+                &img,
+                OutputFormat::Jpeg,
+                EncodingOptions::default(),
+                &default_encoder,
+            )
             .unwrap();
         assert!(!fits, "5 KB is not reachable here");
         assert_eq!(q, target.min_quality);
@@ -226,16 +249,18 @@ mod tests {
     fn converges_in_few_passes() {
         let img = image::DynamicImage::new_rgb8(64, 64);
         let calls = std::cell::Cell::new(0);
-        let enc = |_: &image::DynamicImage, _: OutputFormat, q: u8| {
+        let enc = |_: &image::DynamicImage, _: OutputFormat, opts: EncodingOptions| {
             calls.set(calls.get() + 1);
-            Ok(vec![0u8; q as usize * 1500])
+            Ok(vec![0u8; opts.quality as usize * 1500])
         };
         let t = TargetBytes {
             bytes: 60_000,
             min_quality: 30,
             max_quality: 95,
         };
-        let _ = t.encode_with(&img, OutputFormat::Jpeg, &enc).unwrap();
+        let _ = t
+            .encode_with(&img, OutputFormat::Jpeg, EncodingOptions::default(), &enc)
+            .unwrap();
         assert!(
             calls.get() <= 9,
             "binary search took {} encodes, expected <= 9",
