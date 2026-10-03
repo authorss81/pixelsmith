@@ -42,7 +42,11 @@ ignore = [
   # start failing again, and phase-07 is the phase that decides whether AVIF
   # encoding ships at all. If it does not, delete the feature and this entry
   # together.
-  { id = "RUSTSEC-2024-0436", reason = "Unmaintained `paste`, reachable only via the opt-in `avif` feature (rav1e). No safe upgrade exists. Revisit in phase-07.", expiry = "2027-01-01" },
+  # A time-boxed exception in prose rather than in a field: the cargo-deny
+  # version pinned by the action accepts only `id` and `reason` here, so
+  # `expiry` is a config-parse error rather than a deadline. The date is in the
+  # reason text and in docs/SUPPLY-CHAIN.md so it is still tracked.
+  { id = "RUSTSEC-2024-0436", reason = "Unmaintained `paste`, reachable only via the opt-in `avif` feature (rav1e). No safe upgrade exists. MUST BE RESOLVED BY 2027-01-01: either drop the avif feature or move to an encoder that does not depend on rav1e." },
 ]
 
 [licenses]
