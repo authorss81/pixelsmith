@@ -16,7 +16,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-02 | Fuzz harness for every decode path | PENDING | | |
 | phase-03 | Hostile-input corpus and property tests | PENDING | | |
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
-| phase-05 | Dart FFI binding layer and Flutter app skeleton | PENDING | | |
+| phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `d41df22` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
 | phase-06 | HEIC/HEIF decode | PENDING | | |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | PENDING | | |
 | phase-08 | Lossy WebP via libwebp, verified on every target | PENDING | | |
@@ -124,6 +124,99 @@ recording it always needs a follow-up commit. Two such follow-ups already exist
 (`8a33b6f`, `510267b`) because an earlier recorded sha was invalidated by a
 rebase. The convention is therefore "the commit holding the work", and the
 bookkeeping commits that follow are expected rather than a sign of drift.
+
+## phase-05 notes
+
+**Read this before trusting the row.** The phase is verified — `scripts/verify.sh`
+exits 0 and prints `VERIFY: PASS` — and half of what it covers is *not* in the
+tree. `app/` is a git submodule pointing at `authorss81/shrinkray`, and the only
+credential available to this pipeline has write access to `authorss81/pixelsmith`
+alone:
+
+```console
+$ git -C app push --dry-run origin main
+remote: Permission to authorss81/shrinkray.git denied to github-actions[bot].
+fatal: ... The requested URL returned error: 403
+```
+
+`AGENTS.md` is unambiguous about the consequence: a superproject commit pointing at
+an unpushed submodule SHA is broken for everyone else. So the submodule stays at
+`3ed1eb4` and every `app/`-side change is delivered as
+**`workspace/phase-05/shrinkray-phase-05.patch`**, which applies cleanly to that
+commit. Three of the phase's five machine-checkable criteria are met *by the
+patch* and not by the tree:
+
+| Criterion | In the tree at `3ed1eb4` | Met by |
+| --- | --- | --- |
+| `flutter analyze` reports zero issues | yes | — |
+| `flutter test` passes, offsets and isolate tests included | yes (17 tests) | — |
+| Large decode does not block the calling isolate | yes | — |
+| 1000 iterations leak no buffers | yes | — |
+| Every `px_*` has a matching declaration and appears in the contract test | **no** | the patch |
+
+The last row is the interesting one. `px_inspect` has taken three arguments since
+it was written and `bindings.dart` declared two, so a Dart call passed a `bool`
+where the engine's second `usize` belongs and the phone limit profile was
+unreachable from the app. It survived because the contract test called four of
+fifteen entry points. Nine entry points had never been called from Dart at all.
+The patch fixes all of it; `bash scripts/check-dart-bindings.sh` reports
+`15 entry points match the engine ABI` once it is applied.
+
+**To land it:**
+
+```bash
+cd app                       # or a fresh clone of authorss81/shrinkray
+git apply ../workspace/phase-05/shrinkray-phase-05.patch
+flutter pub get && dart format lib test && flutter analyze
+bash native/build-engine.sh  # build the engine first, or the FFI tests skip
+flutter test
+git commit -m "phase-05: the Dart FFI boundary, verified end to end" && git push
+```
+
+Then, in this repository: empty `KNOWN_DART_DRIFT` in `core/src/ffi_abi.rs` and
+commit the new submodule pointer. The engine test fails on purpose until that list
+is emptied — a test that skipped the comparison instead would stay green forever
+and catch nothing.
+
+**What landed in `core/`, which is this repository's half of the boundary:**
+
+- **`ffi_abi.rs` declares every entry point once**, and each row expands to a
+  `const _: unsafe extern "C" fn(..) -> ..` assignment. An arity change in
+  `ffi.rs` that is not mirrored here is a build failure, not a call with the wrong
+  number of arguments.
+- **`px_abi_layout()`** publishes `PxBuffer`'s offsets via `offset_of!`, so the
+  Dart test compares its struct declaration against the library it loaded rather
+  than against a number somebody typed.
+- **`px-abi-dump -- --check`** and **`scripts/check-dart-bindings.sh`** report any
+  declaration that has drifted.
+- **`verify.sh` builds the debug engine, puts it on the loader path, and fails if
+  any Flutter test skipped.** It previously certified a boundary it had not
+  executed: `DynamicLibrary.open` searches the loader path, not the working
+  directory, so a library in `app/src/rust/` was invisible and the FFI tests
+  skipped themselves while reporting green.
+
+**Two defects this phase found in this repository, both from the gate rather than
+from reading code:**
+
+- `ffi_abi.rs` did not pass `cargo doc -D warnings`: its opening doc line linked
+  to `[`ffi`]`, which is out of scope from a sibling module. The same mistake
+  `ffi.rs` made in phase-01.
+- **`cargo fmt --check` in `verify.sh` could not fail.** `if cargo fmt … | head -n
+  40; then` takes the exit status of `head`, which is always 0 — the identical
+  defect phase-01 fixed on the `dart format` line one check later. It printed
+  "formatting clean" while printing rustfmt's diff, which is how three files were
+  committed in a state rustfmt wanted to rewrite. Fixed, and proved in both
+  directions: a deliberately misformatted function now makes it exit 1 and print
+  the diff.
+
+**Also not done, and named rather than glossed:** the desktop CMake and MSBuild
+glue is in the patch but has never produced a bundle, because no CI job runs a
+desktop build and this runner has neither GTK headers nor MSVC. Its mechanics
+(generator expressions, working directory, install rule) were exercised
+separately; `flutter build linux` and `flutter build windows` were not. macOS is
+unwired by design — the Apple targets link statically and adding a build phase to
+`project.pbxproj` without a Mac would be a guess. Full detail, including the
+console output, is in `workspace/phase-05/FINDINGS.md`.
 
 ## Status values
 

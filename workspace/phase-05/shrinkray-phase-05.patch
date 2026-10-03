@@ -1,8 +1,8 @@
 diff --git a/README.md b/README.md
-index 621981e..f042241 100644
+index 621981e..5622c52 100644
 --- a/README.md
 +++ b/README.md
-@@ -19,23 +19,86 @@ interface on top of `lib/rust/`; they do not re-prove the boundary.
+@@ -19,23 +19,106 @@ interface on top of `lib/rust/`; they do not re-prove the boundary.
  | `lib/rust/errors.dart` | One exception type per engine status |
  | `lib/rust/engine.dart` | Safe wrapper: owns every buffer, frees in `finally`, runs on a worker isolate |
  | `test/models_test.dart` | Enum serialisation, request envelopes, boundary math |
@@ -35,19 +35,16 @@ index 621981e..f042241 100644
 +# Desktop, the host platform (Linux, macOS or Windows):
 +bash native/build-engine.sh
 +bash native/build-engine.sh --release            # optimised
++
++# Android. Opt-in: the target is never inferred from the environment.
++bash native/build-engine.sh --target android --release
  
 -# Or against an explicit engine checkout:
 -bash native/build-engine.sh --release --engine-dir /path/to/pixelsmith
-+# Android. Opt-in: the target is never inferred from the environment.
-+bash native/build-engine.sh --target android --release
-+
 +# Against an explicit engine checkout rather than a sibling directory:
 +bash native/build-engine.sh --engine-dir /path/to/pixelsmith
- ```
- 
--Requires a Rust toolchain. Android cross-compiles need `cargo-ndk` (the script
--installs it); plain `cargo build --target aarch64-linux-android` fails at link
--time with no linker, which is what the script exists to avoid.
++```
++
 +Outputs, and where each platform's loader looks for them:
 +
 +| Target | Command | Artefact |
@@ -70,10 +67,36 @@ index 621981e..f042241 100644
 +cargo install cargo-lipo
 +cargo lipo -t aarch64-apple-ios -t aarch64-apple-ios-sim \
 +  -t x86_64-apple-ios --release -o src/rust/libpixelsmith_core.a
-+```
-+
+ ```
+ 
+-Requires a Rust toolchain. Android cross-compiles need `cargo-ndk` (the script
+-installs it); plain `cargo build --target aarch64-linux-android` fails at link
+-time with no linker, which is what the script exists to avoid.
 +None of these artefacts are committed. They are in `.gitignore` and CI rebuilds
 +them on every run.
++
++**Desktop builds compile the engine themselves.** `linux/CMakeLists.txt` and
++`windows/CMakeLists.txt` run `native/build-engine.sh` as part of every build and
++install the result into the bundle, so `flutter build linux` and
++`flutter build windows` need no manual step:
++
++```bash
++flutter build linux          # the engine is built and copied into bundle/lib
++flutter build windows --release   # into the directory holding the EXE
++```
++
++A Debug build gets a debug engine and everything else gets `--release`. Point the
++build at a specific engine checkout with
++`-DPIXELSMITH_ENGINE_DIR=/path/to/pixelsmith`; left empty, `build-engine.sh`
++infers it from the layout (a sibling `../pixelsmith`, or `../core` when this
++repository is the `app/` submodule). If `bash` is not on `PATH` the configure step
++fails outright rather than producing a bundle with no engine in it.
++
++**macOS is not wired up the same way, and the gap is deliberate.** The Apple
++targets link the engine statically (`DynamicLibrary.process()`), and the Xcode
++project has no build phase that runs `build-engine.sh`, so a macOS bundle needs
++`bash native/build-engine.sh --release` plus a link step in the Xcode target.
++That is a decision for whoever can run Xcode, not a line to guess at here.
 +
 +### Finding the library at runtime
 +
@@ -85,19 +108,16 @@ index 621981e..f042241 100644
 +invisible to it, which is why a desktop `flutter run` used to fail with a dlopen
 +error while the APK worked fine.
 +
-+**Known gap.** The desktop CMake and MSBuild projects do not build or copy the
-+engine yet, so `flutter build linux` and `flutter build windows` produce a bundle
-+without the library in it. Until that is wired up, run the app with
-+`flutter run` from a checkout where `src/rust/` has been populated, or set the
-+loader path yourself:
++`flutter run` from a checkout does not copy the library anywhere, so on Linux it
++still needs the loader path pointed at it:
 +
 +```bash
-+LD_LIBRARY_PATH="$PWD/src/rust" flutter run -d linux   # Linux
++LD_LIBRARY_PATH="$PWD/src/rust" flutter run -d linux
 +```
  
  ### The app
  
-@@ -47,7 +110,14 @@ flutter run
+@@ -47,7 +130,14 @@ flutter run
  ```
  
  `flutter test` passes with or without the native library: the contract test
@@ -113,7 +133,7 @@ index 621981e..f042241 100644
  
  ### Release artefacts
  
-@@ -65,8 +135,10 @@ The engine speaks JSON over a C ABI. The rules, enforced in `lib/rust/`:
+@@ -65,8 +155,10 @@ The engine speaks JSON over a C ABI. The rules, enforced in `lib/rust/`:
    `finally`. A raw pointer never escapes.
  - Every call runs on a worker isolate. A two-second decode cannot drop a frame.
  - `PxBuffer` (`status: u32, data: *u8, len: usize, error: *c_char`) is 32 bytes
@@ -527,6 +547,72 @@ index 853a3f1..30ef7a8 100644
 +        .toList(),
 +  );
 +}
+diff --git a/linux/CMakeLists.txt b/linux/CMakeLists.txt
+index feaf7a5..94ab9c4 100644
+--- a/linux/CMakeLists.txt
++++ b/linux/CMakeLists.txt
+@@ -60,6 +60,48 @@ add_subdirectory("runner")
+ # Run the Flutter tool portions of the build. This must not be removed.
+ add_dependencies(${BINARY_NAME} flutter_assemble)
+ 
++# === The PixelSmith engine ===
++# The Dart side calls into a Rust cdylib that nothing else in this build knows
++# about. Without the rules below, `flutter build linux` produces a bundle whose
++# loader cannot find libpixelsmith_core.so: the app starts, the first engine call
++# throws a dlopen error, and the cause is invisible. The compile itself is done by
++# native/build-engine.sh, which is the same script the README and CI use, so
++# there is exactly one definition of how the engine gets built.
++set(PIXELSMITH_ENGINE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../native/build-engine.sh")
++set(PIXELSMITH_ENGINE_OUT "${CMAKE_CURRENT_SOURCE_DIR}/../src/rust")
++
++# Empty means "work it out": the script looks for a sibling pixelsmith checkout and
++# then for the superproject layout, which is what a submodule checkout is.
++set(PIXELSMITH_ENGINE_DIR "" CACHE PATH
++  "Path to the pixelsmith engine checkout. Empty: let build-engine.sh find it.")
++
++find_program(PIXELSMITH_BASH bash)
++if(NOT PIXELSMITH_BASH)
++  # Fatal rather than skipped. Without this the build would succeed and ship a
++  # bundle with no engine in it, which fails later and much less legibly.
++  message(FATAL_ERROR
++    "bash not found. build-engine.sh is a bash script and this project has no "
++    "other way to compile the engine. Install bash, or build the engine by hand "
++    "with `bash native/build-engine.sh` and re-run.")
++endif()
++
++set(PIXELSMITH_ENGINE_ARGS "")
++if(PIXELSMITH_ENGINE_DIR)
++  list(APPEND PIXELSMITH_ENGINE_ARGS --engine-dir "${PIXELSMITH_ENGINE_DIR}")
++endif()
++
++add_custom_target(pixelsmith_engine ALL
++  COMMAND "${PIXELSMITH_BASH}" "${PIXELSMITH_ENGINE_SCRIPT}"
++          ${PIXELSMITH_ENGINE_ARGS}
++          # A Debug build gets a debug engine. This is not only about speed: the
++          # release profile sets panic = "abort", so a shipped release binary
++          # cannot contain the self-test panic at all.
++          $<$<NOT:$<CONFIG:Debug>>:--release>
++  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
++  COMMENT "Building the PixelSmith engine ($<CONFIG>)"
++  VERBATIM)
++add_dependencies(${BINARY_NAME} pixelsmith_engine)
++
+ # Only the install-generated bundle's copy of the executable will launch
+ # correctly, since the resources must in the right relative locations. To avoid
+ # people trying to run the unbundled copy, put it in a subdirectory instead of
+@@ -106,6 +148,12 @@ foreach(bundled_library ${PLUGIN_BUNDLED_LIBRARIES})
+     COMPONENT Runtime)
+ endforeach(bundled_library)
+ 
++# The engine, built by the pixelsmith_engine target above. $ORIGIN/lib in
++# CMAKE_INSTALL_RPATH is what lets the loader find it there.
++install(FILES "${PIXELSMITH_ENGINE_OUT}/libpixelsmith_core.so"
++  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
++  COMPONENT Runtime)
++
+ # Copy the native assets provided by the build.dart from all packages.
+ set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/linux/")
+ install(DIRECTORY "${NATIVE_ASSETS_DIR}"
 diff --git a/native/build-engine.sh b/native/build-engine.sh
 index 3e9ff62..e1010a3 100644
 --- a/native/build-engine.sh
@@ -1189,3 +1275,67 @@ index b754f98..70b4896 100644
 +  (value >> 16) & 0xFF,
 +  (value >> 24) & 0xFF,
 +];
+diff --git a/windows/CMakeLists.txt b/windows/CMakeLists.txt
+index c3c7c67..bd19cbd 100644
+--- a/windows/CMakeLists.txt
++++ b/windows/CMakeLists.txt
+@@ -52,6 +52,45 @@ add_subdirectory(${FLUTTER_MANAGED_DIR})
+ # Application build; see runner/CMakeLists.txt.
+ add_subdirectory("runner")
+ 
++# === The PixelSmith engine ===
++# Same reasoning as linux/CMakeLists.txt: nothing else in this build compiles the
++# Rust cdylib, so without these rules the packaged EXE has no pixelsmith_core.dll
++# beside it and the first engine call fails at load time. build-engine.sh is the
++# one script that knows how, and it is what the README and CI use.
++set(PIXELSMITH_ENGINE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/../native/build-engine.sh")
++set(PIXELSMITH_ENGINE_OUT "${CMAKE_CURRENT_SOURCE_DIR}/../src/rust")
++
++# Empty means "work it out": the script looks for a sibling pixelsmith checkout
++# and then for the superproject layout, which is what a submodule checkout is.
++set(PIXELSMITH_ENGINE_DIR "" CACHE PATH
++  "Path to the pixelsmith engine checkout. Empty: let build-engine.sh find it.")
++
++find_program(PIXELSMITH_BASH bash)
++if(NOT PIXELSMITH_BASH)
++  # Git Bash ships with Git for Windows and is on PATH in CI. If it is genuinely
++  # absent, failing here beats producing an EXE that cannot start.
++  message(FATAL_ERROR
++    "bash not found. build-engine.sh is a bash script and this project has no "
++    "other way to compile the engine. Install Git for Windows (its bin is on "
++    "PATH), or build the engine by hand with `bash native/build-engine.sh`.")
++endif()
++
++set(PIXELSMITH_ENGINE_ARGS "")
++if(PIXELSMITH_ENGINE_DIR)
++  list(APPEND PIXELSMITH_ENGINE_ARGS --engine-dir "${PIXELSMITH_ENGINE_DIR}")
++endif()
++
++add_custom_target(pixelsmith_engine ALL
++  COMMAND "${PIXELSMITH_BASH}" "${PIXELSMITH_ENGINE_SCRIPT}"
++          ${PIXELSMITH_ENGINE_ARGS}
++          # Debug gets a debug engine: the release profile sets panic = "abort",
++          # which makes the self-test panic abort instead of returning an error.
++          $<$<NOT:$<CONFIG:Debug>>:--release>
++  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/.."
++  COMMENT "Building the PixelSmith engine ($<CONFIG>)"
++  VERBATIM)
++add_dependencies(${BINARY_NAME} pixelsmith_engine)
++
+ 
+ # Generated plugin build rules, which manage building the plugins and adding
+ # them to the application.
+@@ -87,6 +126,13 @@ if(PLUGIN_BUNDLED_LIBRARIES)
+     COMPONENT Runtime)
+ endif()
+ 
++# The engine, built by the pixelsmith_engine target above. On Windows
++# INSTALL_BUNDLE_LIB_DIR is the EXE's own directory, which is where
++# loadEngineLibrary() looks for pixelsmith_core.dll.
++install(FILES "${PIXELSMITH_ENGINE_OUT}/pixelsmith_core.dll"
++  DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
++  COMPONENT Runtime)
++
+ # Copy the native assets provided by the build.dart from all packages.
+ set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")
+ install(DIRECTORY "${NATIVE_ASSETS_DIR}"

@@ -624,9 +624,10 @@ mod tests {
             ]
         }))
         .unwrap();
-        let zip_body =
-            serde_json::to_vec(&serde_json::json!({ "files": [{ "name": "a.jpg", "bytes": input }] }))
-                .unwrap();
+        let zip_body = serde_json::to_vec(
+            &serde_json::json!({ "files": [{ "name": "a.jpg", "bytes": input }] }),
+        )
+        .unwrap();
 
         assert_eq!(live_buffers(), 0, "a test before this one leaked");
         for round in 0..1000 {
@@ -636,12 +637,27 @@ mod tests {
             assert_ne!(handle, HANDLE_INVALID, "round {round}: no token");
             unsafe {
                 assert_eq!(take(px_version()).0, PxStatus::Ok as u32);
-                assert_eq!(take(px_inspect(input.as_ptr(), input.len(), false)).0, PxStatus::Ok as u32);
-                assert_eq!(take(px_exif(input.as_ptr(), input.len())).0, PxStatus::Ok as u32);
+                assert_eq!(
+                    take(px_inspect(input.as_ptr(), input.len(), false)).0,
+                    PxStatus::Ok as u32
+                );
+                assert_eq!(
+                    take(px_exif(input.as_ptr(), input.len())).0,
+                    PxStatus::Ok as u32
+                );
                 assert_eq!(take(px_presets()).0, PxStatus::Ok as u32);
-                assert_eq!(take(px_process(process_body.as_ptr(), process_body.len())).0, PxStatus::Ok as u32);
-                assert_eq!(take(px_batch(batch_body.as_ptr(), batch_body.len())).0, PxStatus::Ok as u32);
-                assert_eq!(take(px_zip(zip_body.as_ptr(), zip_body.len())).0, PxStatus::Ok as u32);
+                assert_eq!(
+                    take(px_process(process_body.as_ptr(), process_body.len())).0,
+                    PxStatus::Ok as u32
+                );
+                assert_eq!(
+                    take(px_batch(batch_body.as_ptr(), batch_body.len())).0,
+                    PxStatus::Ok as u32
+                );
+                assert_eq!(
+                    take(px_zip(zip_body.as_ptr(), zip_body.len())).0,
+                    PxStatus::Ok as u32
+                );
                 assert_eq!(take(px_selftest_error()).0, PxStatus::Error as u32);
                 assert_eq!(take(px_abi_layout()).0, PxStatus::Ok as u32);
                 // The contained panic returns an error, so it is part of the

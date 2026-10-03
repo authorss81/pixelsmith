@@ -81,10 +81,19 @@ fi
 head1 "2. Rust toolchain"
 if [ -f core/Cargo.toml ]; then
   say "--- cargo fmt --check ---"
-  if cargo fmt --manifest-path core/Cargo.toml --all -- --check 2>&1 | head -n 40; then
+  # Same defect phase-01 fixed on the `dart format` line below, one check over:
+  # `cargo fmt ... | head -n 40` as an `if` condition takes the exit status of
+  # `head`, which is always 0, so this reported "formatting clean" over a tree
+  # rustfmt was actively rewriting — and a phase committed a file rustfmt had
+  # reformatted on the strength of it. Capture, then test the captured status.
+  # `--color=never` because the ANSI escapes would defeat the eye as well.
+  FMT=$(cargo fmt --manifest-path core/Cargo.toml --all -- --check --color=never 2>&1)
+  FMT_RC=$?
+  if [ ${FMT_RC} -eq 0 ]; then
     pass "formatting clean"
   else
-    fail "cargo fmt --check reported differences (see above)"
+    fail "cargo fmt --check reported differences:"
+    printf '%s\n' "${FMT}" | head -n 40
   fi
 
   say "--- cargo clippy ---"

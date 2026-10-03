@@ -35,8 +35,8 @@ git commit -m "..." && git push
 ```
 
 The patch was validated in this repository's checkout of the submodule against
-the engine built from the current `core/`: `flutter analyze` reports no issues,
-`flutter test` reports 34 passed and **0 skipped**.
+the engine built from the current `core/`; see *Validation of the patch* below for
+the re-run from a clean tree with the commands and their output.
 
 ## What was wrong
 
@@ -144,10 +144,94 @@ lands they go stale, and the test that compares them fails until they are remove
 A test that skipped the comparison instead would stay green forever and catch
 nothing.
 
+## Second attempt: the gate was red, and one scope item was still missing
+
+The first attempt's work verified as far as it went and then failed
+`scripts/verify.sh` on one line, so this section is about what that run turned up
+and what it added.
+
+### Two defects in this repository, not in `app/`
+
+**`ffi_abi.rs` did not pass `cargo doc -D warnings`.** Its first doc line linked
+to `[`ffi`]`, which is not in scope from a sibling module; rustdoc wants
+`[`crate::ffi`]`. Same mistake `ffi.rs` made in phase-01 and that phase fixed —
+so it was fixed again here, and the lesson repeated rather than learned.
+
+**`cargo fmt --check` in `verify.sh` could not fail.** It was written
+
+```bash
+if cargo fmt --all -- --check 2>&1 | head -n 40; then
+```
+
+which is the identical defect phase-01 fixed on the `dart format` line one check
+later: an `if` condition containing a pipeline takes the exit status of the *last*
+command, and `head`'s is always 0. It reported "formatting clean" while printing
+rustfmt's own diff — which is why `ffi_abi.rs`, `ffi.rs` and `px-abi-dump.rs` were
+committed in a state rustfmt wanted to rewrite. Captured and tested after the
+change, and proved in both directions: a deliberately misformatted function makes
+it exit 1 and print the diff, a clean tree exits 0.
+
+### The desktop build glue, which the first attempt left undone
+
+`PROMPT.md` asks for `core` to be built from CMake and from the Windows MSBuild
+project, copying the artefact where the app expects it. It did not exist in any
+form, so the patch now adds it: `linux/CMakeLists.txt` and
+`windows/CMakeLists.txt` run `native/build-engine.sh` as an `ALL` target and
+`install(FILES ...)` the result into the bundle — `bundle/lib` on Linux, next to
+the EXE on Windows. Debug builds get a debug engine, everything else gets
+`--release`, via a `$<$<NOT:$<CONFIG:Debug>>:--release>` generator expression (which
+is why the single-config and multi-config generators both do the right thing),
+and `-DPIXELSMITH_ENGINE_DIR=` overrides the auto-detected checkout. A missing
+`bash` is a `FATAL_ERROR` rather than a silent skip: a bundle with no engine in it
+fails at the first engine call, which is a much worse place to find out.
+
+What was verified, and what was not, stated plainly:
+
+- **Verified:** the generator expressions, the `WORKING_DIRECTORY`, the
+  `--engine-dir` argument list and the install rule, by exercising them in a
+  throwaway CMake project — Debug produced no `--release`, Release produced
+  `--release`, `-DPIXELSMITH_ENGINE_DIR=x` produced `--engine-dir x --release`,
+  and the working directory was the app root, which is what makes
+  `build-engine.sh` find `../core` in the superproject layout. The real script was
+  then run from `app/` with no arguments and found the engine, built it and copied
+  it to `src/rust/`.
+- **Not verified:** `flutter build linux` and `flutter build windows` themselves.
+  No CI job runs a desktop build and this runner has no GTK headers or MSVC, so
+  the glue has never produced a bundle. It is deliberately thin — it delegates
+  every decision to a script that is tested — but "never executed" is the honest
+  description and the README now says so.
+
+macOS is still not wired up. The Apple targets link the engine statically
+(`DynamicLibrary.process()`), and adding a build phase to `project.pbxproj`
+without a Mac to run Xcode on would be a guess dressed as a fix; the README
+documents the two commands instead.
+
+## Validation of the patch, re-run from a clean tree
+
+`app/` is a submodule this repository cannot push to, so the patch is applied here,
+checked, and reverted:
+
+```console
+$ git -C app apply ../workspace/phase-05/shrinkray-phase-05.patch
+$ (cd app && flutter analyze --no-pub)      # No issues found!
+$ (cd app && dart format --set-exit-if-changed lib test)   # 0 changed
+$ (cd app && LD_LIBRARY_PATH=src/rust flutter test)
+🎉 34 tests passed.
+$ bash scripts/check-dart-bindings.sh
+app/lib/rust/bindings.dart: 15 entry points match the engine ABI
+```
+
+34 tests, 0 skipped, against the engine built from the current `core/`. The
+submodule is back at `3ed1eb4` with a clean working tree.
+
+The drift tripwire was confirmed to fire rather than assumed: with the patch
+applied, `cargo test dart_bindings_match_the_engine_abi` fails with `left: []`
+against the two documented entries, which is exactly the signal the patch's author
+needs to empty the list.
+
 ## Left for whoever can push
 
 - Apply the patch, push, then update the submodule pointer here.
-- The desktop CMake/MSBuild glue: build the engine as part of the desktop build
-  and install the artefact into the bundle. It does not exist in any form.
 - `KNOWN_DART_DRIFT` in `core/src/ffi_abi.rs` must be emptied once the patch
   lands, or the engine test fails on purpose.
+- Run `flutter build linux` and `flutter build windows` once, on a machine that can.

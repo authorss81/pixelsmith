@@ -1,11 +1,11 @@
 //! The C ABI, described as data.
 //!
-//! [`ffi`] holds the implementations; this module holds their *shape*. The two
-//! were previously kept in sync by a human reading both files and hoping, which
-//! is not a mechanism: a `px_*` function can gain a parameter, and the Dart
-//! declaration keeps the old arity, and nothing anywhere notices. The result is
-//! not a compile error on either side — it is a call with the wrong number of
-//! arguments across the FFI boundary.
+//! [`crate::ffi`] holds the implementations; this module holds their *shape*.
+//! The two were previously kept in sync by a human reading both files and
+//! hoping, which is not a mechanism: a `px_*` function can gain a parameter, and
+//! the Dart declaration keeps the old arity, and nothing anywhere notices. The
+//! result is not a compile error on either side — it is a call with the wrong
+//! number of arguments across the FFI boundary.
 //!
 //! So each entry point is declared exactly once, here, in the macro call at the
 //! bottom of this file. That one declaration does two jobs:
@@ -439,7 +439,10 @@ mod tests {
                 symbols.contains(&free),
                 "{free} is missing, so a caller cannot release what the others hand it"
             );
-            let entry = ENTRY_POINTS.iter().find(|e| e.symbol == free).expect("listed above");
+            let entry = ENTRY_POINTS
+                .iter()
+                .find(|e| e.symbol == free)
+                .expect("listed above");
             assert!(
                 !entry.returns_owned_buffer(),
                 "{free} returns owned memory, so freeing it would need another free"
@@ -513,11 +516,8 @@ mod tests {
         let layout = px_buffer_layout();
         assert_eq!(layout.size, 32);
         assert_eq!(layout.align, 8);
-        let offsets: Vec<(&str, usize)> = layout
-            .fields
-            .iter()
-            .map(|f| (f.name, f.offset))
-            .collect();
+        let offsets: Vec<(&str, usize)> =
+            layout.fields.iter().map(|f| (f.name, f.offset)).collect();
         assert_eq!(
             offsets,
             vec![("status", 0), ("data", 8), ("len", 16), ("error", 24)]
@@ -569,8 +569,7 @@ mod tests {
         };
         let drift = dart_drift(&source);
         assert_eq!(
-            drift,
-            KNOWN_DART_DRIFT,
+            drift, KNOWN_DART_DRIFT,
             "the Dart bindings and the engine ABI have drifted. Either fix \
              `app/lib/rust/bindings.dart` (the expected declarations are in \
              `dart_binding_declarations()`) or, if the drift is already known and \
