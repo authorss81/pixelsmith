@@ -9,6 +9,18 @@
 #   2. No unmaintained or yanked crate, and no duplicate version of the same
 #      crate, because both are how supply-chain compromises get in.
 #
+# There are currently ZERO advisories ignored and ZERO duplicate versions skipped.
+# That is not an accident and it should stay that way. Both an ignore list and a
+# skip list grew out of the `avif` feature, which was written against the ravif
+# 0.13 API while Cargo.toml resolved 0.11. It never compiled, which meant
+# scripts/verify.sh failed on every run, and it dragged in rav1e -> nasm, an
+# unmaintained `paste`, and four duplicated crates. The feature was deleted
+# rather than excepted.
+#
+# If you add a dependency that forces you to add a line below, weigh it against
+# the value it brings. An exception nobody re-reads is how a supply-chain policy
+# quietly stops meaning anything.
+#
 # Run with: cargo deny check
 # Enforced in CI via .github/workflows/supply-chain.yml.
 
@@ -33,21 +45,7 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = [
-  # `paste` is archived upstream with no safe upgrade (RUSTSEC-2024-0436).
-  # It is reachable ONLY through the opt-in `avif` feature, via
-  # rav1e -> ravif -> paste. The default build does not contain it.
-  #
-  # A time-boxed exception, not a permanent shrug: the expiry makes cargo-deny
-  # start failing again, and phase-07 is the phase that decides whether AVIF
-  # encoding ships at all. If it does not, delete the feature and this entry
-  # together.
-  # A time-boxed exception in prose rather than in a field: the cargo-deny
-  # version pinned by the action accepts only `id` and `reason` here, so
-  # `expiry` is a config-parse error rather than a deadline. The date is in the
-  # reason text and in docs/SUPPLY-CHAIN.md so it is still tracked.
-  { id = "RUSTSEC-2024-0436", reason = "Unmaintained `paste`, reachable only via the opt-in `avif` feature (rav1e). No safe upgrade exists. MUST BE RESOLVED BY 2027-01-01: either drop the avif feature or move to an encoder that does not depend on rav1e." },
-]
+ignore = []
 
 [licenses]
 version = 2
@@ -67,12 +65,6 @@ allow = [
 ]
 confidence-threshold = 0.93
 
-[[licenses.exceptions]]
-# Ring pulls in a small C library under a permissive but non-SPDX-identifiable
-# notice. Reviewed: no source-distribution obligation.
-crate = "ring"
-allow = ["LicenseRef-ring"]
-
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
@@ -84,16 +76,4 @@ deny = [
   { name = "atty", reason = "Noisy, slow, and superseded by std." },
   { name = "openssl", reason = "Pulls a C toolchain into the build for no benefit; rustls has no native dependency." },
   { name = "native-tls", reason = "Same as openssl. Use rustls if TLS is ever genuinely needed." },
-]
-
-# Duplicate versions are denied by default. These four are the only exceptions,
-# and every one of them comes from rav1e's pinned dependency set under the
-# opt-in `avif` feature — none of them is reachable from the default build.
-# phase-07 either resolves them by dropping or replacing the AVIF encoder, or
-# moves this list to a documented "accepted risk" in docs/SUPPLY-CHAIN.md.
-skip = [
-  { crate = "miniz_oxide", reason = "rav1e (avif) pins an older miniz_oxide alongside the current one." },
-  { crate = "syn", reason = "rav1e (avif) pins an older syn alongside the current one." },
-  { crate = "thiserror", reason = "rav1e (avif) pins an older thiserror alongside the current one." },
-  { crate = "thiserror-impl", reason = "rav1e (avif) pins an older thiserror-impl alongside the current one." },
 ]
