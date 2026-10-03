@@ -16,7 +16,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-02 | Fuzz harness for every decode path | PENDING | | |
 | phase-03 | Hostile-input corpus and property tests | PENDING | | |
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
-| phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `d41df22` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
+| phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
 | phase-06 | HEIC/HEIF decode | PENDING | | |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | PENDING | | |
 | phase-08 | Lossy WebP via libwebp, verified on every target | PENDING | | |
