@@ -233,9 +233,9 @@ struct ProcessRequest {
     format: OutputFormat,
     #[serde(default = "default_quality")]
     quality: u8,
-    /// Scan-by-scan JPEG. Off by default: progressive costs a few per cent of
-    /// file size and only pays off on a slow connection, so it is a choice rather
-    /// than a silent improvement.
+    /// Scan-by-scan JPEG. Off by default: progressive costs about 64% in file
+    /// size at q85, and only pays off on a slow connection, so it is a choice
+    /// rather than a silent improvement.
     #[serde(default)]
     progressive: bool,
     target: Option<u64>,
@@ -1012,6 +1012,98 @@ mod tests {
             let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
             assert_eq!(report.succeeded(), 2);
             assert_eq!(report.failed(), 1);
+        }
+    }
+
+    /// `px_batch` flattens the pipeline into the request rather than nesting it,
+    /// so `chroma_subsampling` and `progressive` arrive as top-level keys — and
+    /// `serde` ignores a key the struct does not declare, which would leave the
+    /// UI's controls silently dead rather than an error. The report carries the
+    /// output size and nothing else, and size is exactly what these two options
+    /// change.
+    #[test]
+    fn px_batch_honours_chroma_and_progressive_at_the_top_level() {
+        let run = |chroma: &str, progressive: bool| -> usize {
+            let request = serde_json::json!({
+                "crop": null, "orientation": null, "resize": null,
+                "strip_metadata": true, "chroma_subsampling": chroma,
+                "format": "jpeg", "quality": 80, "progressive": progressive,
+                "target": null,
+                "files": [{ "name": "a.jpg", "bytes": photo(240, 160) }]
+            });
+            let body = serde_json::to_vec(&request).unwrap();
+            unsafe {
+                let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
+                assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+                let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
+                assert_eq!(report.succeeded(), 1, "{:?}", report.outcomes[0]);
+                report.outcomes[0].output_bytes
+            }
+        };
+
+        let full = run("luma444", false);
+        let subsampled = run("luma420", false);
+        assert!(
+            full > subsampled,
+            "the batch path ignored chroma_subsampling: {full} vs {subsampled}"
+        );
+        let progressive = run("luma420", true);
+        assert!(
+            progressive > subsampled,
+            "the batch path ignored progressive: {progressive} vs {subsampled}"
+        );
+    }
+
+    #[test]
+    fn a_size_ceiling_on_png_travels_back_as_a_sentence() {
+        // The refusal is only useful if it survives the boundary: Dart shows
+        // `Outcome.error` verbatim, so the sentence has to arrive intact rather
+        // than as a status code the UI has to guess about.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "pipeline": {
+                "crop": null, "orientation": null, "resize": null,
+                "strip_metadata": true, "chroma_subsampling": "luma420"
+            },
+            "format": "png",
+            "quality": 85,
+            "progressive": false,
+            "target": 8192,
+            "name": "photo.jpg",
+            "data_base64": b64(&photo(240, 160))
+        }))
+        .unwrap();
+        unsafe {
+            let (status, _, msg) = take(px_process(body.as_ptr(), body.len()));
+            assert_ne!(
+                status,
+                PxStatus::Ok as u32,
+                "a ceiling PNG cannot keep must not come back as a success"
+            );
+            assert!(
+                msg.contains("quality") && msg.contains("JPEG"),
+                "the message must name the problem and a way out: {msg}"
+            );
+        }
+
+        // And the batch path reports it per file rather than failing the batch:
+        // one impossible request must not discard the rest of a folder.
+        let request = serde_json::json!({
+            "crop": null, "orientation": null, "resize": null, "strip_metadata": true,
+            "format": "png", "quality": 85, "target": 8192,
+            "files": [
+                { "name": "a.jpg", "bytes": sample(200, 100) },
+                { "name": "b.jpg", "bytes": sample(200, 100) }
+            ]
+        });
+        let body = serde_json::to_vec(&request).unwrap();
+        unsafe {
+            let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
+            assert_eq!(report.failed(), 2, "every file carries the same bad setting");
+            let error = report.outcomes[0].error.as_deref().unwrap_or("");
+            assert!(error.contains("quality"), "{error}");
+            assert_eq!(report.outcomes[0].quality_used, 0);
         }
     }
 

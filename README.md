@@ -41,8 +41,8 @@ and then writes the next set of phases from a self-audit.
 - Never trust a filename. Format comes from magic bytes; output names are
   sanitised against path traversal.
 
-Not yet: HEIC decode, AVIF encode, lossy WebP, colour management, animation
-preservation. Each has a phase.
+Not yet: HEIC decode, lossy WebP, colour management, animation preservation,
+AVIF decode. Each has a phase.
 
 ## Running it
 

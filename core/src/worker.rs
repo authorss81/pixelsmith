@@ -51,6 +51,29 @@ impl Default for Settings {
     }
 }
 
+impl Settings {
+    /// Refuse a request this format cannot act on, before a pixel is decoded.
+    ///
+    /// Only the byte ceiling is refused. A quality value is *ignored* for a
+    /// lossless format rather than rejected, because one global quality slider
+    /// exists above the format picker and refusing every PNG export because of it
+    /// would be absurd. A ceiling is different: it is a promise about the size of
+    /// the file, and PNG cannot keep it at any slider position. Silently returning
+    /// an oversized file would be the one answer hard rule 9 forbids, so the
+    /// engine says which format will keep it instead.
+    ///
+    /// The UI is expected never to send this combination — it greys the size
+    /// field out from [`crate::capabilities`] and the per-format predicates — but
+    /// a request can arrive from anywhere, and this is the layer every path goes
+    /// through.
+    pub fn validate(&self) -> Result<()> {
+        if self.target.is_some() && !self.format.supports_byte_target() {
+            return Err(Error::NoQualitySetting(self.format.quality_note()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub id: String,
@@ -60,8 +83,11 @@ pub struct Outcome {
     pub output_bytes: usize,
     pub width: u32,
     pub height: u32,
-    /// Quality actually used. Differs from `Settings::quality` when a byte
-    /// target forced a search.
+    /// Quality actually used. Differs from the requested quality when a byte
+    /// target forced a search, and is **0 when the format has no quality setting
+    /// and none was applied** — see [`crate::format::OutputFormat::supports_quality`].
+    /// Zero is also what a failed or cancelled file reports, which is the same
+    /// claim: no quality was used to produce this.
     pub quality_used: u8,
     /// False when the byte target could not be met.
     pub target_met: bool,
@@ -135,6 +161,10 @@ pub struct Processed {
 /// Process a single image. This is the unit of work both the single-image and
 /// batch paths use, so a batch result and a one-off result cannot diverge.
 pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Result<Processed> {
+    // A request this build cannot carry out is refused before anything is
+    // decoded, so the user gets a sentence about their settings rather than a
+    // file that quietly misses the ceiling they asked for.
+    settings.validate()?;
     // Header check first: it rejects a hostile file before we allocate a
     // pixel buffer for it.
     crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
@@ -154,17 +184,34 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // never touches the pipeline. See `Pipeline::chroma_subsampling`.
     let options = settings.encoding.with_chroma(pipeline.chroma_subsampling);
 
-    let mut target_met = true;
-    let (mut bytes, quality_used) = match settings.target {
+    // Zero means "no quality setting was applied", which is what a lossless
+    // format gets. Reporting the requested number there would be a claim about a
+    // control that did nothing, and `quality_used` is what the UI shows next to
+    // the file it just wrote.
+    let reported_quality = if settings.format.supports_quality() {
+        options.quality
+    } else {
+        0
+    };
+
+    let (mut bytes, quality_used, target_met) = match settings.target {
         Some(target) if settings.format.supports_byte_target() => {
             let (bytes, q, met) =
                 target.encode_with(&working, settings.format, options, &default_encoder)?;
-            target_met = met;
-            (bytes, q)
+            (bytes, q, met)
         }
-        _ => (
+        // `validate` refuses this combination, so the arm exists for a caller
+        // that skipped it — and it measures rather than assumes, because
+        // `target_met` has to mean the same thing on every path.
+        Some(target) => {
+            let bytes = crate::encode_fixed(&working, settings.format, options)?;
+            let met = bytes.len() as u64 <= target.bytes;
+            (bytes, reported_quality, met)
+        }
+        None => (
             crate::encode_fixed(&working, settings.format, options)?,
-            options.quality,
+            reported_quality,
+            true,
         ),
     };
 
@@ -406,6 +453,95 @@ mod tests {
                 (210.0 - wave * 0.7).clamp(0.0, 255.0) as u8,
             ])
         }))
+    }
+
+    /// A size ceiling on a format that stores the picture exactly cannot be kept
+    /// at any quality, so the request is refused in a sentence that names a
+    /// format which can keep it. Hard rule 9, and the one answer that beats
+    /// quietly handing back an oversized file labelled "done".
+    #[test]
+    fn a_size_ceiling_on_a_lossless_format_is_refused_in_plain_english() {
+        let j = job("1", "photo.jpg", photo(400, 300, 5));
+        for format in [OutputFormat::Png, OutputFormat::Bmp] {
+            let settings = Settings {
+                format,
+                target: Some(TargetBytes::new(8 * 1024)),
+                ..Settings::default()
+            };
+            let err = process_one(&j, &pipeline(200), &settings).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                matches!(err, Error::NoQualitySetting(_)),
+                "{format:?} refused for the wrong reason: {err:?}"
+            );
+            // It has to say what to do instead, and what the file will cost.
+            assert!(
+                text.contains("quality") && text.contains("JPEG"),
+                "{format:?} should name the problem and an alternative: {text}"
+            );
+            assert!(
+                !text.contains("error:") && !text.contains("unsupported or unrecognised"),
+                "the message reads like a diagnostic: {text}"
+            );
+        }
+    }
+
+    /// The refusal is about the *ceiling*, not about the quality slider: one
+    /// global slider sits above the format picker, so PNG output must still work
+    /// with a quality value in the request.
+    #[test]
+    fn a_quality_value_on_a_lossless_format_is_ignored_rather_than_refused() {
+        let j = job("1", "photo.jpg", photo(200, 150, 9));
+        let settings = Settings {
+            format: OutputFormat::Png,
+            encoding: EncodingOptions::default().with_quality(30),
+            ..Settings::default()
+        };
+        let p = process_one(&j, &pipeline(100), &settings).unwrap();
+        assert!(p.outcome.ok());
+        assert_eq!(crate::format::detect_format(&p.bytes).unwrap(), OutputFormat::Png);
+        // And the report does not claim a quality that was never applied.
+        assert_eq!(
+            p.outcome.quality_used, 0,
+            "PNG has no quality setting, so none may be reported as used"
+        );
+        assert!(p.outcome.target_met, "no ceiling was asked for");
+    }
+
+    /// `target_met` has to mean the same thing on every path. A ceiling this
+    /// build can enforce is searched; one it cannot is refused; and a caller that
+    /// skipped the refusal still gets a measured answer rather than an assumed
+    /// "yes".
+    #[test]
+    fn a_reported_target_met_is_always_measured() {
+        let j = job("1", "photo.jpg", photo(600, 400, 11));
+        // Reachable, so the search has to say yes.
+        let reachable = Settings {
+            format: OutputFormat::Jpeg,
+            target: Some(TargetBytes::new(20 * 1024)),
+            ..Settings::default()
+        };
+        let p = process_one(&j, &pipeline(600), &reachable).unwrap();
+        assert!(p.outcome.target_met);
+        assert!(p.outcome.output_bytes <= 20 * 1024);
+        assert!(
+            p.outcome.quality_used > 0,
+            "a lossy format must report the quality that was used"
+        );
+
+        // Unreachable: honest "no" rather than a file that overshot.
+        let impossible = Settings {
+            format: OutputFormat::Jpeg,
+            target: Some(TargetBytes {
+                bytes: 512,
+                min_quality: 80,
+                max_quality: 95,
+            }),
+            ..Settings::default()
+        };
+        let q = process_one(&j, &pipeline(600), &impossible).unwrap();
+        assert!(!q.outcome.target_met, "512 bytes is not reachable here");
+        assert!(q.outcome.output_bytes > 512);
     }
 
     fn options(chroma: crate::format::ChromaSubsampling, progressive: bool) -> Settings {

@@ -187,11 +187,16 @@ mod tests {
         // Writable and readable are different questions, and this tree answers
         // only the first. A UI that inferred "we can write AVIF, therefore we can
         // open one" would offer to preview a file it cannot decode.
+        //
+        // This assertion fails the day an AV1 decoder lands, which is the point:
+        // the flag, the comment above it and `image`'s feature list all have to be
+        // revisited in the same commit, rather than the flag quietly becoming a
+        // claim nobody checked.
         let caps = capabilities();
-        assert!(!caps.avif_decode);
         assert!(
-            !(caps.avif_encode && !caps.avif_decode) || !caps.avif_encode,
-            "if this ever gains a decoder, this test is the place to notice"
+            !caps.avif_decode,
+            "this build now claims an AV1 decoder; update the flag's doc comment and \
+             format::tests::avif_output_is_a_real_avif_container in the same commit"
         );
     }
 

@@ -68,10 +68,13 @@ heic = ["dep:heic-rs"]
 # the same way: the crate compiles anywhere Rust does, which is all four shipped
 # targets.
 #
-# What it costs is build time and AV1 encode being roughly two orders of
-# magnitude slower than JPEG, both documented in docs/ARCHITECTURE.md. The slow
-# part is per file and the batch path parallelises across files, so a 200-image
-# AVIF batch still uses every core.
+# What it costs is build time and AV1 encode speed. Measured in release on the CI
+# runner, single-threaded, one 1600×1200 photo: 3.2 s at quality 70 against 20 ms
+# for a q85 4:2:0 JPEG, and 17 s for a 4032×3024 one. That is roughly two orders
+# of magnitude, and it is the price of the smallest file at a given quality. The
+# slow part is per file and the batch path parallelises across files, so a
+# 200-image AVIF batch still uses every core — but a single AVIF export is a
+# progress bar, not an instant. Both numbers are in docs/ARCHITECTURE.md.
 #
 # The build is on by default but the *decoder* is not, because this tree has no
 # AV1 decoder at all (`image`'s avif-native/dav1d path is not enabled, and

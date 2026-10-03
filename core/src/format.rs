@@ -106,8 +106,12 @@ impl OutputFormat {
     /// True when the encoder writes scan-by-scan rather than in one pass.
     ///
     /// A progressive JPEG shows a coarse image immediately and refines it, so a
-    /// slow network shows something rather than a blank rectangle. It costs a
-    /// few per cent of file size for that, which is why it is not the default.
+    /// slow network shows something rather than a blank rectangle. It is not free
+    /// and it is not a few per cent: measured on a 1600×1200 fixture at q85, a
+    /// progressive 4:2:0 JPEG is 96,938 bytes against 59,200 for the baseline
+    /// file — about 64% more — because the four scans it writes carry the
+    /// coefficients twice. That is why it is off by default and belongs on the
+    /// Web category of a share sheet rather than on every export.
     pub fn supports_progressive(self) -> bool {
         matches!(self, Self::Jpeg)
     }
@@ -143,6 +147,71 @@ impl OutputFormat {
     /// Whether a byte ceiling can be enforced for this format at all.
     pub fn supports_byte_target(self) -> bool {
         self.supports_quality()
+    }
+
+    /// What to tell a person who asked for a quality setting, or a size
+    /// ceiling, that this format has no use for.
+    ///
+    /// Every arm is written out rather than composed from a template because the
+    /// useful sentence is not the same for each: PNG needs a different next step
+    /// from a read-only format, and neither is helped by "unsupported quality".
+    /// Returning a sentence for *every* format, including the ones that do have a
+    /// quality setting, keeps the match exhaustive — a new format cannot be added
+    /// without deciding what it says here.
+    pub fn quality_note(self) -> &'static str {
+        match self {
+            Self::Jpeg => {
+                "JPEG has a quality setting, so the slider does something here. \
+                 60 is a good default for a photo, 90 and above for a screenshot."
+            }
+            Self::Png => {
+                "PNG is stored exactly as it is drawn, so it has no quality setting: the \
+                 file will be as large as the picture needs, whatever the slider says. \
+                 Ask for JPEG or WebP if you need it smaller."
+            }
+            Self::WebP if lossy_webp_enabled() => {
+                "WebP has a quality setting in this build, so the slider does something here."
+            }
+            Self::WebP => {
+                "WebP output in this build is lossless, so it has no quality setting: the \
+                 file will be as large as the picture needs. Ask for JPEG if you need a \
+                 size dial, or rebuild the engine with the webp-lossy feature."
+            }
+            Self::Gif => {
+                "GIF is palette-quantised, so it has no quality setting and a size ceiling \
+                 cannot be applied to it. It is the right choice for an animation, not for a \
+                 photograph. Ask for JPEG or WebP if you need the file to fit under a limit."
+            }
+            Self::Tiff => {
+                "TIFF is stored without lossy compression, so it has no quality setting and a \
+                 size ceiling cannot be applied to it. Use it for editing or printing; ask \
+                 for JPEG or WebP if you need the file to fit under a limit."
+            }
+            Self::Bmp => {
+                "BMP is an uncompressed bitmap with no quality setting, so a size ceiling \
+                 cannot be applied to it. It is here because some tools only read it, not \
+                 because it saves space. Ask for JPEG or WebP if you need a smaller file."
+            }
+            Self::Ico => {
+                "ICO is uncompressed and has no quality setting, so a size ceiling cannot be \
+                 applied to it. Ask for JPEG or WebP if you need a size limit; keep PNG for \
+                 anything that is not a Windows icon."
+            }
+            Self::Avif if avif_encode_enabled() => {
+                "AVIF has a quality setting, and it is the smallest of the formats here \
+                 at a given quality — at the cost of an encode that takes seconds, not \
+                 milliseconds."
+            }
+            Self::Avif => {
+                "This build cannot write AVIF at all, so it has no quality setting to \
+                 offer. Ask for JPEG or WebP, or rebuild the engine with the avif feature."
+            }
+            Self::Heic | Self::Heif => {
+                "HEIC and HEIF are read-only here: this build opens your iPhone photo and \
+                 converts it, but never writes one. Ask for JPEG, PNG or WebP as the \
+                 output format."
+            }
+        }
     }
 
     /// Maps a file extension to a format. Only trusted after [`detect_format`]
@@ -213,8 +282,9 @@ const fn avif_encode_enabled() -> bool {
 /// relative to luma.
 ///
 /// This is a bigger lever on file size than most people expect — a 4:2:0 JPEG
-/// spends a quarter of the chroma samples of a 4:4:4 one, and most photographs
-/// cannot tell. What it costs is *colour detail*, not sharpness: luma stays
+/// spends a quarter of the chroma samples of a 4:4:4 one, and on the measured
+/// 1600×1200 fixture at q85 that is 59,200 bytes against 88,975, a third off the
+/// file. What it costs is *colour detail*, not sharpness: luma stays
 /// full-resolution either way, so edges stay crisp while the colour along them
 /// smears. Text on a coloured background is where it shows: coloured glyph
 /// fringes appear against the background, because the glyph and the background
@@ -466,11 +536,16 @@ pub fn encode(
     Ok(out)
 }
 
-/// rav1e's speed scale is 1 (slowest, smallest) to 10 (fastest, largest). The
-/// default of 4 makes a single phone photo take minutes, which in a resizer
-/// reads as a hung app; 8 keeps a photo well under a second at a cost of a few
-/// per cent in size. This is a constant rather than a setting because there is no
-/// honest way to expose "how many seconds may I take" as a slider.
+/// rav1e's speed scale is 1 (slowest, smallest) to 10 (fastest, largest).
+///
+/// 8 rather than 4 because 4 buys nothing measurable here and costs the whole
+/// wait: on a 1600×1200 fixture at q70 both 4 and 8 produce ~5.8–6.0 KB, while
+/// 10 trades 34% more bytes (7,709) for two thirds of the time (1.2 s against
+/// 3.2 s). This is a constant rather than a setting because there is no honest
+/// way to expose "how many seconds may I take" as a slider — and 3 seconds for
+/// one photo is already the price of AVIF at all, which is why
+/// `docs/ARCHITECTURE.md` treats it as an opt-in for a chosen export rather than
+/// a batch default.
 #[cfg(feature = "avif")]
 const AVIF_SPEED: u8 = 8;
 
@@ -1084,6 +1159,32 @@ mod tests {
             err.to_string().contains("Avif"),
             "the failure should name the format, not 'unsupported': {err}"
         );
+    }
+
+    #[test]
+    fn every_refusal_says_what_to_choose_instead() {
+        // Hard rule 9, asserted over the whole enum so the next format added
+        // cannot ship a dead end. A message that names the problem but not the way
+        // out leaves the user with a failure and no next action, which is the
+        // failure mode the rule is about.
+        for format in OutputFormat::all() {
+            let note = format.quality_note();
+            assert!(!note.trim().is_empty(), "{format:?} has no note at all");
+            assert!(
+                note.ends_with('.') && !note.contains("  "),
+                "{format:?} is not written like a sentence: {note}"
+            );
+            if !format.supports_byte_target() {
+                let names_an_alternative = ["JPEG", "PNG", "WebP", "AVIF"]
+                    .iter()
+                    .any(|name| note.contains(name));
+                assert!(
+                    names_an_alternative,
+                    "{format:?} cannot take a size ceiling, so its note must name a format \
+                     that can: {note}"
+                );
+            }
+        }
     }
 
     #[test]

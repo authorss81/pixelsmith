@@ -43,6 +43,12 @@ impl TargetBytes {
         }
     }
 
+    /// Encode until the file fits `bytes`.
+    ///
+    /// Returns `(bytes, quality_used, target_met)`. `quality_used` is **0 when
+    /// the format has no quality setting** and no search happened — see
+    /// [`crate::format::OutputFormat::supports_quality`]. Reporting a number for
+    /// a control that did nothing would be a claim the caller then displays.
     pub fn encode_with(
         &self,
         img: &image::DynamicImage,
@@ -52,10 +58,11 @@ impl TargetBytes {
     ) -> Result<(Vec<u8>, u8, bool)> {
         if format.is_lossless() || !format.supports_byte_target() {
             // Lossless output does not respond to quality, so searching is
-            // pointless: encode once and report honestly.
+            // pointless: encode once and report honestly — including reporting
+            // that no quality was used, and whether the ceiling was met at all.
             let bytes = encoder(img, format, base.with_quality(self.min_quality))?;
             let len = bytes.len();
-            return Ok((bytes, 100, len as u64 <= self.bytes));
+            return Ok((bytes, 0, len as u64 <= self.bytes));
         }
 
         let lo = self.min_quality.clamp(1, 100);

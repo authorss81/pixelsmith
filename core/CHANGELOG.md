@@ -7,7 +7,55 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Nothing yet. The next entry appears when a phase lands.
+### Added
+
+- **AVIF encode, on by default.** The `avif` feature is back and in `default`,
+  writing through `image`'s own encoder (rav1e via ravif) rather than the
+  hand-written one that never compiled. It is pure Rust with no C toolchain and
+  no build script, which is why it does not carry the caveats the `webp-lossy`
+  and `heic` features do. What it costs is time: 3.2 s for a 1600×1200 photo
+  against 20 ms for JPEG, so a single AVIF export is a progress bar.
+  `capabilities().avif_decode` stays `false` — this tree has no AV1 decoder, and
+  writing a format the build cannot read back is only honest because the flag
+  says so.
+- **Progressive JPEG.** `EncodingOptions::progressive` writes scan-by-scan output,
+  so an image appears at all on a slow connection. It costs about 64% in file
+  size at q85, so it is off by default and JPEG-only.
+- **Chroma subsampling control.** `EncodingOptions::chroma_subsampling`
+  (`Luma444`, `Luma422`, `Luma420`) is honoured by the JPEG encoder, carried by
+  `Pipeline` and `Settings`, and exposed in the JSON request. The default is
+  4:2:0 for photographs; `Preset::chroma` is 4:4:4 for `store-screenshot`, whose
+  content is text on a coloured background. `ChromaSubsampling::trade_off()` is
+  a one-line explanation a UI can show verbatim, and the argument for the default
+  is in `docs/ARCHITECTURE.md`.
+- `Capabilities::jpeg_progressive` and `Capabilities::jpeg_chroma_subsampling`,
+  derived from the same predicates the UI reads per format rather than written
+  as constants, so the list cannot describe a build that no longer exists.
+
+### Changed
+
+- `format::encode`, `lib::encode_fixed`, `lib::process`, `lib::encode_to_target`,
+  `target::Encoder` and `worker::Settings` take an `EncodingOptions` instead of a
+  bare `quality: u8`. Its default is 85, the value every preset already assumed,
+  so no existing export changes.
+- JPEG is written through `jpeg-encoder` rather than `image`'s encoder. That
+  encoder is baseline 4:4:4 with no progressive option, and it picks its own
+  sampling factor from the quality value — which would have made a user's quality
+  slider silently change the picture's colour resolution. `docs/JPEG.md` is the
+  comparison, with the measurements.
+- `Outcome::quality_used` is 0 when the format has no quality setting, instead of
+  reporting the requested number next to a file the slider never influenced.
+- A byte ceiling on a format with no quality setting is now refused with
+  `Error::NoQualitySetting` and a sentence naming a format that can keep it,
+  rather than returning an oversized file with `target_met: true`. A *quality*
+  value on the same format is still ignored: one global slider sits above the
+  format picker, and refusing every PNG export because of it would be absurd.
+
+### Known limitations
+
+- **AVIF cannot be read back.** Recognised on input by brand bytes, refused by
+  name on decode, and reported as `avif_decode: false`. AV1 decode is a second
+  codec and is not in this tree.
 
 ## [0.1.0]
 

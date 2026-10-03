@@ -17,7 +17,7 @@ Nothing below `error.rs` knows anything exists above it.
 | --- | --- | --- |
 | `core/src/lib.rs` | The crate root: the re-export surface, the honest capability list, and the four functions that make up the plain-Rust API (decode, transform, encode, encode-to-target). | `Capabilities`, `capabilities()`, `process()`, `decode_bounded()`, `encode_fixed()`, `encode_to_target()` |
 | `core/src/error.rs` | Every failure mode in the engine, as one enum, plus the `Result<T>` alias. Nothing unwinds out of a public entry point, so a malformed file cannot take down the host process. | `Error`, `Result<T>` |
-| `core/src/format.rs` | What a format *is*: the `OutputFormat` enum, magic-byte detection, the encode dispatch, JPEG APP1 splicing, and output-capacity estimation. Reading is broader than writing, which is normal. | `OutputFormat`, `detect_format()`, `encode()`, `append_exif()` |
+| `core/src/format.rs` | What a format *is*: the `OutputFormat` enum, magic-byte detection, the encode dispatch, the per-format `EncodingOptions` (quality, progressive, chroma), JPEG APP1 splicing, and output-capacity estimation. Reading is broader than writing, which is normal. | `OutputFormat`, `ChromaSubsampling`, `EncodingOptions`, `detect_format()`, `encode()`, `append_exif()` |
 | `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
 | `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
@@ -36,6 +36,7 @@ and a one-off result cannot drift apart.
 
 ```
 bytes off disk
+  → worker::Settings::validate  a request this build cannot carry out is refused here
   → validate::validate_bytes   input size, magic bytes, header dimensions
                               (heic::header for HEIF, image header otherwise)
   → lib::decode_bounded        decoder limits applied, then decode, then re-check
@@ -46,6 +47,118 @@ bytes off disk
   → worker::sanitise_stem      output name, filtered against traversal
   → Vec<u8>
 ```
+
+## Encoding options: quality, progressive, chroma
+
+`format::EncodingOptions` is one struct, not three arguments. It started as a
+bare `quality: u8` and each new knob would have been another parameter on a
+function that already takes an image, a format and a target — through
+`format::encode`, `target::Encoder`, `lib::encode_fixed`, `worker::Settings` and
+two JSON request structs. The struct also gives the options a home in the JSON
+contract, so the next knob is a field rather than a signature change in five
+places and a Dart model.
+
+| Field | Default | Honoured by |
+| --- | --- | --- |
+| `quality` | 85 | JPEG; AVIF and lossy WebP where those encoders are compiled in. Ignored everywhere else. |
+| `progressive` | `false` | JPEG only. |
+| `chroma_subsampling` | `Luma420` | JPEG only. |
+
+85 is the quality every existing preset already assumed, so the default changes
+no existing export's bytes. "Ignored" is deliberate and asserted: a caller with
+one global quality slider should not get an error for choosing PNG output, and
+`format::tests::an_option_a_format_cannot_honour_changes_nothing` pins that a PNG
+is byte-identical whatever the JPEG-only options say. What the engine *refuses*
+is a promise it cannot keep — a byte ceiling on a format with no quality setting
+— and it says so in a sentence naming a format that can (`Settings::validate`,
+`OutputFormat::quality_note`).
+
+Two places a value can be set, and one rule: **`Pipeline::chroma_subsampling`
+wins over `Settings::encoding.chroma_subsampling`**, because the pipeline
+describes the picture and is what a UI sets on it. `Settings` is the fallback for
+a caller that never touches the pipeline. `worker::process_one` applies it, so a
+caller who sets it in only one of the two places gets the behaviour they asked
+for on the path a UI actually uses.
+
+`Outcome.quality_used` is **0 when the format has no quality setting**, because
+that is the honest report: no quality was applied. Zero is also what a failed or
+cancelled file carries, which is the same claim. Before phase-07 the engine
+reported the *requested* 85 for a PNG, next to a file whose size the slider never
+influenced.
+
+### Why 4:2:0 is the default
+
+The phase prompt asked for the argument rather than the number, so here it is.
+
+**What it is.** JPEG stores luma and two colour-difference channels. Chroma
+subsampling is how finely those two are stored: 4:4:4 keeps both at full
+resolution, 4:4:2:0 (usually written 4:2:0) stores a quarter of the chroma
+samples — one for each 2×2 block of luma. Luma resolution never changes, so
+**sharpness is untouched**: this trades colour detail, not edges. That is the
+first thing a user has to be told, because "subsampling" sounds like a
+resolution setting.
+
+**The case for 4:2:0.** This is a photo resizer, and photographs are luma. A
+skin's colour changes across tens of pixels; a sky's across hundreds. Measured
+on a 1600×1200 fixture at q85, 4:2:0 is 59,200 bytes against 88,975 at 4:4:4 —
+**a third of the file** for a difference you cannot see in a photograph. On the
+Web category, where the file is uploaded rather than printed, a third off every
+asset is the difference between a fast site and a slow one, and no competing
+resizer exposes the knob at all.
+
+**The case against it, which is real.** Content whose subject *is* colour
+degrades visibly: red text on a blue background, a logo with hard colour
+boundaries, a UI screenshot. Measured on saturated red-on-blue bars at q95, the
+mean error of the blue-difference channel is 1.04 at 4:4:4 and 22.21 at 4:2:0 —
+**twenty times worse** — while 4:2:2 sits in between at 21.68. Glyphs fringe
+against their background because the glyph and the background are different
+colours one pixel apart. So a default that is right for photographs is wrong for
+screenshots, and the engine must not pretend otherwise.
+
+**The resolution.** The default follows the *content*, and the engine knows what
+the content is: `Preset.chroma` is 4:2:0 for all 40 other presets in the
+catalogue and 4:4:4 for `store-screenshot`, the one whose content is a UI capture
+with text on a coloured background. The JSON request carries
+`pipeline.chroma_subsampling`, so the app can expose the same choice for custom
+work, and `ChromaSubsampling::trade_off()` is a tooltip the UI can show verbatim.
+Nothing is applied silently: `ChromaSubsampling` is `#[serde(default)]` at
+4:2:0 and the doc comment on the enum says why.
+
+**What would change it.** Phase-12. Once ICC profiles are applied, a Display-P3
+photograph decoded correctly will have chroma detail the sRGB pipeline never had,
+and 4:2:0 will start discarding something a user can see. If that turns out to be
+visible on real phone photographs, the default has to move to 4:2:2 — the middle
+level exists for exactly that, and it is 18% off 4:4:4 here rather than 33%.
+
+### Progressive JPEG
+
+Scan-by-scan output shows a coarse picture immediately and refines it, which is
+what makes an image appear at all on a slow connection. It is off by default
+because it is not cheap: measured at q85 4:2:0, 96,938 bytes against 59,200 —
+about 64% more — since the four scans carry some coefficients twice. That belongs
+on a share sheet for "sending over a slow link", not on every export. `docs/JPEG.md`
+is the encoder comparison behind the choice of `jpeg-encoder` over `image`'s.
+
+### AVIF: on by default, and it costs seconds
+
+The `avif` feature is **on by default** (it was removed in phase-01 and
+reinstated here), because it is `image`'s own encoder — rav1e through ravif —
+which is pure Rust with no C toolchain, no nasm and no build script, so the two
+reasons the other opt-in codecs are off do not apply.
+
+What it costs is time. Measured in release, single-threaded, one 1600×1200 photo
+at quality 70: **3.2 s**, against 20 ms for a q85 4:2:0 JPEG — roughly two orders
+of magnitude. A 4032×3024 photo takes 17 s. The batch path parallelises across
+files, so a 200-image AVIF batch still uses every core, but a single AVIF export
+is a progress bar. `AVIF_SPEED` is 8 because 4 measured no smaller (5,967 bytes
+against 5,759 at q70) and 10 measured 34% larger for two thirds off the wait.
+
+The decode direction is the honest half of the story: **this build cannot read
+AVIF back.** `image`'s AV1 decoder (dav1d) is not enabled and `heic-rs` decodes
+HEVC only, so `capabilities().avif_decode` is `false` and a UI must not imply a
+round trip it cannot make. Writing a format you cannot read is still worth it —
+the file leaves the device and the user opens it in a browser — but the capability
+list is where that difference is stated, not left to be discovered.
 
 ## The fixed transform order: crop → orient → resize
 
@@ -127,10 +240,14 @@ decides what a file is; `OutputFormat::from_extension` exists for naming output
 and is documented as untrusted until `detect_format` agrees. A file called
 `photo.png` that contains JPEG is a JPEG.
 
-`OutputFormat::all()` is **not** a list of writable formats. `Avif` is in the
-enum because it is recognised on input, and `format::encode` rejects it with
-`Error::UnsupportedFormat`. What the build can actually write is
-`lib::capabilities()`, which is what the UI greys out.
+`OutputFormat::all()` is **not** a list of writable formats. `Heic` and `Heif` are
+in the enum because they are recognised on input, and `format::encode` rejects
+them with `Error::UnsupportedFormat`. `Avif` is the awkward one: it is both, and
+which one depends on the build — with the `avif` feature it is written, without
+it `is_read_only()` is `true` and the refusal names the feature to turn on. What
+the build can actually write is `lib::capabilities()`, which is what the UI greys
+out, and every per-format predicate is derived from the same `cfg!` that decides
+the dispatch, so the list cannot promise an encoder the build lacks.
 
 **HEIF is detected by reading the container, not by asking a codec.** `image`
 has no HEIF sniffer, so `detect_format` falls back to `heic::detect`, which
@@ -142,9 +259,10 @@ format". `Avif` is reachable from the same fallback, so an AV1-coded file in a
 HEIF container is named rather than misreported — `image`'s sniffer only claims
 `ftypavif`, and a file may be stamped `mif1` with `avif` in its compatible list.
 
-Three formats are read-only: `Avif`, `Heic` and `Heif`. `is_read_only()` is the
-flag the UI reads, and a test asserts it against `format::encode` so the two
-cannot drift into a format the UI offers and the encoder refuses.
+`Heic` and `Heif` are always read-only. `Avif` is read-only only in a build
+without the encoder. `is_read_only()` is the flag the UI reads, and a test
+asserts it against `format::encode` so the two cannot drift into a format the UI
+offers and the encoder refuses.
 
 ## The FFI boundary
 
@@ -197,14 +315,17 @@ Buffer ownership, in full:
 
 | Flag | Default | Effect |
 | --- | --- | --- |
+| `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codecs below are off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
 | `webp-lossy` | off | Swaps in the `webp` crate (libwebp) for lossy WebP. Off by default so the pure-Rust build needs no C toolchain and compiles fast in CI; with it off, WebP output is lossless. |
 | `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default until phase-08 has cross-compiled it for all four shipped targets; CI builds it on every run because CI uses `--all-features`. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
-`default = []`. `lib::capabilities()` is generated from these flags, so adding a
-codec means adding a flag *and* a field there — a capability the UI cannot see
-is a capability the UI will offer and then fail at export time. The HEIC flag is
-`heic_decode`, deliberately not an encode flag: the engine can read HEIC and
-cannot write it, and one boolean cannot honestly say both.
+`default = ["avif"]`. `lib::capabilities()` is generated from these flags, so
+adding a codec means adding a flag *and* a field there — a capability the UI
+cannot see is a capability the UI will offer and then fail at export time. The
+HEIC flag is `heic_decode`, deliberately not an encode flag: the engine can read
+HEIC and cannot write it, and one boolean cannot honestly say both. AVIF is the
+same shape inverted — `avif_encode` on, `avif_decode` off, because this tree has
+no AV1 decoder in any configuration.
 
 ## Gotchas
 
@@ -235,12 +356,15 @@ named so you can check the handling rather than re-derive it.
    whatsoever, which is precisely how `payload.png` gets treated as a JPEG.
    Handled in `core/src/format.rs`, and `worker::Job::name` documents that it is
    a display name only.
-6. **`OutputFormat::Avif` exists but cannot be written.** It is in the enum so
-   AVIF input is recognised and reported; `format::encode` returns
-   `Error::UnsupportedFormat` for it. An earlier `ravif`-based encoder behind an
+6. **`OutputFormat::Avif` is writable only when the feature is on.** It is both a
+   recognised input and a real output in the default build, and
+   `is_read_only()` returns `!avif_encode_enabled()` so the two cannot disagree;
+   a build without the feature gets the same "this build cannot write it, choose
+   JPEG or WebP" refusal HEIC gets. An earlier `ravif`-based encoder behind an
    `avif` feature never compiled and broke every verification run, so it was
-   deleted rather than excepted. Handled in `core/src/format.rs` (`encode`) and
-   `core/src/lib.rs` (`avif_encode: false`).
+   deleted rather than excepted — `image`'s own AVIF encoder is what replaced
+   it. Handled in `core/src/format.rs` (`encode_avif`, both `cfg` arms) and
+   `core/src/lib.rs` (`avif_encode: cfg!(feature = "avif")`).
 7. **`image::Limits` is `#[non_exhaustive]`.** It cannot be constructed with a
    struct literal, so `apply_to_decoder` starts from `Default` and narrows only
    the three fields it cares about. Handled in `core/src/validate.rs`
@@ -297,6 +421,42 @@ named so you can check the handling rather than re-derive it.
     reporting `OutputFormat::Avif` for an AV1-coded HEIF: naming a format is not
     the same as being able to read it. Handled in `core/src/heic.rs` (`detect`,
     which has no `cfg` on it) and `core/src/format.rs` (`detect_format`).
+16. **`image`'s JPEG encoder writes baseline 4:4:4 and chooses its own sampling
+    factor from the quality value.** It has no progressive option at all, and it
+    switches from 4:2:0 to 4:4:4 at quality 90 — so leaving it in charge would
+    make a user's quality slider silently change the picture's colour
+    resolution, which is the kind of change no caller asks for and no test sees.
+    JPEG is therefore written through `jpeg-encoder`, and the sampling factor is
+    set explicitly on every encode. Handled in `core/src/format.rs`
+    (`encode_jpeg`), with the comparison in `docs/JPEG.md`.
+17. **`jpeg_encoder::SamplingFactor` counts luma samples per chroma sample, so
+    JPEG's 4:2:0 is `F_2_2`.** The two spellings read backwards relative to each
+    other, and a "correction" applied at the call site instead of in the mapping
+    would hand the encoder a file with twice the chroma samples asked for. All
+    three levels go through `ChromaSubsampling::sampling_factor`, the only place
+    the translation exists.
+18. **`quality_used: 0` means no quality setting was applied.** It is not a
+    failed encode and not "quality zero". A lossless format has no quality knob,
+    so the honest report for a PNG is 0 rather than the 85 the caller asked for —
+    the UI shows that number next to the file it just wrote, so a wrong one is a
+    claim about the user's own export. Handled in `core/src/worker.rs`
+    (`process_one`) and `core/src/target.rs` (`encode_with`).
+19. **A size ceiling on a format with no quality setting cannot be honoured at
+    any slider position.** The engine refuses it rather than returning an
+    oversized file with `target_met: true`, which is the one answer hard rule 9
+    forbids. Only the *ceiling* is refused: a quality value on the same format is
+    ignored, because one global quality slider sits above the format picker and
+    refusing every PNG export because of it would be absurd. Handled in
+    `core/src/worker.rs` (`Settings::validate`) with the sentence in
+    `OutputFormat::quality_note`.
+20. **The suite's wall clock is the preset test, not AVIF.**
+    `presets::tests::presets_convert_to_working_pipelines` runs 41 Lanczos3
+    resamples of a 4000×3000 image — about six seconds each in the debug build
+    `verify.sh` runs, so roughly four minutes of the total. A single AVIF encode
+    is ~0.5 s in the same build, which is fast enough not to matter. Neither is a
+    regression, but a `cargo test` that takes minutes rather than seconds is
+    worth recognising as normal before someone tries to speed the codecs up.
+
 
 ## Verification
 

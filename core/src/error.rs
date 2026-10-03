@@ -12,6 +12,13 @@ pub enum Error {
     #[error("{0}")]
     UnsupportedFormat(&'static str),
 
+    /// A setting the chosen format cannot act on was asked for: a byte ceiling,
+    /// or a quality value, on a format that stores the picture exactly. The
+    /// payload is a sentence written for a person, not a diagnostic — see
+    /// [`crate::format::OutputFormat::quality_note`].
+    #[error("{0}")]
+    NoQualitySetting(&'static str),
+
     #[error("image is larger than the {limit} byte input limit ({actual} bytes)")]
     InputTooLarge { limit: usize, actual: usize },
 
