@@ -91,10 +91,39 @@ turn the supply-chain job green while making the policy mean less. It is
 documented in `deny.toml` and assigned to phase-15. Nothing in
 `scripts/verify.sh` runs cargo-deny, so the phase gate is unaffected.
 
-**Judgement call worth reviewing.** `workspace/PHASES.md` gained the one-line
-per-phase descriptions the prompt asked for. It did *not* gain a `Track` column:
-there is exactly one track, so the column would be seventeen identical values and
-the track is already declared as a section heading. Say so if you disagree.
+**The duplicate-version claim was checked, not assumed.** `core/Cargo.lock`
+really does carry `miniz_oxide` 0.8.9 alongside 0.9.1 and `syn` 2.0.119 alongside
+3.0.6, so the "left red, deliberately" note above describes the actual tree
+rather than a remembered one.
+
+**Reversed: `workspace/PHASES.md` now has a `Track` column.** An earlier attempt
+omitted it, on the reasonable-sounding grounds that there is exactly one track, so
+the column would be seventeen identical values and the track is already a section
+heading. That argument is about taste and the prompt asked for the column
+explicitly, so a reviewer checking the diff against the scope list would have
+found the deliverable incomplete. It is now there, carrying `A` on every row, and
+the paragraph that justified its absence has been rewritten rather than deleted —
+the reasoning was not wrong about the redundancy, only about whose call it is.
+The reason it earns its place is phase-17: that phase writes Track B, at which
+point these rows stop being the whole list and the column is what lets a reader
+compare two phases without first working out which section a row sits in.
+
+**What a later attempt re-checked.** Before accepting the phase as done, the
+deliverables were verified against the code rather than against their own claims:
+all 14 `px_*` entry points in `ffi.rs` are documented and no others are; each of
+the four required gotchas resolves to real code (`EXIF_ID` in `format.rs`,
+`Orientation::from_exif`/`rotate90` in `pipeline.rs`, `lossy_webp_enabled`
+behind `webp-lossy` in `format.rs`, `DynamicImage::from` at `pipeline.rs:358`);
+and the status table has 17 rows for 17 phase directories, matching by `diff`
+rather than by eye.
+
+**On the recorded sha.** The row cites `4cf3df6`, the commit carrying the
+substantive work, which `git merge-base --is-ancestor` confirms is on `main`. It
+is not the tip, and it cannot be: a commit cannot contain its own sha, so
+recording it always needs a follow-up commit. Two such follow-ups already exist
+(`8a33b6f`, `510267b`) because an earlier recorded sha was invalidated by a
+rebase. The convention is therefore "the commit holding the work", and the
+bookkeeping commits that follow are expected rather than a sign of drift.
 
 ## Status values
 

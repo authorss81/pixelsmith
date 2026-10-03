@@ -38,29 +38,31 @@ not gets another attempt.
 Current scope. `core/` is the Rust engine; `app/` does not exist until phase-05.
 
 Order is execution order, so this table is the single place to look when asking
-"what happens next". The Track is not a column because there is exactly one
-track in existence; a second track becomes a second section, which reads better
-than a column of identical values.
+"what happens next". The Track column carries `A` seventeen times today, which
+looks redundant until phase-17 writes Track B: at that point these rows stop being
+the whole list, and a reader comparing two phases needs the track visible in the
+same glance as the title rather than inferring it from which section the row
+happens to sit in.
 
-| Phase | Title | Depends on | Timeout | What it does |
-| --- | --- | --- | --- | --- |
-| [phase-01](phase-01/PROMPT.md) | Verification baseline and project scaffolding | — | 60 | Makes `scripts/verify.sh` green and writes the config and docs every later phase depends on. |
-| [phase-02](phase-02/PROMPT.md) | Fuzz harness for every decode path | 01 | 90 | Puts a fuzz target on every entry point that touches untrusted bytes. |
-| [phase-03](phase-03/PROMPT.md) | Hostile-input corpus and property tests | 02 | 75 | Turns fuzz findings into permanent regression tests, plus property tests for dimension arithmetic, path sanitisation and the byte-target search. |
-| [phase-04](phase-04/PROMPT.md) | Sandboxed decode worker with a hard memory cap | 03 | 90 | Moves decode into a subprocess with a real address-space limit. |
-| [phase-05](phase-05/PROMPT.md) | Dart FFI binding layer and Flutter app skeleton | 04 | 90 | The first user-facing code: a Dart wrapper over `px_*`, and a window that opens. |
-| [phase-06](phase-06/PROMPT.md) | HEIC/HEIF decode | 05 | 90 | The format every modern phone camera actually writes. |
-| [phase-07](phase-07/PROMPT.md) | AVIF encode, progressive JPEG, chroma subsampling | 06 | 90 | Closes the honesty gap: the formats we report must be the formats we write. |
-| [phase-08](phase-08/PROMPT.md) | Lossy WebP via libwebp, verified on every target | 07 | 90 | Turns on `webp-lossy` and proves it builds and behaves on all five targets. |
-| [phase-09](phase-09/PROMPT.md) | SIMD resize path behind a feature flag | 08 | 90 | A SIMD resize path, with the pure-Rust kernel kept as the correctness oracle and the two proven to agree. |
-| [phase-10](phase-10/PROMPT.md) | Benchmarks and a performance regression gate | 09 | 75 | Makes "slower" a red build instead of something nobody notices. |
-| [phase-11](phase-11/PROMPT.md) | Low-peak-memory decode for very large images | 10 | 90 | Decodes a 200 MP panorama in roughly one pixel buffer instead of two, so a phone OS does not kill it. |
-| [phase-12](phase-12/PROMPT.md) | Colour management: sRGB, Display-P3 and ICC | 11 | 90 | Stops wide-gamut photos from washing out on an sRGB display. |
-| [phase-13](phase-13/PROMPT.md) | Animated GIF: honest handling | 12 | 75 | Either preserves animation properly or refuses clearly, never silently flattens. |
-| [phase-14](phase-14/PROMPT.md) | Content-hash deduplication and a folder pipeline | 13 | 75 | Does the whole folder, and skips the copies that are already identical. |
-| [phase-15](phase-15/PROMPT.md) | Supply-chain policy and reproducible builds | 14 | 90 | Closes the `cargo deny` bans failure and makes a build reproducible byte-for-byte. |
-| [phase-16](phase-16/PROMPT.md) | **Release artefacts: the APK and the EXE** | 15 | 90 | Publishes installable, checksummed binaries. Delivery phase. |
-| [phase-17](phase-17/PROMPT.md) | Self-audit and next-phase generation | 16 | 90 | Audits what exists and generates the phase set after this one. |
+| Phase | Track | Title | Depends on | Timeout | What it does |
+| --- | --- | --- | --- | --- | --- |
+| [phase-01](phase-01/PROMPT.md) | A | Verification baseline and project scaffolding | — | 60 | Makes `scripts/verify.sh` green and writes the config and docs every later phase depends on. |
+| [phase-02](phase-02/PROMPT.md) | A | Fuzz harness for every decode path | 01 | 90 | Puts a fuzz target on every entry point that touches untrusted bytes. |
+| [phase-03](phase-03/PROMPT.md) | A | Hostile-input corpus and property tests | 02 | 75 | Turns fuzz findings into permanent regression tests, plus property tests for dimension arithmetic, path sanitisation and the byte-target search. |
+| [phase-04](phase-04/PROMPT.md) | A | Sandboxed decode worker with a hard memory cap | 03 | 90 | Moves decode into a subprocess with a real address-space limit. |
+| [phase-05](phase-05/PROMPT.md) | A | Dart FFI binding layer and Flutter app skeleton | 04 | 90 | The first user-facing code: a Dart wrapper over `px_*`, and a window that opens. |
+| [phase-06](phase-06/PROMPT.md) | A | HEIC/HEIF decode | 05 | 90 | The format every modern phone camera actually writes. |
+| [phase-07](phase-07/PROMPT.md) | A | AVIF encode, progressive JPEG, chroma subsampling | 06 | 90 | Closes the honesty gap: the formats we report must be the formats we write. |
+| [phase-08](phase-08/PROMPT.md) | A | Lossy WebP via libwebp, verified on every target | 07 | 90 | Turns on `webp-lossy` and proves it builds and behaves on all five targets. |
+| [phase-09](phase-09/PROMPT.md) | A | SIMD resize path behind a feature flag | 08 | 90 | A SIMD resize path, with the pure-Rust kernel kept as the correctness oracle and the two proven to agree. |
+| [phase-10](phase-10/PROMPT.md) | A | Benchmarks and a performance regression gate | 09 | 75 | Makes "slower" a red build instead of something nobody notices. |
+| [phase-11](phase-11/PROMPT.md) | A | Low-peak-memory decode for very large images | 10 | 90 | Decodes a 200 MP panorama in roughly one pixel buffer instead of two, so a phone OS does not kill it. |
+| [phase-12](phase-12/PROMPT.md) | A | Colour management: sRGB, Display-P3 and ICC | 11 | 90 | Stops wide-gamut photos from washing out on an sRGB display. |
+| [phase-13](phase-13/PROMPT.md) | A | Animated GIF: honest handling | 12 | 75 | Either preserves animation properly or refuses clearly, never silently flattens. |
+| [phase-14](phase-14/PROMPT.md) | A | Content-hash deduplication and a folder pipeline | 13 | 75 | Does the whole folder, and skips the copies that are already identical. |
+| [phase-15](phase-15/PROMPT.md) | A | Supply-chain policy and reproducible builds | 14 | 90 | Closes the `cargo deny` bans failure and makes a build reproducible byte-for-byte. |
+| [phase-16](phase-16/PROMPT.md) | A | **Release artefacts: the APK and the EXE** | 15 | 90 | Publishes installable, checksummed binaries. Delivery phase. |
+| [phase-17](phase-17/PROMPT.md) | A | Self-audit and next-phase generation | 16 | 90 | Audits what exists and generates the phase set after this one. |
 
 ### phase-16 is the delivery phase
 
