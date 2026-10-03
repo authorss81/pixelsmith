@@ -499,7 +499,10 @@ mod tests {
         };
         let p = process_one(&j, &pipeline(100), &settings).unwrap();
         assert!(p.outcome.ok());
-        assert_eq!(crate::format::detect_format(&p.bytes).unwrap(), OutputFormat::Png);
+        assert_eq!(
+            crate::format::detect_format(&p.bytes).unwrap(),
+            OutputFormat::Png
+        );
         // And the report does not claim a quality that was never applied.
         assert_eq!(
             p.outcome.quality_used, 0,

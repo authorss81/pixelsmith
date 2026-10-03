@@ -1100,7 +1100,11 @@ mod tests {
             let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
             assert_eq!(status, PxStatus::Ok as u32, "{msg}");
             let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
-            assert_eq!(report.failed(), 2, "every file carries the same bad setting");
+            assert_eq!(
+                report.failed(),
+                2,
+                "every file carries the same bad setting"
+            );
             let error = report.outcomes[0].error.as_deref().unwrap_or("");
             assert!(error.contains("quality"), "{error}");
             assert_eq!(report.outcomes[0].quality_used, 0);

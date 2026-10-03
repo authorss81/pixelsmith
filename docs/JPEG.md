@@ -60,10 +60,10 @@ Measured in release on the CI runner, 1600×1200, one thread, no EXIF:
 
 | Output | Bytes | Encode |
 | --- | --- | --- |
-| JPEG q85 4:4:4 baseline | 88,975 | 33 ms |
+| JPEG q85 4:4:4 baseline | 88,975 | 35 ms |
 | JPEG q85 4:2:2 baseline | 72,724 | 26 ms |
 | JPEG q85 4:2:0 baseline | 59,200 | 20 ms |
-| JPEG q85 4:2:0 progressive | 96,938 | 25 ms |
+| JPEG q85 4:2:0 progressive | 96,938 | 26 ms |
 
 Progressive costs about 64% at q85 here, not "a few per cent": the four scans
 carry some coefficients twice. `OutputFormat::supports_progressive` says so with
@@ -72,13 +72,14 @@ ends up wondering where the file size went.
 
 Chroma error, measured as mean absolute error of the blue-difference channel on
 saturated red-on-blue bars at q95 — the content that decides whether 4:2:0 is
-honest:
+honest. The bars are `format::tests::colour_bars(240, 160)`, so the figure is
+reproducible from the test module rather than from a file nobody else has:
 
 | Level | Chroma error |
 | --- | --- |
-| 4:4:4 | 1.04 |
-| 4:2:2 | 21.68 |
-| 4:2:0 | 22.21 |
+| 4:4:4 | 1.05 |
+| 4:2:2 | 21.18 |
+| 4:2:0 | 21.75 |
 
 That is the argument for the default, in numbers: 4:2:0 is a third off the file
 of a photograph and twenty times worse on a screenshot. `docs/ARCHITECTURE.md`

@@ -109,8 +109,8 @@ resizer exposes the knob at all.
 **The case against it, which is real.** Content whose subject *is* colour
 degrades visibly: red text on a blue background, a logo with hard colour
 boundaries, a UI screenshot. Measured on saturated red-on-blue bars at q95, the
-mean error of the blue-difference channel is 1.04 at 4:4:4 and 22.21 at 4:2:0 —
-**twenty times worse** — while 4:2:2 sits in between at 21.68. Glyphs fringe
+mean error of the blue-difference channel is 1.05 at 4:4:4 and 21.75 at 4:2:0 —
+**twenty times worse** — while 4:2:2 sits in between at 21.18. Glyphs fringe
 against their background because the glyph and the background are different
 colours one pixel apart. So a default that is right for photographs is wrong for
 screenshots, and the engine must not pretend otherwise.

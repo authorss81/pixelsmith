@@ -1,0 +1,397 @@
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 853a3f1..f550dc9 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -63,6 +63,28 @@ enum ResampleFilter {
+   };
+ }
+ 
++/// Chroma resolution. Matches `ChromaSubsampling` in `core/src/format.rs`,
++/// which is `snake_case`, so the wire names are `luma444`, `luma422` and
++/// `luma420`.
++///
++/// This is not a quality slider wearing a different hat. Luma resolution never
++/// changes, so sharpness is identical at all three; what changes is how finely
++/// colour is stored. 4:2:0 keeps a quarter of the colour samples and is the
++/// right default for a photograph; 4:2:2 is the middle; 4:4:4 is the only level
++/// that keeps colour detail on hard edges, which is what text on a coloured
++/// background is. The argument, with the measurements, is in
++/// `docs/ARCHITECTURE.md`.
++enum ChromaSubsampling {
++  luma444,
++  luma422,
++  luma420;
++
++  String toJson() => name;
++
++  static ChromaSubsampling fromJson(String value) =>
++      ChromaSubsampling.values.byName(value);
++}
++
+ /// EXIF orientation correction. Matches `Orientation` in `core/src/pipeline.rs`.
+ enum Orientation {
+   normal,
+@@ -152,6 +174,7 @@ final class Pipeline {
+     this.orientation,
+     this.resize,
+     this.stripMetadata = true,
++    this.chromaSubsampling = ChromaSubsampling.luma420,
+   });
+ 
+   final CropSpec? crop;
+@@ -162,11 +185,22 @@ final class Pipeline {
+   /// GPS coordinates, and keeping them silently would publish that.
+   final bool stripMetadata;
+ 
++  /// Chroma resolution of the output. Lives on the pipeline rather than beside
++  /// the format because it describes the *picture*, not the file container: it
++  /// is a decision about what is in the image that a UI makes once and applies
++  /// whichever encoder it ends up with.
++  ///
++  /// The default is 4:2:0 because this is a photo resizer. Switch to
++  /// [ChromaSubsampling.luma444] for screenshots, logos and anything with text
++  /// on a coloured background, where 4:2:0 visibly fringes the glyphs.
++  final ChromaSubsampling chromaSubsampling;
++
+   Map<String, Object?> toJson() => {
+     'crop': crop?.toJson(),
+     'orientation': orientation?.toJson(),
+     'resize': resize?.toJson(),
+     'strip_metadata': stripMetadata,
++    'chroma_subsampling': chromaSubsampling.toJson(),
+   };
+ }
+ 
+@@ -264,6 +298,7 @@ final class Preset {
+     required this.width,
+     required this.height,
+     required this.format,
++    required this.chroma,
+   });
+ 
+   final String id;
+@@ -272,12 +307,18 @@ final class Preset {
+   final int? height;
+   final OutputFormat format;
+ 
++  /// Chroma level the preset exports at. Every preset is JPEG or WebP, and
++  /// `store-screenshot` is the one at 4:4:4 — a UI capture is text on a
++  /// coloured background, which is exactly the content 4:2:0 fringes.
++  final ChromaSubsampling chroma;
++
+   static Preset fromJson(Map<String, Object?> json) => Preset(
+     id: json['id'] as String,
+     label: json['label'] as String,
+     width: (json['width'] as num).toInt(),
+     height: (json['height'] as num?)?.toInt(),
+     format: OutputFormat.fromJson(json['format'] as String),
++    chroma: ChromaSubsampling.fromJson(json['chroma'] as String),
+   );
+ }
+ 
+@@ -395,13 +436,37 @@ final class Capabilities {
+     required this.version,
+     required this.webpLossy,
+     required this.avifEncode,
++    required this.avifDecode,
++    required this.jpegProgressive,
++    required this.jpegChromaSubsampling,
+     required this.maxInputBytes,
+     required this.maxPixels,
+   });
+ 
+   final String version;
+   final bool webpLossy;
++
++  /// Whether AVIF can be *written*. True in the default build. It is not the
++  /// whole story, which is why [avifDecode] is a separate field: one boolean
++  /// for both directions would tell a user we could open the file we just
++  /// produced.
+   final bool avifEncode;
++
++  /// Whether AVIF can be *read*. False in every build of this engine, because
++  /// there is no AV1 decoder in the tree. A UI that greys out nothing and then
++  /// fails to preview its own export is the failure this field exists to
++  /// prevent.
++  final bool avifDecode;
++
++  /// Whether the JPEG encoder writes scan-by-scan output. Costs about 64% in
++  /// file size at q85; it belongs on "sending this over a slow link", not on
++  /// every export.
++  final bool jpegProgressive;
++
++  /// Whether the JPEG encoder honours a chroma resolution. False would mean a
++  /// chroma control in the UI that does nothing.
++  final bool jpegChromaSubsampling;
++
+   final int maxInputBytes;
+   final int maxPixels;
+ 
+@@ -411,6 +476,9 @@ final class Capabilities {
+       version: json['version'] as String,
+       webpLossy: caps['webp_lossy'] as bool,
+       avifEncode: caps['avif_encode'] as bool,
++      avifDecode: caps['avif_decode'] as bool,
++      jpegProgressive: caps['jpeg_progressive'] as bool,
++      jpegChromaSubsampling: caps['jpeg_chroma_subsampling'] as bool,
+       maxInputBytes: (caps['max_input_bytes'] as num).toInt(),
+       maxPixels: (caps['max_pixels'] as num).toInt(),
+     );
+@@ -430,10 +498,16 @@ abstract final class Requests {
+     int? targetBytes,
+     bool? stripMetadata,
+     bool mobileLimits = false,
++    bool progressive = false,
+   }) => jsonEncode({
+     'pipeline': pipeline.toJson(),
+     'format': format.toJson(),
+     'quality': quality,
++    // A top-level key beside `quality`, not a field on the pipeline: scan order
++    // is a property of the encoder writing the file, while chroma resolution is
++    // a property of the picture. The engine puts the same split in its own
++    // request structs, so the two cannot disagree about which is which.
++    'progressive': progressive,
+     'target': targetBytes,
+     'name': name,
+     'data_base64': base64Encode(imageBytes),
+@@ -449,10 +523,15 @@ abstract final class Requests {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    bool progressive = false,
+   }) => jsonEncode({
++    // The pipeline's fields are spread at the top level because the engine's
++    // batch request inlines them; `chroma_subsampling` arrives the same way as
++    // `strip_metadata` does.
+     ...pipeline.toJson(),
+     'format': format.toJson(),
+     'quality': quality,
++    'progressive': progressive,
+     'target': targetBytes,
+     'mobile_limits': mobileLimits,
+     'cancel': cancelHandle,
+diff --git a/test/ffi_contract_test.dart b/test/ffi_contract_test.dart
+index b754f98..5482239 100644
+--- a/test/ffi_contract_test.dart
++++ b/test/ffi_contract_test.dart
+@@ -1,9 +1,11 @@
++import 'dart:convert';
+ import 'dart:ffi' as ffi;
+ import 'dart:io';
+ 
+ import 'package:ffi/ffi.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/bindings.dart';
++import 'package:shrinkray/rust/models.dart';
+ 
+ /// The contract test: every `px_*` function the engine exports must have a
+ /// matching Dart declaration, and the `PxBuffer` layout must match byte for
+@@ -89,6 +91,42 @@ void main() {
+       calloc.free(again);
+     }
+   });
++
++  test('the encoder capabilities parse through the Dart model', () {
++    // `Capabilities.fromJson` casts every field, so a key the engine sends and
++    // the model does not name throws here rather than reading as absent in the
++    // UI. Asserted against the library that was actually loaded, not against a
++    // hand-written JSON literal, because the failure this guards against is
++    // precisely the model and the engine disagreeing.
++    final lib = _tryLoad();
++    if (lib == null) {
++      markTestSkipped(
++        'native library not built — run the native build first (see README.md)',
++      );
++      return;
++    }
++    final px = PxBindings(lib);
++    final buffer = px.version();
++    try {
++      final json =
++          jsonDecode(
++                utf8.decode(
++                  buffer.data.cast<ffi.Uint8>().asTypedList(buffer.len),
++                ),
++              )
++              as Map<String, Object?>;
++      final caps = Capabilities.fromJson(json);
++      expect(caps.jpegProgressive, isTrue);
++      expect(caps.jpegChromaSubsampling, isTrue);
++      // Writable and not readable: the default build has an AVIF encoder and no
++      // AV1 decoder. A model that collapsed these into one field would claim a
++      // round trip the engine cannot make.
++      expect(caps.avifEncode, isTrue);
++      expect(caps.avifDecode, isFalse);
++    } finally {
++      px.bufferFree(buffer);
++    }
++  });
+ }
+ 
+ /// Returns the engine library, or null when it has not been built.
+diff --git a/test/models_test.dart b/test/models_test.dart
+index 949c83d..660af34 100644
+--- a/test/models_test.dart
++++ b/test/models_test.dart
+@@ -45,6 +45,28 @@ void main() {
+     });
+   });
+ 
++  group('ChromaSubsampling', () {
++    test('serialises the names the Rust enum produces', () {
++      // `#[serde(rename_all = "snake_case")]` on `Luma444`/`Luma422`/`Luma420`
++      // gives exactly these three strings. A Dart-side `luma4_4_4` would be a
++      // silent "bad request", which is the failure this assertion exists to
++      // prevent.
++      expect(ChromaSubsampling.luma444.toJson(), 'luma444');
++      expect(ChromaSubsampling.luma422.toJson(), 'luma422');
++      expect(ChromaSubsampling.luma420.toJson(), 'luma420');
++    });
++
++    test('round-trips every value', () {
++      for (final chroma in ChromaSubsampling.values) {
++        expect(ChromaSubsampling.fromJson(chroma.toJson()), chroma);
++      }
++    });
++
++    test('rejects an unknown level rather than guessing', () {
++      expect(() => ChromaSubsampling.fromJson('luma411'), throwsArgumentError);
++    });
++  });
++
+   group('Pipeline', () {
+     test('serialises with the exact keys the engine expects', () {
+       const pipeline = Pipeline(
+@@ -69,6 +91,21 @@ void main() {
+       expect((pipeline.toJson())['strip_metadata'], isTrue);
+     });
+ 
++    test('chroma defaults to 4:2:0, and says so on the wire', () {
++      // The phase prompt asks for a default of Luma420, and a default the wire
++      // does not carry is not a default — it is a coincidence between the
++      // constructor and the engine's own `#[serde(default)]`. Asserted on the
++      // serialised map so the two cannot drift apart silently.
++      const pipeline = Pipeline();
++      expect(pipeline.chromaSubsampling, ChromaSubsampling.luma420);
++      expect((pipeline.toJson())['chroma_subsampling'], 'luma420');
++    });
++
++    test('an explicit 4:4:4 reaches the request', () {
++      const pipeline = Pipeline(chromaSubsampling: ChromaSubsampling.luma444);
++      expect((pipeline.toJson())['chroma_subsampling'], 'luma444');
++    });
++
+     test('noUpscale defaults to true', () {
+       // Upscaling past native resolution adds bytes and zero detail.
+       const spec = ResizeSpec(width: 8000);
+@@ -93,6 +130,110 @@ void main() {
+       // [1, 2, 3] as base64.
+       expect(body, contains('"data_base64":"AQID"'));
+     });
++
++    test('carries chroma on the pipeline and progressive beside it', () {
++      // Two different decisions in two different places: chroma resolution
++      // describes the picture and belongs to the pipeline, scan order describes
++      // the encoder and sits beside `quality`. The engine splits them the same
++      // way, and a request that put `progressive` inside `pipeline` would be
++      // silently ignored.
++      final body = Requests.process(
++        pipeline: const Pipeline(chromaSubsampling: ChromaSubsampling.luma444),
++        format: OutputFormat.jpeg,
++        imageBytes: const [1],
++        name: 'photo.jpg',
++        progressive: true,
++      );
++      expect(body, contains('"chroma_subsampling":"luma444"'));
++      expect(body, contains('"progressive":true'));
++    });
++
++    test('progressive is off unless it is asked for', () {
++      // Off by default because it costs about 64% in file size at q85. A
++      // default-on default would inflate every export for a benefit only a slow
++      // link can use.
++      final body = Requests.process(
++        pipeline: const Pipeline(),
++        format: OutputFormat.jpeg,
++        imageBytes: const [1],
++        name: 'photo.jpg',
++      );
++      expect(body, contains('"progressive":false'));
++    });
++  });
++
++  group('Requests.batch', () {
++    test('inlines the pipeline, so chroma travels with it', () {
++      final body = Requests.batch(
++        pipeline: const Pipeline(chromaSubsampling: ChromaSubsampling.luma444),
++        format: OutputFormat.jpeg,
++        files: const [
++          BatchFile(name: 'a.jpg', bytes: [1]),
++        ],
++        progressive: true,
++      );
++      expect(body, contains('"chroma_subsampling":"luma444"'));
++      expect(body, contains('"progressive":true'));
++    });
++  });
++
++  group('Preset', () {
++    test('reads the chroma level the engine sends', () {
++      // A preset is a promise about an export, and `store-screenshot` is the
++      // one at 4:4:4. A Dart model without this field would drop the decision
++      // the catalogue made and export the screenshot at 4:2:0.
++      final preset = Preset.fromJson(const {
++        'id': 'store-screenshot',
++        'label': 'Play Store screenshot',
++        'width': 1080,
++        'height': 1920,
++        'format': 'jpeg',
++        'chroma': 'luma444',
++      });
++      expect(preset.chroma, ChromaSubsampling.luma444);
++    });
++  });
++
++  group('Capabilities', () {
++    test('reads the snake_case keys the engine sends', () {
++      final caps = Capabilities.fromJson({
++        'version': '0.1.0',
++        'capabilities': {
++          'webp_lossy': false,
++          'avif_encode': true,
++          'avif_decode': false,
++          'jpeg_progressive': true,
++          'jpeg_chroma_subsampling': true,
++          'max_input_bytes': 536870912,
++          'max_pixels': 128000000,
++        },
++      });
++      expect(caps.avifEncode, isTrue);
++      // Writable and not readable are separate questions, and the default build
++      // answers them differently. One boolean for both would have told a user we
++      // could open the file we just wrote.
++      expect(caps.avifDecode, isFalse);
++      expect(caps.jpegProgressive, isTrue);
++      expect(caps.jpegChromaSubsampling, isTrue);
++      expect(caps.maxPixels, 128000000);
++    });
++
++    test('a missing field is an error, not a default', () {
++      // Reading a capability as absent is how a build that cannot do something
++      // ends up offering it, so every field is cast rather than defaulted.
++      expect(
++        () => Capabilities.fromJson({
++          'version': '0.1.0',
++          'capabilities': {
++            'webp_lossy': false,
++            'avif_encode': true,
++            'max_input_bytes': 1,
++            'max_pixels': 1,
++          },
++        }),
++        throwsA(isA<TypeError>()),
++      );
++    });
+   });
+ 
+   group('ProcessResult', () {

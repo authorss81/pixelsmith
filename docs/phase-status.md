@@ -18,7 +18,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
 | phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
 | phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
-| phase-07 | AVIF encode, progressive JPEG, chroma subsampling | PENDING | | |
+| phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | (this commit) | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
 | phase-08 | Lossy WebP via libwebp, verified on every target | PENDING | | |
 | phase-09 | SIMD resize path behind a feature flag | PENDING | | |
 | phase-10 | Benchmarks and a performance regression gate | PENDING | | |
@@ -300,6 +300,126 @@ asserted behaviour with the reasoning attached, rather than a weakened test.
   lacks is a crash) and `heicDecode` to `Capabilities`. It applies cleanly to
   `3ed1eb4` and was run through `flutter analyze` and `flutter test` (20 passed)
   before being captured.
+
+## phase-07 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with
+`--all-features` (152 Rust tests, 17 Flutter tests, none skipped).
+
+**The two previous attempts had finished the work and were stopped by rustfmt.**
+Both `4f45606` and `e9e3766` record a verification failure; running the gate over
+the tree `0a53543` left behind showed the *only* failing check was
+`cargo fmt --check`, on two `assert_eq!` calls that one line over 100 columns in
+`ffi.rs` and `worker.rs`. Clippy, all 152 Rust tests, the release build,
+rustdoc, `flutter analyze` and all 17 Flutter tests passed as they stood. The two
+lines are now formatted and the gate is green; nothing else about the engine
+needed changing, which is worth recording because it is the opposite of what a
+red row usually means.
+
+**The chroma default is 4:2:0 because this is a photo resizer, and the argument
+is in `docs/ARCHITECTURE.md`.** The prompt asked for the argument rather than the
+number, so it is written out there: photographs are luma, and on a 1600×1200
+fixture at q85 4:2:0 is 59,200 bytes against 88,975 for 4:4:4. What it costs is
+*colour* detail, not sharpness — luma resolution never changes — and on the
+content whose subject *is* colour, saturated red-on-blue bars at q95, the mean
+error of the blue-difference channel is 21.75 at 4:2:0 against 1.05 at 4:4:4.
+That is why the default follows the content rather than being one number:
+`Preset.chroma` is 4:4:4 for `store-screenshot` and 4:2:0 for the other 40, and a
+test asserts both halves so adding a preset means deciding.
+
+**Every number in the docs was re-measured rather than trusted.** The engine
+already quoted byte counts, encode times and the AVIF speed comparison; a
+temporary `#[test]` running the real encoders in release reproduced all of them
+exactly (88,975 / 72,724 / 59,200 / 96,938 bytes; 3.19 s AVIF at q70 and 17.1 s
+at 4032×3024; speed 4 at 5,967 bytes and speed 10 at 7,709 in 1.2 s) — except
+four, which were corrected here. The chroma-error figures were off by up to 0.5
+and the two JPEG encode times by 2 ms. `docs/JPEG.md` now names
+`format::tests::colour_bars(240, 160)` as the fixture the error figures come
+from, so the next reader can rerun them instead of taking them on trust. The
+tests themselves assert *relations* — 4:4:4 strictly larger, 4:2:0 more than
+three times the chroma error of 4:4:4 — never absolute byte counts, so a
+different encoder version cannot fail them.
+
+**JPEG is no longer written by `image`.** The old encoder is baseline 4:4:4 with
+no progressive option *and* it picks its own sampling factor from the quality
+value — 4:2:0 below q90, 4:4:4 at or above. Leaving it in charge would have made
+a user's quality slider silently change the picture's colour resolution, which is
+the kind of change no caller asks for and no test sees. It is now `jpeg-encoder`,
+which is pure Rust with no build script, and the sampling factor is set
+explicitly on every encode. `docs/JPEG.md` is the comparison.
+
+**`EncodingOptions` replaced a bare `quality: u8`, and `quality_used` now means
+what it says.** The struct was the prompt's instruction and it pays for itself
+immediately — the same value carries `progressive` and `chroma_subsampling`
+through `format::encode`, `target::Encoder`, `lib::encode_fixed`,
+`worker::Settings` and two JSON request structs without a fifth parameter
+anywhere. Its default is 85, the value every preset already assumed, so no
+existing export changes.
+
+Two behaviour changes go slightly past the prompt's literal scope, both because
+the prompt's own judgement question presupposes them:
+
+- `Outcome.quality_used` is **0** when the format has no quality setting. Before
+  this the engine reported the *requested* 85 next to a PNG whose size the
+  slider never influenced, and the UI shows that number next to the file it just
+  wrote. Zero is also what a failed file carries, which is the same claim: no
+  quality was applied.
+- A **byte ceiling** on a format with no quality setting is refused with
+  `Error::NoQualitySetting` and a sentence naming a format that can keep it. A
+  quality *value* on the same format is still ignored, because one global slider
+  sits above the format picker and refusing every PNG export because of it would
+  be absurd. The prompt asks whether "this format has no quality setting" reads
+  like a sentence a person wrote; `OutputFormat::quality_note` is written per
+  format rather than from a template, because PNG needs a different next step
+  from a read-only one, and `every_refusal_says_what_to_choose_instead` holds
+  every arm to it.
+
+**AVIF is on by default, and the honest half of the story is the decode
+direction.** The `avif` feature is `image`'s own encoder — rav1e through ravif —
+so unlike `webp-lossy` and `heic` it needs no C toolchain and no unverified
+cross-compile, which is why it is in `default`. What it costs is time: 3.2 s for a
+1600×1200 photo against 20 ms for a JPEG, so a single AVIF export is a progress
+bar and the batch path is what makes it usable. **This build cannot read AVIF
+back** — there is no AV1 decoder in any configuration — so
+`capabilities().avif_decode` is `false` and separate from `avif_encode`, because
+one boolean for both directions would tell a user we could open the file we just
+wrote.
+
+**The `avif` feature is tested in both configurations.** `cargo test
+--all-features` only ever compiles one, so
+`format::tests::avif_is_offered_exactly_when_this_build_has_the_encoder` asserts
+that the capability flag, `is_read_only()` and what `encode` actually does agree,
+rather than hard-coding one answer — and the test was additionally run under
+`--no-default-features`, where the refusal arm and its "choose JPEG, PNG or WebP"
+message are the ones that execute. That run is not part of `verify.sh`, which is
+still `--all-features` only.
+
+**`app/` is delivered as `workspace/phase-07/shrinkray-phase-07.patch`**, for the
+same reason as phase-05 and phase-06: only `authorss81/pixelsmith` is writable
+from this pipeline. It adds `ChromaSubsampling` (defaulting to `luma420`),
+`Pipeline.chromaSubsampling`, `Preset.chroma`, `progressive` on both request
+builders, and `avifDecode`/`jpegProgressive`/`jpegChromaSubsampling` on
+`Capabilities`. It applies cleanly to `3ed1eb4` and was run through `flutter
+analyze` and `flutter test` (29 passed, none skipped) before being captured.
+
+**The three app-side patches do not stack.** phase-05, phase-06 and phase-07 are
+each rooted at `3ed1eb4`, and all three touch the `Capabilities` constructor in
+`app/lib/rust/models.dart`, so applying two at once needs that one hunk merged by
+hand. This is stated rather than worked around: merging them is a three-line edit
+for whoever lands the series, and regenerating one patch to depend on another
+would have meant a patch that applies to a commit nobody has.
+
+**Not done, and named rather than glossed:**
+
+- **AV1 decode.** Recognised on input, refused by name, reported as
+  `avif_decode: false`.
+- **`progressive` for WebP and AVIF.** Both formats can be written scan-by-scan
+  and neither knob is wired to them, so `supports_progressive()` is JPEG-only and
+  a test asserts a read-only or lossless format advertises neither it nor chroma.
+- **Chroma for lossy WebP and AVIF.** libwebp takes a `sampling_factor` and rav1e
+  takes a `chroma_sample_position`, and both are unreached here. The knobs are
+  JPEG-only by assertion rather than by accident, which means phase-08 has a
+  decision to make rather than a flag to discover.
 
 ## Status values
 
