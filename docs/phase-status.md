@@ -18,7 +18,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
 | phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
 | phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
-| phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | (this commit) | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
+| phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | `d815024` | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
 | phase-08 | Lossy WebP via libwebp, verified on every target | PENDING | | |
 | phase-09 | SIMD resize path behind a feature flag | PENDING | | |
 | phase-10 | Benchmarks and a performance regression gate | PENDING | | |
