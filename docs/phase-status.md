@@ -12,7 +12,7 @@ ever disagree, the marker wins and the table is a bug.
 
 | Phase | Title | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
-| phase-01 | Verification baseline and project scaffolding | DONE | `7811e15` | See [phase-01 notes](#phase-01-notes) below |
+| phase-01 | Verification baseline and project scaffolding | DONE | `4cf3df6` | See [phase-01 notes](#phase-01-notes) below |
 | phase-02 | Fuzz harness for every decode path | PENDING | | |
 | phase-03 | Hostile-input corpus and property tests | PENDING | | |
 | phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
