@@ -244,8 +244,11 @@ jobs:
       - name: Install opencode (pinned)
         run: |
           curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # The installer writes to $GITHUB_PATH, which only affects LATER
+          # steps. Verify by absolute path, or this step exits 127.
+          export PATH="$HOME/.opencode/bin:$PATH"
           opencode --version
+          opencode models | head -n 5
 
       - name: Write run budget
         run: |
@@ -463,7 +466,9 @@ jobs:
       - name: Install opencode (pinned)
         run: |
           curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # $GITHUB_PATH only affects LATER steps, so verify by absolute path.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
 
       - name: Review phase
         env:
@@ -527,7 +532,9 @@ jobs:
       - name: Install opencode (pinned)
         run: |
           curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
-          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          # $GITHUB_PATH only affects LATER steps, so verify by absolute path.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
 
       - name: Check whether the audit has already run
         id: gate
