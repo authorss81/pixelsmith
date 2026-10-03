@@ -521,6 +521,19 @@ pub extern "C" fn px_selftest_panic() -> PxBuffer {
     }
 }
 
+/// The memory layout of [`PxBuffer`], as JSON.
+///
+/// Dart reads `PxBuffer` by byte offset, so the declaration in `bindings.dart`
+/// has to agree with the struct above byte for byte. A test that asserts a
+/// hand-typed "32" proves the author once counted correctly; this proves the
+/// library the app actually loaded has the layout the app expects, on whatever
+/// target it was compiled for. A 32-bit target has different numbers, and a
+/// hard-coded expectation would be wrong there rather than absent.
+#[unsafe(no_mangle)]
+pub extern "C" fn px_abi_layout() -> PxBuffer {
+    from_json(&crate::ffi_abi::px_buffer_layout())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,6 +591,108 @@ mod tests {
         };
         unsafe { px_buffer_free(buffer) };
         (status, data, message)
+    }
+
+    #[test]
+    fn a_thousand_rounds_of_the_boundary_leak_nothing() {
+        // `CAPACITIES` holds one entry per buffer handed out and not returned, so
+        // its length is the engine's own answer to "how much did you leak". A
+        // Dart test cannot do better than run out of memory eventually; this can
+        // say so after one round. Every allocation shape goes through the loop:
+        // success buffers, error strings, handles, and the deliberate failures,
+        // because a leak in the error path is the one nobody notices.
+        fn live_buffers() -> usize {
+            CAPACITIES.with(|c| c.borrow().len())
+        }
+
+        let input = sample(64, 48);
+        let process_body = serde_json::to_vec(&serde_json::json!({
+            "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+            "format": "jpeg",
+            "quality": 85,
+            "target": null,
+            "name": "photo.jpg",
+            "data_base64": b64(&input)
+        }))
+        .unwrap();
+        let batch_body = serde_json::to_vec(&serde_json::json!({
+            "crop": null, "orientation": null, "resize": null, "strip_metadata": true,
+            "format": "jpeg", "quality": 85, "target": null,
+            "files": [
+                { "name": "a.jpg", "bytes": input },
+                { "name": "b.jpg", "bytes": b"broken".to_vec() }
+            ]
+        }))
+        .unwrap();
+        let zip_body =
+            serde_json::to_vec(&serde_json::json!({ "files": [{ "name": "a.jpg", "bytes": input }] }))
+                .unwrap();
+
+        assert_eq!(live_buffers(), 0, "a test before this one leaked");
+        for round in 0..1000 {
+            // A fresh token per round: `px_cancel_free` really does drop it, so
+            // reusing the handle would test the "unknown handle" path 999 times.
+            let handle = px_cancel_new();
+            assert_ne!(handle, HANDLE_INVALID, "round {round}: no token");
+            unsafe {
+                assert_eq!(take(px_version()).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_inspect(input.as_ptr(), input.len(), false)).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_exif(input.as_ptr(), input.len())).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_presets()).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_process(process_body.as_ptr(), process_body.len())).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_batch(batch_body.as_ptr(), batch_body.len())).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_zip(zip_body.as_ptr(), zip_body.len())).0, PxStatus::Ok as u32);
+                assert_eq!(take(px_selftest_error()).0, PxStatus::Error as u32);
+                assert_eq!(take(px_abi_layout()).0, PxStatus::Ok as u32);
+                // The contained panic returns an error, so it is part of the
+                // loop rather than a separate test that hides a leaked string.
+                assert_eq!(take(px_selftest_panic()).0, PxStatus::Error as u32);
+            }
+            assert!(px_cancel_trigger(handle));
+            assert!(px_cancel_free(handle));
+
+            if round % 100 == 0 {
+                let live = live_buffers();
+                assert_eq!(live, 0, "round {round} left {live} buffers live");
+            }
+        }
+        assert_eq!(live_buffers(), 0, "the loop leaked buffers");
+    }
+
+    #[test]
+    fn the_abi_layout_endpoint_describes_the_struct_dart_reads() {
+        // The Dart side asserts its `PxBuffer` declaration against this, so it
+        // has to describe the struct rather than a copy of it that could go
+        // stale.
+        unsafe {
+            let (status, data, msg) = take(px_abi_layout());
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            assert_eq!(v["name"], "PxBuffer");
+            assert_eq!(v["size"], std::mem::size_of::<PxBuffer>());
+            let fields: Vec<(String, u64)> = v["fields"]
+                .as_array()
+                .expect("fields is an array")
+                .iter()
+                .map(|f| {
+                    (
+                        f["name"].as_str().expect("field name").to_string(),
+                        f["offset"].as_u64().expect("offset is a number"),
+                    )
+                })
+                .collect();
+            let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, vec!["status", "data", "len", "error"]);
+            for (i, (_, offset)) in fields.iter().enumerate().skip(1) {
+                let previous = fields[i - 1].1;
+                let previous_size = v["fields"][i - 1]["size"].as_u64().unwrap();
+                assert!(
+                    *offset >= previous + previous_size,
+                    "{} starts inside the field before it",
+                    names[i]
+                );
+            }
+        }
     }
 
     #[test]

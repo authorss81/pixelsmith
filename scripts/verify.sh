@@ -162,19 +162,91 @@ if [ -f app/pubspec.yaml ]; then
       printf '%s\n' "${ANALYZE}" | grep -E '^\s*(info|warning|error)' | head -n 30
     fi
 
+    say "--- native engine for the contract test ---"
+    # The FFI tests skip themselves when the library cannot be loaded, and a
+    # skipped test is green. So this gate used to pass while checking none of the
+    # boundary at all: 13 passed, 4 skipped, and `px_inspect`'s arity mismatch
+    # sat there unnoticed. Build the engine and put it on the loader path, then
+    # insist that nothing skipped.
+    #
+    # DEBUG on purpose. `[profile.release]` sets `panic = "abort"`, so
+    # `px_selftest_panic` aborts the test process instead of returning an error
+    # buffer, and `flutter test` exits 1 while printing that every test passed.
+    # That is the right trade for a shipped binary; it is the wrong one for a
+    # test run, so the test runs against the debug library.
+    ENGINE_READY=0
+    ENGINE_DIR="$(pwd)/app/src/rust"
+    if command -v cargo >/dev/null 2>&1 && [ -f core/Cargo.toml ]; then
+      LIB=""
+      case "$(uname -s)" in
+        Darwin) LIB="core/target/debug/libpixelsmith_core.dylib" ;;
+        *)      LIB="core/target/debug/libpixelsmith_core.so" ;;
+      esac
+      if cargo build --manifest-path core/Cargo.toml --lib >/dev/null 2>&1 \
+         && [ -f "${LIB}" ]; then
+        mkdir -p "${ENGINE_DIR}"
+        cp "${LIB}" "${ENGINE_DIR}/"
+        pass "debug engine built for the contract test"
+        ENGINE_READY=1
+      else
+        fail "cargo build --lib failed, so the FFI contract cannot be checked"
+      fi
+    else
+      say "  skip: cargo absent, so the FFI contract is not checked"
+    fi
+
     say "--- flutter test ---"
-    FTOUT=$( cd app && flutter test --no-pub 2>&1 )
-    if [ $? -eq 0 ]; then
-      pass "$(printf '%s' "${FTOUT}" | grep -E 'All tests passed' | head -n1)"
+    # `DynamicLibrary.open('libpixelsmith_core.so')` searches the loader path,
+    # not the working directory, so the library has to be named absolutely or
+    # the tests quietly skip themselves.
+    if [ "${ENGINE_READY}" = "1" ]; then
+      FTOUT=$( cd app && \
+        LD_LIBRARY_PATH="${ENGINE_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" \
+        DYLD_LIBRARY_PATH="${ENGINE_DIR}${DYLD_LIBRARY_PATH:+:${DYLD_LIBRARY_PATH}}" \
+        flutter test --no-pub 2>&1 )
+    else
+      FTOUT=$( cd app && flutter test --no-pub 2>&1 )
+    fi
+    FRC=$?
+    if [ ${FRC} -eq 0 ]; then
+      pass "$(printf '%s' "${FTOUT}" | grep -E 'All tests passed|tests passed' | tail -n1)"
     else
       fail "flutter test failed:"
       printf '%s\n' "${FTOUT}" | grep -E 'FAILED|Error|error|\+[0-9]+ -[0-9]+' | head -n 30
+    fi
+
+    # A skip is not a pass. The contract test skips itself when the engine
+    # cannot be loaded, which is exactly the case where the boundary is worth
+    # nothing, so a skip has to be visible here rather than buried in the output.
+    if [ "${ENGINE_READY}" = "1" ]; then
+      SKIPPED=$(printf '%s' "${FTOUT}" | grep -c '(skipped)' || true)
+      if [ "${SKIPPED}" -eq 0 ]; then
+        pass "no test was skipped"
+      else
+        fail "${SKIPPED} test(s) skipped; the engine is loaded, so they should not be"
+        printf '%s\n' "${FTOUT}" | grep '(skipped)' | head -n 10
+      fi
     fi
   else
     say "  skip: flutter not installed on this runner (toolchain step installs it)"
   fi
 else
   say "  skip: app/pubspec.yaml not present yet"
+fi
+
+# -----------------------------------------------------------------------------
+head1 "3b. Dart bindings versus the engine ABI"
+# Deliberately not a gate check. `app/` is a separate repository and the drift
+# between them is recorded in workspace/phase-05/FINDINGS.md; a gate that is red
+# for a reason the reader cannot act on stops being read. Run it by hand:
+#   bash scripts/check-dart-bindings.sh
+if [ -f app/lib/rust/bindings.dart ] && command -v cargo >/dev/null 2>&1; then
+  if bash scripts/check-dart-bindings.sh >/dev/null 2>&1; then
+    pass "app/lib/rust/bindings.dart matches the engine ABI"
+  else
+    say "  note: bindings drift is tracked in workspace/phase-05/FINDINGS.md"
+    say "        (bash scripts/check-dart-bindings.sh lists it)"
+  fi
 fi
 
 # -----------------------------------------------------------------------------

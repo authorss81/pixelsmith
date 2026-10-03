@@ -10,6 +10,7 @@
 pub mod error;
 pub mod exif;
 pub mod ffi;
+pub mod ffi_abi;
 pub mod format;
 pub mod pipeline;
 pub mod presets;

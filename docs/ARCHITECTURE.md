@@ -9,7 +9,7 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Ten modules, no submodules, no circular references. Dependencies point downward:
+Eleven modules, no submodules, no circular references. Dependencies point downward:
 `lib.rs` → `worker.rs` / `pipeline.rs` → `validate.rs` → `error.rs`. Nothing
 below `error.rs` knows anything exists above it.
 
@@ -24,7 +24,8 @@ below `error.rs` knows anything exists above it.
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
 | `core/src/presets.rs` | The preset catalogue, grouped by intent and carrying a `category` so the UI can present tabs. Custom values are always allowed. | `Preset`, `PRESETS`, `all_presets()`, `find_preset()`, `to_pipeline()` |
 | `core/src/worker.rs` | The layer the UI actually calls: per-file work, Rayon parallelism, cancellation, ZIP output, per-file accounting, and filename sanitisation. | `Job`, `Settings`, `Outcome`, `BatchReport`, `CancelToken`, `process_one()`, `process_batch()`, `sanitise_stem()` |
-| `core/src/ffi.rs` | The C ABI, where Rust's safety stops protecting the caller. 14 `px_*` entry points, a tagged result struct, and buffer ownership rules. | `PxBuffer`, `PxStatus`, `PxHandle`, `px_*` |
+| `core/src/ffi.rs` | The C ABI, where Rust's safety stops protecting the caller. 15 `px_*` entry points, a tagged result struct, and buffer ownership rules. | `PxBuffer`, `PxStatus`, `PxHandle`, `px_*` |
+| `core/src/ffi_abi.rs` | The same ABI as data: one declaration per entry point, proved against `ffi.rs` at compile time and rendered into the Dart declarations `app/lib/rust/bindings.dart` must contain. | `ENTRY_POINTS`, `EntryPoint`, `px_buffer_layout()`, `dart_drift()` |
 
 ## Request path
 
@@ -142,6 +143,7 @@ might dereference.
 | `px_cancel_free(handle)` | `PxHandle` | `bool` |
 | `px_selftest_error()` | — | `PxBuffer` — a deliberate error |
 | `px_selftest_panic()` | — | `PxBuffer` — see gotcha 8 |
+| `px_abi_layout()` | — | `PxBuffer` — JSON `StructLayout` for `PxBuffer` |
 
 Buffer ownership, in full:
 
@@ -231,6 +233,24 @@ named so you can check the handling rather than re-derive it.
 10. **JPEG has no alpha channel.** Encoding a transparent PNG to JPEG without
     flattening first produces a black rectangle. Handled in `core/src/format.rs`
     (`flatten_alpha`, in the `OutputFormat::Jpeg` arm).
+11. **A hand-written Dart binding is not a contract, it is a hope.** `dart:ffi`
+    has no generator and no `offsetOf`, so `app/lib/rust/bindings.dart` is typed
+    by a human against `ffi.rs` — and `px_inspect` took three arguments while the
+    declaration passed two, for as long as both existed. The guard is
+    `core/src/ffi_abi.rs`: every entry point is declared once, each declaration
+    expands to a `const _` function-pointer assignment that only compiles if it
+    matches the real signature, and `scripts/check-dart-bindings.sh` reports the
+    difference. Handled in `core/src/ffi_abi.rs`.
+12. **`px_selftest_panic` aborts a release build, so `flutter test` must not run
+    against one.** `[profile.release]` sets `panic = "abort"` (gotcha 8), so the
+    test device dies with SIGABRT and `flutter test` exits 1 while printing that
+    every test passed. `scripts/verify.sh` therefore builds the *debug* library
+    before running the Flutter tests. Handled in `scripts/verify.sh`.
+13. **The engine has to be on the loader path before `flutter test` means
+    anything.** `DynamicLibrary.open('libpixelsmith_core.so')` searches the loader
+    path, not the working directory, so a library in `app/src/rust/` is invisible
+    to it and the FFI tests skip themselves — green, and checking nothing. The
+    gate now exports `LD_LIBRARY_PATH` and fails if any test skipped.
 
 ## Verification
 
@@ -239,7 +259,11 @@ counts as done. It enforces hard rule 1 mechanically (no network crate in the
 engine tree, no networking symbol in `core/src`), then runs `cargo fmt --check`,
 `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test
 --all-features`, `cargo build --release` and `cargo doc` with `-D warnings`, then
-repository hygiene.
+repository hygiene, then builds the debug engine, puts it on the loader path,
+runs the Flutter tests against it and **fails if any of them skipped**. That last
+part is the one that matters: the FFI tests skip themselves when the library is
+absent, so for most of the project's life the gate was reporting success while
+executing none of the boundary.
 
 Two things about it worth knowing before you touch it:
 

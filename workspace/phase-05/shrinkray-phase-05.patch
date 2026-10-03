@@ -1,0 +1,1191 @@
+diff --git a/README.md b/README.md
+index 621981e..f042241 100644
+--- a/README.md
++++ b/README.md
+@@ -19,23 +19,86 @@ interface on top of `lib/rust/`; they do not re-prove the boundary.
+ | `lib/rust/errors.dart` | One exception type per engine status |
+ | `lib/rust/engine.dart` | Safe wrapper: owns every buffer, frees in `finally`, runs on a worker isolate |
+ | `test/models_test.dart` | Enum serialisation, request envelopes, boundary math |
+-| `test/ffi_contract_test.dart` | Layout assertion + every entry point, skipped when the library is not built |
++| `test/engine_isolate_test.dart` | A large decode does not block the calling isolate; 1000 calls leak nothing |
++| `test/ffi_contract_test.dart` | Every `px_*` entry point, called; layout checked against the engine |
++
++`bindings.dart` is hand-written, so the engine repository checks it:
++
++```bash
++# in the engine checkout
++bash scripts/check-dart-bindings.sh /path/to/shrinkray/lib/rust/bindings.dart
++```
++
++That compares every arity against the real function signatures and fails on
++drift. It is not part of `verify.sh`, because the app is a separate repository
++and a gate that is red for a reason you cannot fix is a gate you stop reading.
+ 
+ ## Building
+ 
+ ### The engine
+ 
++Everything below is run from the app checkout. It needs a Rust toolchain; the
++version that matters is whatever `rustc --version` reports, and nothing here
++pins one.
++
+ ```bash
+-# From a checkout next to pixelsmith:
+-bash native/build-engine.sh --release
++# Desktop, the host platform (Linux, macOS or Windows):
++bash native/build-engine.sh
++bash native/build-engine.sh --release            # optimised
+ 
+-# Or against an explicit engine checkout:
+-bash native/build-engine.sh --release --engine-dir /path/to/pixelsmith
++# Android. Opt-in: the target is never inferred from the environment.
++bash native/build-engine.sh --target android --release
++
++# Against an explicit engine checkout rather than a sibling directory:
++bash native/build-engine.sh --engine-dir /path/to/pixelsmith
+ ```
+ 
+-Requires a Rust toolchain. Android cross-compiles need `cargo-ndk` (the script
+-installs it); plain `cargo build --target aarch64-linux-android` fails at link
+-time with no linker, which is what the script exists to avoid.
++Outputs, and where each platform's loader looks for them:
++
++| Target | Command | Artefact |
++| --- | --- | --- |
++| Linux | `bash native/build-engine.sh --release` | `src/rust/libpixelsmith_core.so` |
++| macOS | `bash native/build-engine.sh --release` | `src/rust/libpixelsmith_core.dylib` |
++| Windows | `bash native/build-engine.sh --release` | `src/rust/pixelsmith_core.dll` |
++| Android | `bash native/build-engine.sh --target android --release` | `src/rust/jniLibs/<abi>/libpixelsmith_core.so` |
++| iOS | `cargo lipo -o src/rust/libpixelsmith_core.a` then link it in the Xcode target | static |
++
++**Android** needs `cargo-ndk` (the script installs it if it is missing) and
++`ANDROID_NDK_HOME`. Plain `cargo build --target aarch64-linux-android` fails at
++link time with no linker, which is the reason cargo-ndk exists here.
++
++**iOS** is the one target this script does not build: `cargo-lipo` merges the
++device and simulator slices into a static library, and the Xcode target links it.
++
++```bash
++rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
++cargo install cargo-lipo
++cargo lipo -t aarch64-apple-ios -t aarch64-apple-ios-sim \
++  -t x86_64-apple-ios --release -o src/rust/libpixelsmith_core.a
++```
++
++None of these artefacts are committed. They are in `.gitignore` and CI rebuilds
++them on every run.
++
++### Finding the library at runtime
++
++`loadEngineLibrary` searches, in order: `src/rust/`, then the directory holding
++the executable and `lib/` beside it, then the platform loader path, and on Apple
++platforms `DynamicLibrary.process()` because the engine is linked in
++statically. The order matters because `DynamicLibrary.open('name.so')` searches
++the *loader path*, not the working directory: a library sitting in the project is
++invisible to it, which is why a desktop `flutter run` used to fail with a dlopen
++error while the APK worked fine.
++
++**Known gap.** The desktop CMake and MSBuild projects do not build or copy the
++engine yet, so `flutter build linux` and `flutter build windows` produce a bundle
++without the library in it. Until that is wired up, run the app with
++`flutter run` from a checkout where `src/rust/` has been populated, or set the
++loader path yourself:
++
++```bash
++LD_LIBRARY_PATH="$PWD/src/rust" flutter run -d linux   # Linux
++```
+ 
+ ### The app
+ 
+@@ -47,7 +110,14 @@ flutter run
+ ```
+ 
+ `flutter test` passes with or without the native library: the contract test
+-skips gracefully when nothing is built, and says so.
++skips when nothing is built, and says so. That skip is easy to mistake for a
++pass, so `scripts/verify.sh` in the engine repository builds the engine first and
++then **fails if any test skipped**.
++
++Run the tests against a **debug** library. `[profile.release]` in the engine sets
++`panic = "abort"`, so `px_selftest_panic` aborts the test process instead of
++returning an error buffer, and `flutter test` exits 1 while printing that every
++test passed.
+ 
+ ### Release artefacts
+ 
+@@ -65,8 +135,10 @@ The engine speaks JSON over a C ABI. The rules, enforced in `lib/rust/`:
+   `finally`. A raw pointer never escapes.
+ - Every call runs on a worker isolate. A two-second decode cannot drop a frame.
+ - `PxBuffer` (`status: u32, data: *u8, len: usize, error: *c_char`) is 32 bytes
+-  on 64-bit. `ffi_contract_test.dart` asserts the size; a mismatch is silent
+-  memory corruption.
++  on 64-bit, 16 on 32-bit. `ffi_contract_test.dart` works the offsets out from
++  the declaration and compares them with `px_abi_layout`, which reports the
++  layout of the library that was actually loaded. A hard-coded 32 would be wrong
++  on a 32-bit target rather than absent.
+ - Enum wire values match the engine's serde derives exactly: `OutputFormat` is
+   lowercase, `FitMode`/`ResampleFilter`/`Orientation` are snake_case.
+   `catmullRom` serialises as `catmull_rom` — sending camelCase is a silent "bad
+diff --git a/lib/rust/bindings.dart b/lib/rust/bindings.dart
+index ec76635..46ccda6 100644
+--- a/lib/rust/bindings.dart
++++ b/lib/rust/bindings.dart
+@@ -38,6 +38,11 @@ abstract final class PxStatus {
+ /// once, and freeing twice is only safe because the Rust side no-ops on unknown
+ /// pointers. Use [PixelSmithEngine] instead, which owns every buffer it
+ /// receives and frees it in a `finally`.
++///
++/// These declarations are hand-written because `dart:ffi` has no generator. The
++/// engine repository holds the other half of that arrangement and can check
++/// them: `cargo run --bin px-abi-dump -- --check lib/rust/bindings.dart`
++/// compares every arity here against the real signatures and fails on drift.
+ final class PxBindings {
+   PxBindings(this._lib);
+ 
+@@ -54,11 +59,21 @@ final class PxBindings {
+         ffi.Void Function(ffi.Pointer<ffi.Char>),
+         void Function(ffi.Pointer<ffi.Char>)
+       >('px_string_free');
++  // Three arguments, not two: the engine takes `mobile_limits` and a two-argument
++  // declaration passes a bool where the second `usize` belongs. This was wrong
++  // for as long as the file existed, and nothing noticed, because nothing called
++  // `px_inspect` from a test with the library loaded. `cargo run --bin
++  // px-abi-dump -- --check app/lib/rust/bindings.dart` in the engine repository
++  // is what catches it.
+   late final _pxInspect = _lib
+       .lookupFunction<
+-        PxBuffer Function(ffi.Pointer<ffi.Uint8>, ffi.Size),
+-        PxBuffer Function(ffi.Pointer<ffi.Uint8>, int)
++        PxBuffer Function(ffi.Pointer<ffi.Uint8>, ffi.Size, ffi.Bool),
++        PxBuffer Function(ffi.Pointer<ffi.Uint8>, int, bool)
+       >('px_inspect');
++  late final _pxAbiLayout = _lib
++      .lookupFunction<PxBuffer Function(), PxBuffer Function()>(
++        'px_abi_layout',
++      );
+   late final _pxExif = _lib
+       .lookupFunction<
+         PxBuffer Function(ffi.Pointer<ffi.Uint8>, ffi.Size),
+@@ -103,7 +118,8 @@ final class PxBindings {
+   PxBuffer version() => _pxVersion();
+   void bufferFree(PxBuffer b) => _pxBufferFree(b);
+   void stringFree(ffi.Pointer<ffi.Char> s) => _pxStringFree(s);
+-  PxBuffer inspect(ffi.Pointer<ffi.Uint8> p, int len) => _pxInspect(p, len);
++  PxBuffer inspect(ffi.Pointer<ffi.Uint8> p, int len, bool mobileLimits) =>
++      _pxInspect(p, len, mobileLimits);
+   PxBuffer exif(ffi.Pointer<ffi.Uint8> p, int len) => _pxExif(p, len);
+   PxBuffer presets() => _pxPresets();
+   PxBuffer process(ffi.Pointer<ffi.Uint8> p, int len) => _pxProcess(p, len);
+@@ -112,6 +128,7 @@ final class PxBindings {
+   int cancelNew() => _pxCancelNew();
+   bool cancelTrigger(int h) => _pxCancelTrigger(h);
+   bool cancelFree(int h) => _pxCancelFree(h);
++  PxBuffer abiLayout() => _pxAbiLayout();
+   PxBuffer selftestError() => _pxSelftestError();
+   PxBuffer selftestPanic() => _pxSelftestPanic();
+ }
+diff --git a/lib/rust/engine.dart b/lib/rust/engine.dart
+index a88ef68..041470c 100644
+--- a/lib/rust/engine.dart
++++ b/lib/rust/engine.dart
+@@ -1,5 +1,6 @@
+ import 'dart:convert';
+ import 'dart:ffi' as ffi;
++import 'dart:io';
+ import 'dart:isolate';
+ 
+ import 'package:ffi/ffi.dart';
+@@ -8,29 +9,78 @@ import 'bindings.dart';
+ import 'errors.dart';
+ import 'models.dart';
+ 
+-/// Loads the native engine library for the current platform.
++/// The names the engine library goes by. Every platform's convention is in the
++/// list rather than behind a branch, because the cost of guessing wrong is an
++/// `ArgumentError` from `dlopen` at the first call.
++const _engineLibraryNames = <String>[
++  'libpixelsmith_core.so', // Linux, Android
++  'pixelsmith_core.dll', // Windows
++  'libpixelsmith_core.dylib', // macOS, when built dynamically
++];
++
++/// Loads the native engine library, or returns null when it is not there.
+ ///
+-/// The library name differs per platform because each one has its own
+-/// convention, and getting it wrong is a startup crash rather than an error:
+-/// - Android: `libpixelsmith_core.so`, bundled per ABI by `cargo-ndk`.
+-/// - iOS/macOS: statically linked; `DynamicLibrary.process()`.
+-/// - Windows: `pixelsmith_core.dll`, sitting next to the EXE.
+-/// - Linux: `libpixelsmith_core.so`, sitting next to the binary.
+-ffi.DynamicLibrary loadEngineLibrary() {
+-  if (ffi.Abi.current() == ffi.Abi.androidArm64 ||
+-      ffi.Abi.current() == ffi.Abi.androidArm ||
+-      ffi.Abi.current() == ffi.Abi.androidX64) {
+-    return ffi.DynamicLibrary.open('libpixelsmith_core.so');
++/// Null rather than an exception because "not built" is an ordinary state for a
++/// developer and a test, and an exception invites a `try` around the one call
++/// site that matters. A missing engine is still fatal for the app — see
++/// [loadEngineLibrary], which is what production uses.
++///
++/// The search order is the whole difficulty:
++/// - Android: the `.so` is extracted from the APK and found by bare name.
++/// - iOS/macOS: linked statically, so `DynamicLibrary.process()`.
++/// - Desktop: a file. `DynamicLibrary.open('libpixelsmith_core.so')` searches the
++///   loader path, *not* the working directory, so a library sitting in the
++///   project is invisible to it — which is why this used to fail in every
++///   `flutter run` and `flutter test` on Linux until the paths below were added.
++ffi.DynamicLibrary? tryLoadEngineLibrary() {
++  for (final name in _engineLibraryNames) {
++    for (final candidate in _candidatePaths(name)) {
++      if (File(candidate).existsSync()) {
++        return ffi.DynamicLibrary.open(candidate);
++      }
++    }
+   }
+-  if (ffi.Abi.current() == ffi.Abi.iosArm64 ||
+-      ffi.Abi.current() == ffi.Abi.macosArm64 ||
+-      ffi.Abi.current() == ffi.Abi.macosX64) {
++  if (Platform.isIOS || Platform.isMacOS) {
++    // Always "succeeds", even with nothing loaded, so it is only trustworthy on
++    // the platforms that actually link the engine in.
+     return ffi.DynamicLibrary.process();
+   }
+-  if (ffi.Abi.current() == ffi.Abi.windowsX64) {
+-    return ffi.DynamicLibrary.open('pixelsmith_core.dll');
++  for (final name in _engineLibraryNames) {
++    try {
++      return ffi.DynamicLibrary.open(name);
++    } on ArgumentError {
++      continue;
++    }
++  }
++  return null;
++}
++
++/// Loads the native engine library, failing loudly when it is absent.
++///
++/// A missing engine is a startup crash, not an error the user caused, so the
++/// message says how to build it instead of leaking a dlopen error.
++ffi.DynamicLibrary loadEngineLibrary() {
++  final library = tryLoadEngineLibrary();
++  if (library == null) {
++    throw StateError(
++      'The PixelSmith engine is not built for this platform. Run '
++      '`bash native/build-engine.sh`, or `bash scripts/verify.sh` in the engine '
++      'repository to build it and run the tests against it.',
++    );
+   }
+-  return ffi.DynamicLibrary.open('libpixelsmith_core.so');
++  return library;
++}
++
++/// Where a library of that name could plausibly be.
++Iterable<String> _candidatePaths(String name) sync* {
++  // Where `native/build-engine.sh` leaves it. Only present in a development
++  // checkout, never in a shipped bundle.
++  yield '${Directory.current.path}/src/rust/$name';
++  // Where a desktop bundle puts it: beside the executable, and in `lib/` beside
++  // it on the platforms whose CMake install rules use a `lib` subdirectory.
++  final beside = File(Platform.resolvedExecutable).parent.path;
++  yield '$beside/$name';
++  yield '$beside/lib/$name';
+ }
+ 
+ /// The safe wrapper around every `px_*` entry point.
+@@ -53,8 +103,14 @@ final class PixelSmithEngine {
+ 
+   /// Inspect a file's header without decoding pixels. Rejects a hostile file
+   /// before a pixel buffer is allocated.
+-  Future<ValidateReport> inspect(List<int> bytes) =>
+-      Isolate.run(() => _inspectStatic(bytes));
++  ///
++  /// Set [mobileLimits] on a phone. The engine's phone profile is 128 MiB and
++  /// 40 MP rather than 512 MiB and 128 MP, because a 128 MP decode OOMs a phone
++  /// rather than merely slowing it down.
++  Future<ValidateReport> inspect(
++    List<int> bytes, {
++    bool mobileLimits = false,
++  }) => Isolate.run(() => _inspectStatic(bytes, mobileLimits));
+ 
+   /// Full EXIF read.
+   Future<ExifInfo> exif(List<int> bytes) =>
+@@ -63,6 +119,13 @@ final class PixelSmithEngine {
+   /// The preset catalogue.
+   Future<List<Preset>> presets() => Isolate.run(() => _presetsStatic());
+ 
++  /// Where the engine says `PxBuffer`'s fields live, in bytes.
++  ///
++  /// Exposed so the contract test can check the struct declaration in
++  /// `bindings.dart` against the library it loaded, rather than against a number
++  /// somebody typed by hand.
++  Future<AbiLayout> abiLayout() => Isolate.run(() => _abiLayoutStatic());
++
+   /// Process one image.
+   Future<ProcessResult> process({
+     required Pipeline pipeline,
+@@ -139,12 +202,12 @@ Capabilities _versionStatic() {
+   return Capabilities.fromJson(_takeJson(px, px.version()));
+ }
+ 
+-ValidateReport _inspectStatic(List<int> bytes) {
++ValidateReport _inspectStatic(List<int> bytes, bool mobileLimits) {
+   final px = PxBindings(loadEngineLibrary());
+   final ptr = _copyToNative(bytes);
+   try {
+     return ValidateReport.fromJson(
+-      _takeJson(px, px.inspect(ptr, bytes.length)),
++      _takeJson(px, px.inspect(ptr, bytes.length, mobileLimits)),
+     );
+   } finally {
+     _freeNative(ptr);
+@@ -169,13 +232,17 @@ List<Preset> _presetsStatic() {
+       .toList();
+ }
+ 
++AbiLayout _abiLayoutStatic() {
++  final px = PxBindings(loadEngineLibrary());
++  return AbiLayout.fromJson(_takeJson(px, px.abiLayout()));
++}
++
+ ProcessResult _processStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  final body = utf8.encode(request);
++  final ptr = _copyToNative(body);
+   try {
+-    return ProcessResult.fromJson(
+-      _takeJson(px, px.process(ptr, request.length)),
+-    );
++    return ProcessResult.fromJson(_takeJson(px, px.process(ptr, body.length)));
+   } finally {
+     _freeNative(ptr);
+   }
+@@ -183,9 +250,10 @@ ProcessResult _processStatic(String request) {
+ 
+ BatchReport _batchStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  final body = utf8.encode(request);
++  final ptr = _copyToNative(body);
+   try {
+-    return BatchReport.fromJson(_takeJson(px, px.batch(ptr, request.length)));
++    return BatchReport.fromJson(_takeJson(px, px.batch(ptr, body.length)));
+   } finally {
+     _freeNative(ptr);
+   }
+@@ -193,17 +261,10 @@ BatchReport _batchStatic(String request) {
+ 
+ List<int> _zipStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  final body = utf8.encode(request);
++  final ptr = _copyToNative(body);
+   try {
+-    final buffer = px.zip(ptr, request.length);
+-    try {
+-      if (buffer.status != PxStatus.ok) {
+-        throw EngineProcessingException(_readError(buffer));
+-      }
+-      return buffer.data.asTypedList(buffer.len).toList();
+-    } finally {
+-      px.bufferFree(buffer);
+-    }
++    return _takeBytes(px, px.zip(ptr, body.length));
+   } finally {
+     _freeNative(ptr);
+   }
+@@ -230,29 +291,53 @@ List<Object?> _takeJsonList(PxBindings px, PxBuffer buffer) {
+   return (decoded as List).cast<Object?>();
+ }
+ 
+-Object? _takeDecoded(PxBindings px, PxBuffer buffer) {
++/// Same, for `px_zip`, whose payload is a ZIP archive rather than JSON. Running
++/// it through `jsonDecode` would reject every valid archive.
++List<int> _takeBytes(PxBindings px, PxBuffer buffer) {
+   try {
+-    final status = buffer.status;
+-    final message = _readError(buffer);
+-    final List<int> data = buffer.data == ffi.nullptr
+-        ? const []
+-        : buffer.data.asTypedList(buffer.len).toList();
+-    if (status == PxStatus.ok) {
+-      return jsonDecode(utf8.decode(data));
+-    }
+-    if (status == PxStatus.invalidArgument) {
+-      throw EngineContractException(
+-        message.isEmpty ? 'engine rejected the call' : message,
++    _throwIfFailed(buffer);
++    if (buffer.data == ffi.nullptr || buffer.len == 0) {
++      throw EngineProcessingException(
++        'the engine reported success and returned no bytes',
+       );
+     }
+-    throw EngineProcessingException(
+-      message.isEmpty ? 'engine failed without explanation' : message,
+-    );
++    return buffer.data.asTypedList(buffer.len).toList();
++  } finally {
++    px.bufferFree(buffer);
++  }
++}
++
++Object? _takeDecoded(PxBindings px, PxBuffer buffer) {
++  try {
++    _throwIfFailed(buffer);
++    return jsonDecode(utf8.decode(_payload(buffer)));
+   } finally {
+     px.bufferFree(buffer);
+   }
+ }
+ 
++/// Turns a non-OK status into the matching exception type.
++///
++/// Read before the payload, because the payload is absent on failure and an
++/// error string with no explanation is worse than the exception type: hard rule
++/// 9 is that the user is told what happened.
++void _throwIfFailed(PxBuffer buffer) {
++  final message = _readError(buffer);
++  if (buffer.status == PxStatus.ok) return;
++  if (buffer.status == PxStatus.invalidArgument) {
++    throw EngineContractException(
++      message.isEmpty ? 'engine rejected the call' : message,
++    );
++  }
++  throw EngineProcessingException(
++    message.isEmpty ? 'engine failed without explanation' : message,
++  );
++}
++
++List<int> _payload(PxBuffer buffer) => buffer.data == ffi.nullptr
++    ? const []
++    : buffer.data.asTypedList(buffer.len).toList();
++
+ String _readError(PxBuffer buffer) =>
+     buffer.error == ffi.nullptr ? '' : buffer.error.cast<Utf8>().toDartString();
+ 
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 853a3f1..30ef7a8 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -481,3 +481,59 @@ final class BatchFile {
+   final String name;
+   final List<int> bytes;
+ }
++
++/// One field's position inside a `#[repr(C)]` struct. Mirrors `FieldLayout` in
++/// `core/src/ffi_abi.rs`.
++final class AbiField {
++  const AbiField({
++    required this.name,
++    required this.offset,
++    required this.size,
++  });
++
++  final String name;
++  final int offset;
++  final int size;
++
++  static AbiField fromJson(Map<String, Object?> json) => AbiField(
++    name: json['name'] as String,
++    offset: (json['offset'] as num).toInt(),
++    size: (json['size'] as num).toInt(),
++  );
++}
++
++/// The engine's own answer to where `PxBuffer`'s fields live.
++///
++/// Dart reads the struct by byte offset, so this is the only number worth
++/// asserting against: a constant in a test proves someone once counted
++/// correctly, this proves the library that was actually loaded has the layout
++/// the declaration assumes, on whatever target it was compiled for.
++final class AbiLayout {
++  const AbiLayout({
++    required this.name,
++    required this.size,
++    required this.align,
++    required this.fields,
++  });
++
++  final String name;
++  final int size;
++  final int align;
++  final List<AbiField> fields;
++
++  int? offsetOf(String field) {
++    for (final f in fields) {
++      if (f.name == field) return f.offset;
++    }
++    return null;
++  }
++
++  static AbiLayout fromJson(Map<String, Object?> json) => AbiLayout(
++    name: json['name'] as String,
++    size: (json['size'] as num).toInt(),
++    align: (json['align'] as num).toInt(),
++    fields: (json['fields'] as List)
++        .map((f) => AbiField.fromJson((f as Map).cast<String, Object?>()))
++        .toList(),
++  );
++}
+diff --git a/native/build-engine.sh b/native/build-engine.sh
+index 3e9ff62..e1010a3 100644
+--- a/native/build-engine.sh
++++ b/native/build-engine.sh
+@@ -4,7 +4,13 @@
+ # and place the library where Flutter expects it.
+ #
+ # Usage:
+-#   bash native/build-engine.sh [--release] [--engine-dir PATH]
++#   bash native/build-engine.sh [--release] [--target android] [--engine-dir PATH]
++#
++# --target defaults to the host (Linux, macOS or Windows desktop). Android is
++# opt-in because an earlier revision inferred it from ANDROID_NDK_HOME being set,
++# and a CI runner that happens to have the Android SDK installed then built the
++# engine for Android while asking for a desktop build. The two are not
++# interchangeable and neither is a fallback for the other.
+ #
+ # --engine-dir defaults to ../pixelsmith (a checkout next to this repository),
+ # which is the layout when shrinkray is pulled in as the `app/` submodule of
+@@ -23,14 +29,21 @@ set -euo pipefail
+ 
+ RELEASE=0
+ ENGINE_DIR=""
++TARGET="host"
+ while [ $# -gt 0 ]; do
+   case "$1" in
+     --release) RELEASE=1; shift ;;
++    --target) TARGET="$2"; shift 2 ;;
+     --engine-dir) ENGINE_DIR="$2"; shift 2 ;;
+     *) echo "unknown flag: $1" >&2; exit 2 ;;
+   esac
+ done
+ 
++case "${TARGET}" in
++  host|android) ;;
++  *) echo "error: --target must be 'host' or 'android', not '${TARGET}'" >&2; exit 2 ;;
++esac
++
+ if [ -z "${ENGINE_DIR}" ]; then
+   if [ -d "../pixelsmith/core" ]; then
+     ENGINE_DIR="../pixelsmith"
+@@ -52,9 +65,18 @@ CARGO_ARGS=(build --lib)
+ if [ "${RELEASE}" = "1" ]; then CARGO_ARGS+=(--release); fi
+ 
+ OS="$(uname -s)"
++if [ "${TARGET}" = "android" ] && [ "${OS}" != "Linux" ] && [ "${OS}" != "Darwin" ]; then
++  echo "error: --target android is only supported from a Linux or macOS host, not ${OS}" >&2
++  exit 2
++fi
+ case "${OS}" in
+   Linux)
+-    if [ -n "${ANDROID_NDK_HOME:-}" ]; then
++    if [ "${TARGET}" = "android" ]; then
++      if [ -z "${ANDROID_NDK_HOME:-}" ]; then
++        echo "error: --target android needs ANDROID_NDK_HOME set." >&2
++        echo "hint: install the NDK, or drop --target to build for Linux." >&2
++        exit 2
++      fi
+       # Cross-compiling for Android from a Linux host. cargo-ndk supplies the
+       # NDK clang wrapper that plain `cargo build --target` lacks, which is
+       # what failed the first engine-matrix run with a linker error.
+diff --git a/test/engine_isolate_test.dart b/test/engine_isolate_test.dart
+index 0cbadda..b00bb28 100644
+--- a/test/engine_isolate_test.dart
++++ b/test/engine_isolate_test.dart
+@@ -1,5 +1,4 @@
+ import 'dart:async';
+-import 'dart:ffi' as ffi;
+ 
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/engine.dart';
+@@ -71,21 +70,7 @@ void main() {
+   });
+ }
+ 
+-bool _libraryPresent() {
+-  for (final name in [
+-    'libpixelsmith_core.so',
+-    'pixelsmith_core.dll',
+-    'libpixelsmith_core.dylib',
+-  ]) {
+-    try {
+-      ffi.DynamicLibrary.open(name).close();
+-      return true;
+-    } on ArgumentError {
+-      continue;
+-    }
+-  }
+-  return false;
+-}
++bool _libraryPresent() => tryLoadEngineLibrary() != null;
+ 
+ /// A 2000x1500 gradient encoded as BMP bytes by hand.
+ ///
+diff --git a/test/ffi_contract_test.dart b/test/ffi_contract_test.dart
+index b754f98..70b4896 100644
+--- a/test/ffi_contract_test.dart
++++ b/test/ffi_contract_test.dart
+@@ -1,113 +1,474 @@
++import 'dart:convert';
+ import 'dart:ffi' as ffi;
+-import 'dart:io';
+ 
+ import 'package:ffi/ffi.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/bindings.dart';
++import 'package:shrinkray/rust/engine.dart';
++import 'package:shrinkray/rust/models.dart';
+ 
+-/// The contract test: every `px_*` function the engine exports must have a
+-/// matching Dart declaration, and the `PxBuffer` layout must match byte for
+-/// byte.
++/// The contract test: every `px_*` function the engine exports is called here,
++/// and the `PxBuffer` layout is checked against the engine rather than against a
++/// number somebody typed by hand.
+ ///
+-/// This test needs the compiled native library. Without it — a fresh checkout
+-/// before phase-05's build glue has run, or `flutter test` on a machine without
+-/// a Rust toolchain — it skips rather than failing. A skipped contract test is
+-/// honest about what it could not check; a failing one would block every
+-/// unrelated change.
++/// These tests need the compiled native library, and they skip without it,
++/// because a fresh checkout has no engine until the build glue has run. A skip
++/// is only honest if something says so, so `scripts/verify.sh` builds the
++/// library first and then fails if any test here skipped.
+ void main() {
+-  test('PxBuffer layout matches the Rust #[repr(C)] struct', () {
+-    // struct PxBuffer {
+-    //   uint32_t status;      // offset 0, size 4
+-    //   uint8_t *data;        // offset 8, size 8
+-    //   size_t len;           // offset 16, size 8
+-    //   char *error;          // offset 24, size 8
+-    // };                      // total 32 on 64-bit
+-    expect(ffi.sizeOf<PxBuffer>(), 32);
++  late PxBindings px;
++
++  setUpAll(() {
++    final lib = tryLoadEngineLibrary();
++    if (lib != null) {
++      px = PxBindings(lib);
++    }
+   });
+ 
+-  test('every px_* function resolves in the native library', () {
+-    final lib = _tryLoad();
+-    if (lib == null) {
++  test('the native library is loadable', () {
++    if (tryLoadEngineLibrary() == null) {
+       markTestSkipped(
+-        'native library not built — run the native build first (see README.md)',
++        'native library not built — run scripts/verify.sh, or see README.md '
++        'for the per-platform build',
+       );
+-      return;
+     }
+-    final px = PxBindings(lib);
+-
+-    // Calling px_version exercises the full round trip: allocate on the Rust
+-    // side, read the struct by offset, parse, free.
+-    final buffer = px.version();
+-    try {
+-      expect(buffer.status, PxStatus.ok);
+-      expect(buffer.data.address, isNonZero);
+-      expect(buffer.len, greaterThan(0));
+-    } finally {
++  });
++
++  group('PxBuffer layout', () {
++    test('offsets match the declaration, as the engine reports them', () {
++      _requireLibrary();
++      // The declaration is `u32, *u8, usize, *char`. `dart:ffi` has no
++      // `offsetOf`, so the expected offsets are worked out from the field types
++      // here and then compared with the engine's own numbers — which is the half
++      // that can be wrong. A constant would only prove someone once counted.
++      final pointerSize = ffi.sizeOf<ffi.Pointer<ffi.Void>>();
++      final statusSize = ffi.sizeOf<ffi.Uint32>();
++      final sizeSize = ffi.sizeOf<ffi.Size>();
++      int alignUp(int value, int alignment) =>
++          (value + alignment - 1) ~/ alignment * alignment;
++      final dataOffset = alignUp(statusSize, pointerSize);
++
++      // Not named `expected`: `expect` is the matcher in this file, and a local
++      // of that name shadows it for the rest of the block.
++      final offsets = <String, int>{
++        'status': 0,
++        'data': dataOffset,
++        'len': dataOffset + pointerSize,
++        'error': dataOffset + pointerSize + sizeSize,
++      };
++
++      final layout = AbiLayout.fromJson(_takeJson(px, px.abiLayout()));
++      expect(ffi.sizeOf<PxBuffer>(), offsets['error']! + pointerSize);
++      expect(layout.size, offsets['error']! + pointerSize);
++      for (final entry in offsets.entries) {
++        expect(
++          layout.offsetOf(entry.key),
++          entry.value,
++          reason:
++              'the engine puts ${entry.key} at ${layout.offsetOf(entry.key)}',
++        );
++      }
++    });
++  });
++
++  group('every entry point', () {
++    test('px_version reports the version and the honest capability list', () {
++      _requireLibrary();
++      final payload = _takeJson(px, px.version());
++      expect(payload['version'], isA<String>());
++      expect(payload['version'], isNotEmpty);
++      final caps = (payload['capabilities'] as Map).cast<String, Object?>();
++      expect(caps['jpeg'], true);
++      // AVIF is readable and not writable, and the UI greys out what the build
++      // cannot produce (hard rule 10).
++      expect(caps['avif_encode'], false);
++    });
++
++    test('px_inspect reports a real header without decoding it', () {
++      _requireLibrary();
++      final image = _bmp(64, 48);
++      final report = _takeJson(
++        px,
++        px.inspect(_borrow(image), image.length, false),
++      );
++      expect(report['width'], 64);
++      expect(report['height'], 48);
++      expect(report['format'], 'bmp');
++      expect(report['suspicious'], isNull);
++    });
++
++    test('px_inspect passes its third argument through to the limits', () {
++      _requireLibrary();
++      // 17000 px on the long side: over the phone's 16000 px per-side limit,
++      // under the desktop limit of 30000, and only 0.4 MB of BMP to look at. The
++      // phone profile pushes its limit into the decoder, so this is rejected
++      // outright rather than reported. If the flag were dropped the two calls
++      // would agree, and this is what proves the engine saw it — the argument was
++      // unreachable from Dart until this declaration was corrected.
++      final wide = _bmp(17000, 8);
++      final desktop = _takeJson(
++        px,
++        px.inspect(_borrow(wide), wide.length, false),
++      );
++      expect(desktop['suspicious'], isNull);
++
++      final mobile = px.inspect(_borrow(wide), wide.length, true);
++      try {
++        expect(mobile.status, PxStatus.error);
++        expect(_error(mobile), isNotEmpty);
++      } finally {
++        px.bufferFree(mobile);
++      }
++    });
++
++    test('px_inspect refuses a null pointer with a length', () {
++      _requireLibrary();
++      final buffer = px.inspect(ffi.nullptr, 16, false);
++      try {
++        expect(buffer.status, PxStatus.invalidArgument);
++        expect(_error(buffer), contains('null'));
++      } finally {
++        px.bufferFree(buffer);
++      }
++    });
++
++    test('px_exif reports no EXIF in a BMP', () {
++      _requireLibrary();
++      final image = _bmp(8, 8);
++      final info = _takeJson(px, px.exif(_borrow(image), image.length));
++      expect(info['has_gps'], false);
++      expect(info['entries'], isEmpty);
++    });
++
++    test('px_presets returns a catalogue with the fields the UI needs', () {
++      _requireLibrary();
++      final list = _takeJsonList(px, px.presets());
++      expect(list, isNotEmpty);
++      final first = (list.first as Map).cast<String, Object?>();
++      expect(first['id'], isA<String>());
++      expect(first['label'], isA<String>());
++      expect(first['width'], isA<int>());
++      expect(first['format'], isA<String>());
++    });
++
++    test('px_process resizes one image and returns the image', () {
++      _requireLibrary();
++      final request = utf8.encode(
++        Requests.process(
++          pipeline: const Pipeline(
++            resize: ResizeSpec(width: 32, fit: FitMode.width),
++          ),
++          format: OutputFormat.jpeg,
++          imageBytes: _bmp(64, 48),
++          name: 'photo.jpg',
++        ),
++      );
++      final result = _takeJson(
++        px,
++        px.process(_borrow(request), request.length),
++      );
++      expect(result['width'], 32);
++      expect(result['height'], 24);
++      expect(result['output_name'], 'photo.jpg');
++      expect(result['output_bytes'], greaterThan(0));
++      final bytes = (result['bytes'] as List).cast<int>();
++      expect(bytes, isNotEmpty);
++      // The bytes are the encoded image, not the JSON envelope around it.
++      expect(bytes.take(2).toList(), [0xFF, 0xD8]);
++    });
++
++    test('px_process accepts a name that is not ASCII', () {
++      _requireLibrary();
++      // The request is UTF-8 on the wire. Handing the engine the Dart string's
++      // length instead of its encoded length truncates it, and the engine answers
++      // "bad request" for a file whose name contains an accent.
++      final name = 'café-π.jpg';
++      final request = utf8.encode(
++        Requests.process(
++          pipeline: const Pipeline(),
++          format: OutputFormat.jpeg,
++          imageBytes: _bmp(32, 32),
++          name: name,
++        ),
++      );
++      final result = _takeJson(
++        px,
++        px.process(_borrow(request), request.length),
++      );
++      expect(result['output_name'], name);
++    });
++
++    test('px_process rejects a malformed request rather than crashing', () {
++      _requireLibrary();
++      final body = utf8.encode('{not json');
++      final buffer = px.process(_borrow(body), body.length);
++      try {
++        expect(buffer.status, PxStatus.invalidArgument);
++        expect(_error(buffer), contains('bad request'));
++      } finally {
++        px.bufferFree(buffer);
++      }
++    });
++
++    test('px_batch reports partial failure instead of failing outright', () {
++      _requireLibrary();
++      final good = _bmp(32, 32);
++      final request = utf8.encode(
++        Requests.batch(
++          pipeline: const Pipeline(),
++          format: OutputFormat.jpeg,
++          files: [
++            BatchFile(name: 'a.jpg', bytes: good),
++            // A header cut in half: the magic bytes are intact, so format
++            // detection succeeds and the failure happens later, in the decoder.
++            BatchFile(name: 'broken.jpg', bytes: good.sublist(0, 20)),
++            BatchFile(name: 'c.jpg', bytes: good),
++          ],
++        ),
++      );
++      final report = _takeJson(px, px.batch(_borrow(request), request.length));
++      expect(report['cancelled'], false);
++      final outcomes = (report['outcomes'] as List)
++          .map((o) => (o as Map).cast<String, Object?>())
++          .toList();
++      expect(outcomes.length, 3);
++      expect(outcomes.where((o) => o['error'] == null).length, 2);
++      // Hard rule 9: a failure carries a reason, never a bare null.
++      final failure = outcomes.firstWhere((o) => o['error'] != null);
++      expect(failure['error'], isNotEmpty);
++    });
++
++    test('px_batch stops when its token has been triggered', () {
++      _requireLibrary();
++      final handle = px.cancelNew();
++      expect(handle, isNot(0), reason: '0 means the engine refused the token');
++      expect(px.cancelTrigger(handle), true);
++
++      final request = utf8.encode(
++        Requests.batch(
++          pipeline: const Pipeline(),
++          format: OutputFormat.jpeg,
++          files: [
++            for (var i = 0; i < 4; i++)
++              BatchFile(name: '$i.jpg', bytes: _bmp(32, 32)),
++          ],
++          cancelHandle: handle,
++        ),
++      );
++      final report = _takeJson(px, px.batch(_borrow(request), request.length));
++      expect(report['cancelled'], true);
++      expect(px.cancelFree(handle), true);
++      expect(
++        px.cancelFree(handle),
++        false,
++        reason: 'double free must be refused',
++      );
++    });
++
++    test('px_cancel_new, px_cancel_trigger and px_cancel_free agree', () {
++      _requireLibrary();
++      final handle = px.cancelNew();
++      expect(handle, isNot(0));
++      expect(px.cancelTrigger(handle), true);
++      expect(px.cancelFree(handle), true);
++      // Neither function dereferences a handle, so a value that was never issued
++      // is an answer rather than a wild access.
++      expect(px.cancelTrigger(0xDEADBEEF), false);
++      expect(px.cancelFree(0xDEADBEEF), false);
++    });
++
++    test('px_zip returns an archive, not JSON', () {
++      _requireLibrary();
++      final request = utf8.encode(
++        Requests.zip([
++          BatchFile(name: 'a.jpg', bytes: _bmp(16, 16)),
++          BatchFile(name: 'b.jpg', bytes: _bmp(16, 16)),
++        ]),
++      );
++      final archive = _takeBytes(px, px.zip(_borrow(request), request.length));
++      expect(archive.length, greaterThan(22));
++      // "PK\003\004": a local file header.
++      expect(archive.take(4).toList(), [0x50, 0x4B, 0x03, 0x04]);
++    });
++
++    test('px_selftest_error fails deliberately, with a reason', () {
++      _requireLibrary();
++      final buffer = px.selftestError();
++      try {
++        expect(buffer.status, PxStatus.error);
++        expect(buffer.data, ffi.nullptr);
++        expect(_error(buffer), contains('deliberate'));
++      } finally {
++        px.bufferFree(buffer);
++      }
++    });
++
++    test(
++      'px_selftest_panic returns an error rather than killing the process',
++      () {
++        _requireLibrary();
++        // True only against a debug build. `[profile.release]` sets
++        // `panic = "abort"`, so the shipped library aborts here instead of
++        // returning an error buffer. That is the intended trade, and it is why
++        // `scripts/verify.sh` runs the tests against the debug library.
++        final buffer = px.selftestPanic();
++        try {
++          expect(buffer.status, PxStatus.error);
++          expect(_error(buffer), contains('contained'));
++        } finally {
++          px.bufferFree(buffer);
++        }
++      },
++    );
++  });
++
++  group('ownership', () {
++    test('px_buffer_free treats a second free as a no-op', () {
++      _requireLibrary();
++      final buffer = px.version();
++      final address = buffer.data.address;
++      expect(address, isNonZero);
+       px.bufferFree(buffer);
+-    }
++      // Structs cannot be constructed in Dart — they live in native memory — so
++      // the same value is rebuilt in a native allocation and freed. The engine
++      // looks the pointer up among the buffers it owns, finds nothing, and leaks
++      // rather than rebuilding a `Vec` it does not own. A crash here means the
++      // ownership contract is broken.
++      final again = calloc<PxBuffer>();
++      try {
++        again.ref
++          ..status = 1
++          ..data = ffi.Pointer<ffi.Uint8>.fromAddress(address)
++          ..len = 0;
++        px.bufferFree(again.ref);
++      } finally {
++        calloc.free(again);
++      }
++    });
+ 
+-    // The deliberate failure must come back as an error buffer, not a crash.
+-    final err = px.selftestError();
+-    try {
+-      expect(err.status, PxStatus.error);
+-      expect(err.data.address, isZero);
+-    } finally {
+-      px.bufferFree(err);
+-    }
++    test('px_string_free releases an error string', () {
++      _requireLibrary();
++      final buffer = px.selftestError();
++      expect(_error(buffer), isNotEmpty);
++      px.stringFree(buffer.error);
++      // Every success path has a null error pointer, so freeing one has to be
++      // safe as well.
++      px.stringFree(ffi.nullptr);
++    });
+ 
+-    // A contained panic must also come back as an error buffer.
+-    final panic = px.selftestPanic();
+-    try {
+-      expect(panic.status, PxStatus.error);
+-    } finally {
+-      px.bufferFree(panic);
+-    }
++    test('a thousand round trips free everything they allocate', () {
++      _requireLibrary();
++      // Volume rather than measurement: Dart cannot count native allocations, so
++      // a leak here grows until the process dies. The engine's equivalent,
++      // `ffi::tests::a_thousand_rounds_of_the_boundary_leak_nothing`, can: it
++      // reads the table of buffers the engine still believes it owns.
++      for (var i = 0; i < 1000; i++) {
++        expect(_takeJson(px, px.version())['version'], isNotEmpty);
++      }
++    });
+   });
++}
+ 
+-  test('buffers freed twice do not crash', () {
+-    final lib = _tryLoad();
+-    if (lib == null) {
+-      markTestSkipped('native library not built');
+-      return;
+-    }
+-    final px = PxBindings(lib);
+-    final buffer = px.version();
+-    final address = buffer.data.address;
+-    expect(address, isNonZero);
++/// Skips the current test when the engine has not been built.
++///
++/// `markTestSkipped` ends the test, so nothing after this line runs against an
++/// unloaded library.
++void _requireLibrary() {
++  if (tryLoadEngineLibrary() == null) {
++    markTestSkipped('native library not built');
++  }
++}
++
++/// Copies bytes into native memory.
++///
++/// Deliberately not freed: these are scratch buffers for a test process that
++/// exits in seconds, and freeing them here would prove nothing the engine-side
++/// leak test does not already prove.
++ffi.Pointer<ffi.Uint8> _borrow(List<int> bytes) {
++  final ptr = calloc<ffi.Uint8>(bytes.length);
++  ptr.asTypedList(bytes.length).setAll(0, bytes);
++  return ptr;
++}
++
++Map<String, Object?> _takeJson(PxBindings px, PxBuffer buffer) {
++  try {
++    expect(buffer.status, PxStatus.ok, reason: _error(buffer));
++    return _decode(buffer) as Map<String, Object?>;
++  } finally {
+     px.bufferFree(buffer);
+-    // Second free of the same pointer must be a no-op on the Rust side
+-    // (unknown pointers are leaked, never rebuilt). If this crashes, the
+-    // ownership contract is broken. Structs cannot be constructed directly —
+-    // they live in native memory — so allocate one.
+-    final again = calloc<PxBuffer>();
+-    try {
+-      again.ref.status = 1;
+-      again.ref.data = ffi.Pointer<ffi.Uint8>.fromAddress(address);
+-      again.ref.len = 0;
+-      px.bufferFree(again.ref);
+-    } finally {
+-      calloc.free(again);
+-    }
+-  });
++  }
+ }
+ 
+-/// Returns the engine library, or null when it has not been built.
+-ffi.DynamicLibrary? _tryLoad() {
+-  for (final name in [
+-    'libpixelsmith_core.so',
+-    'pixelsmith_core.dll',
+-    'libpixelsmith_core.dylib',
+-  ]) {
+-    try {
+-      return ffi.DynamicLibrary.open(name);
+-    } on ArgumentError {
+-      continue;
+-    }
++List<Object?> _takeJsonList(PxBindings px, PxBuffer buffer) {
++  try {
++    expect(buffer.status, PxStatus.ok, reason: _error(buffer));
++    return _decode(buffer) as List<Object?>;
++  } finally {
++    px.bufferFree(buffer);
++  }
++}
++
++List<int> _takeBytes(PxBindings px, PxBuffer buffer) {
++  try {
++    expect(buffer.status, PxStatus.ok, reason: _error(buffer));
++    return buffer.data.asTypedList(buffer.len).toList();
++  } finally {
++    px.bufferFree(buffer);
+   }
+-  // iOS and macOS link statically; process() always "succeeds" even with
+-  // nothing in it, so only use it when the file actually exists.
+-  if (Platform.isIOS || Platform.isMacOS) {
+-    return ffi.DynamicLibrary.process();
++}
++
++Object? _decode(PxBuffer buffer) =>
++    jsonDecode(utf8.decode(buffer.data.asTypedList(buffer.len)));
++
++String _error(PxBuffer buffer) =>
++    buffer.error == ffi.nullptr ? '' : buffer.error.cast<Utf8>().toDartString();
++
++/// An uncompressed 24-bit BMP: the simplest container to build without an
++/// encoder, and one the engine decodes.
++List<int> _bmp(int width, int height) {
++  final rowBytes = width * 3;
++  final padded = rowBytes + (4 - rowBytes % 4) % 4;
++  final pixels = <int>[];
++  // Rows are stored bottom-up and each channel is blue first.
++  for (var y = height - 1; y >= 0; y--) {
++    for (var x = 0; x < width; x++) {
++      pixels
++        ..add((x * 255 ~/ width) & 0xFF)
++        ..add((y * 255 ~/ height) & 0xFF)
++        ..add(128);
++    }
++    while (pixels.length % padded != 0) {
++      pixels.add(0);
++    }
+   }
+-  return null;
++  return [..._bmpHeaderOnly(width, height), ...pixels];
+ }
++
++/// Just the 54-byte header, for a file whose pixels are deliberately absent.
++///
++/// `px_inspect` reads the header and stops, which is the whole point of a
++/// header-only check: a 400-megapixel claim costs nothing to reject.
++List<int> _bmpHeaderOnly(int width, int height) => <int>[
++  0x42, 0x4D, // "BM"
++  ..._le32(54), // file size: only the header exists
++  0, 0, 0, 0, // reserved
++  ..._le32(54), // pixel data offset
++  40, 0, 0, 0, // DIB header size
++  ..._le32(width),
++  ..._le32(height),
++  1, 0, // planes
++  24, 0, // bits per pixel
++  0, 0, 0, 0, // compression: none
++  ..._le32(width * height * 3), // image size
++  0, 0, 0, 0, // pixels per metre, horizontal
++  0, 0, 0, 0, // pixels per metre, vertical
++  0, 0, 0, 0, // palette size
++  0, 0, 0, 0, // important colours
++];
++
++List<int> _le32(int value) => [
++  value & 0xFF,
++  (value >> 8) & 0xFF,
++  (value >> 16) & 0xFF,
++  (value >> 24) & 0xFF,
++];
