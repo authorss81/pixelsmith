@@ -21,7 +21,8 @@ been mechanically checked, not asserted by an agent.
 | phase-13 | Animated GIF: honest handling | PENDING | | |
 | phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
 | phase-15 | Supply-chain policy and reproducible builds | PENDING | | |
-| phase-16 | Self-audit and next-phase generation | PENDING | | |
+| phase-16 | Release artefacts: the APK and the EXE | PENDING | | Publishes the installable binaries |
+| phase-17 | Self-audit and next-phase generation | PENDING | | Generates the next phase set |
 
 ## Status values
 

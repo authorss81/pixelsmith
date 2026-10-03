@@ -54,11 +54,38 @@ Current scope. `core/` is the Rust engine; `app/` does not exist until phase-05.
 | [phase-13](phase-13/PROMPT.md) | Animated GIF: honest handling | 12 | 75 |
 | [phase-14](phase-14/PROMPT.md) | Content-hash deduplication and a folder pipeline | 13 | 75 |
 | [phase-15](phase-15/PROMPT.md) | Supply-chain policy and reproducible builds | 14 | 90 |
-| [phase-16](phase-16/PROMPT.md) | Self-audit and next-phase generation | 15 | 90 |
+| [phase-16](phase-16/PROMPT.md) | **Release artefacts: the APK and the EXE** | 15 | 90 |
+| [phase-17](phase-17/PROMPT.md) | Self-audit and next-phase generation | 16 | 90 |
+
+### phase-16 is the delivery phase
+
+Everything before it builds a library and a test suite. phase-16 turns that into
+two things a person can install:
+
+- an **Android APK** (plus an `.aab`, because Play Store distribution requires
+  one and an APK alone cannot be published) — signed, with declared ABIs, and
+  verified to contain `lib/*/libpixelsmith_core.so` rather than being an empty
+  shell that crashes on first tap;
+- a **Windows EXE** as a portable ZIP — the whole `Release/` directory, because
+  an EXE without its DLLs does not start — verified to carry
+  `pixelsmith_core.dll` next to the executable.
+
+It publishes a tagged GitHub Release with SHA-256 checksums and the SBOM, and
+writes a `CHANGELOG.md` whose "what is still missing" section is the important
+one.
+
+`.github/workflows/build.yml` already produces both artefacts on every push, so
+this phase makes them release-grade rather than reinventing them. It also means
+the build is checked continuously from phase-05 onward: a refactor that breaks
+the binary shows up as a red build long before anyone installs it.
+
+Signing secrets belong to the repository owner. phase-16 must not fail when they
+are absent — it produces a debug-signed release, attaches it, and opens an issue
+saying exactly which secret to add.
 
 ## Track B and beyond — generated, not written
 
-There is no hand-authored UI track. Phase-16 writes it.
+There is no hand-authored UI track. phase-17 writes it.
 
 The reasoning: a prompt for "implement the before/after split slider" written
 before the app exists would describe a UI nothing had built, and the agent

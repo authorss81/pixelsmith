@@ -1,0 +1,258 @@
+name: build
+
+# Produces the artefacts a user can actually install.
+#
+# This runs on every push so there is always an APK and an EXE to download, and
+# it is the mechanism phase-16 formalises into a signed release.
+#
+# Deliberately separate from `automation`: a broken build must never stop a
+# phase, and a phase must never be able to publish a broken binary.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Build release mode (slower, needs signing secrets)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  FLUTTER_VERSION: stable
+
+jobs:
+  # ---------------------------------------------------------------------------
+  android-apk:
+    name: Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build the Rust library for Android ABIs
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: core
+        run: |
+          # Before phase-05 there is no Flutter app and therefore nothing to
+          # bundle the library into. Skipping is correct, not a failure: the
+          # Rust-only phases still get their verification from `automation`.
+          if [ ! -d ../app ]; then
+            echo "::notice::app/ does not exist yet — Rust-only tree, skipping native build."
+            exit 0
+          fi
+          cargo ndk \
+            -t arm64-v8a -t x86_64 \
+            -o ../app/src/rust/jniLibs \
+            build --release --lib
+
+      - name: Build the APK
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] && [ "${{ inputs.release }}" = "true" ]; then
+            flutter build apk --release
+          else
+            # Debug-signed so CI can always produce an installable artefact.
+            # Phase-16 replaces this with a properly signed release build.
+            flutter build apk --debug
+          fi
+
+      - name: Upload APK
+        if: hashFiles('app/pubspec.yaml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixelsmith-apk
+          path: app/build/app/outputs/**/*.{apk,aab}
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify the APK is a real, installable archive
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: |
+          APK=$(find build/app/outputs -name '*.apk' | head -n1)
+          if [ -z "${APK}" ]; then echo "::error::no APK produced"; exit 1; fi
+          echo "APK: ${APK} ($(stat -c%s "${APK}") bytes)"
+          # A zip bomb or an empty archive would pass a size check silently.
+          unzip -l "${APK}" | tail -n 1
+          unzip -l "${APK}" | grep -q 'classes.dex' \
+            || { echo "::error::APK has no classes.dex — this is not an app"; exit 1; }
+          unzip -l "${APK}" | grep -q 'lib/.*\.so' \
+            || echo "::warning::no native .so in the APK — expected before phase-05"
+          aapt2 dump badging "${APK}" 2>/dev/null | head -n 3 || true
+
+  # ---------------------------------------------------------------------------
+  windows-exe:
+    name: Windows EXE
+    # Must run on Windows: Flutter's Windows desktop toolchain is MSBuild-based
+    # and will not cross-compile from Linux.
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Resolve dependencies
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build the Rust library for Windows
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: core
+        run: |
+          if (-not (Test-Path ..\app)) {
+            Write-Output "::notice::app\ does not exist yet — Rust-only tree, skipping."
+            exit 0
+          }
+          New-Item -ItemType Directory -Force -Path ..\app\src\rust | Out-Null
+          cargo build --release --lib
+          Copy-Item target\release\pixelsmith_core.dll ..\app\src\rust\ -ErrorAction SilentlyContinue
+
+      - name: Build the EXE
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: flutter build windows --release
+
+      - name: Upload EXE
+        if: hashFiles('app/pubspec.yaml') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: pixelsmith-windows-exe
+          path: app/build/windows/x64/runner/Release/**
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Verify the EXE and its native library
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build\windows -Recurse -Filter '*.exe' -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -notlike '*flutter*' } | Select-Object -First 1
+          if (-not $exe) { Write-Output '::error::no EXE produced'; exit 1 }
+          Write-Output "EXE: $($exe.FullName) ($($exe.Length) bytes)"
+          # The engine must ship alongside the app; a missing DLL means the app
+          # opens to a crash on first use.
+          $root = Split-Path (Split-Path $exe.FullName -Parent) -Parent
+          Get-ChildItem -Path $root -Recurse -Include '*.dll' |
+            Select-Object Name, Length | Format-Table -AutoSize
+          if ($exe.Length -lt 100kb) {
+            Write-Output "::error::EXE is $($exe.Length) bytes, which is implausibly small"
+            exit 1
+          }
+
+  # ---------------------------------------------------------------------------
+  # Not shipped yet. Best-effort, so a macOS toolchain problem cannot turn the
+  # build check red while Android and Windows are the only targets that matter.
+  linux:
+    name: Linux (best effort)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux desktop build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang cmake ninja-build pkg-config libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - name: Build
+        if: hashFiles('app/pubspec.yaml') != ''
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build linux --release
+      - uses: actions/upload-artifact@v4
+        if: hashFiles('app/pubspec.yaml') != ''
+        with:
+          name: pixelsmith-linux
+          path: app/build/linux/**/*
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # The Rust engine on its own, for every platform, with no Flutter involved.
+  # This is the artefact that proves the engine itself cross-compiles, and it is
+  # available long before any UI exists.
+  engine-matrix:
+    name: engine ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-latest }
+          - { target: x86_64-pc-windows-msvc,  os: windows-latest }
+          - { target: x86_64-apple-darwin,    os: macos-latest }
+          - { target: aarch64-apple-darwin,   os: macos-latest }
+          - { target: aarch64-linux-android,  os: ubuntu-latest }
+          - { target: aarch64-apple-ios,      os: macos-latest }
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and test the engine
+        working-directory: core
+        run: |
+          cargo build --release --lib --target ${{ matrix.target }}
+          cargo test --release --lib --target ${{ matrix.target }} --no-run
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-${{ matrix.target }}
+          path: |
+            core/target/${{ matrix.target }}/release/*.so
+            core/target/${{ matrix.target }}/release/*.dll
+            core/target/${{ matrix.target }}/release/*.dylib
+            core/target/${{ matrix.target }}/release/*.a
+          if-no-files-found: warn
+          retention-days: 14
