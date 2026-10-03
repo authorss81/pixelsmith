@@ -49,6 +49,7 @@ optional = true
 
 
 [dev-dependencies]
+proptest = "1"
 tempfile = "3"
 
 [profile.release]
