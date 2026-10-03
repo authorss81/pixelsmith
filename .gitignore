@@ -35,10 +35,13 @@
 *.a
 *.lib
 
-# Pipeline state that must never be committed by accident
+# Pipeline state that must never be committed by accident.
+# NOTE: workspace/.runs is deliberately NOT ignored. It is the run budget, and
+# the only copy that survives the runner being wiped lives on main. An earlier
+# revision ignored it, so the budget reset to 0 on every run and the cap never
+# actually capped anything.
 /logs/
 workspace/.stop
-workspace/.runs
 workspace/*/.session
 workspace/*/.checkpoint
 

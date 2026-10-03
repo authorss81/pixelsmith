@@ -114,7 +114,11 @@ run_models() {
     code="${code:-0}"
     post="$(wc -c < "${logfile}" 2>/dev/null || echo 0)"
     growth=$((post - pre))
-    unset code
+    # NOTE: do not `unset code` here. `code` is declared `local`, so it starts
+    # unset, and the default above covers that. An earlier revision unset it
+    # after reading it and then read it again on the next line, which `set -u`
+    # turns into "code: unbound variable" — killing every phase before opencode
+    # was ever invoked.
     if [ "${code}" -eq 0 ]; then
       ACTIVE_MODEL="${m}"
       echo "== [models] ${m} succeeded =="
@@ -295,7 +299,12 @@ run_phase() {
   set +e
   checkpoint_loop &
   local CHECK_PID=$!
-  run_models "${LOG_DIR}/${PHASE}.log" --agent build "${SESSION_ARGS[@]}" --title "px-${PHASE}"
+  # ${arr[@]+"${arr[@]}"} is the portable idiom for expanding an array that may
+  # be empty under `set -u`. Plain "${SESSION_ARGS[@]}" is safe on bash 4.4+ but
+  # hard-fails on older bash, and a phase that dies before opencode runs costs a
+  # whole job to discover.
+  run_models "${LOG_DIR}/${PHASE}.log" --agent build \
+    ${SESSION_ARGS[@]+"${SESSION_ARGS[@]}"} --title "px-${PHASE}"
   local code=$?
   kill "${CHECK_PID}" 2>/dev/null || true
   set -e
