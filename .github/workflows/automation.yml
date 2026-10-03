@@ -169,22 +169,8 @@ jobs:
           fi
           finish_empty "idle"
 
-      - name: Consume one run from the budget
-        if: steps.pick.outputs.exists == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/.runs" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]' || echo 0)
-          RUNS=${RUNS:-0}
-          echo $((RUNS + 1)) > /tmp/runs
-          {
-            cd "$GITHUB_WORKSPACE" 2>/dev/null || { mkdir -p /tmp/ws && cd /tmp/ws; }
-            git init -q . 2>/dev/null || true
-            mkdir -p workspace
-            cp /tmp/runs workspace/.runs
-          }
-          # Upload as an artifact; the commit step below writes it to main.
-          echo "runs=$((RUNS + 1))" >> "$GITHUB_OUTPUT"
+      # The budget itself is incremented by run-phase, which has a checkout and
+      # can therefore commit workspace/.runs back to main.
 
   # ---------------------------------------------------------------------------
   run-phase:
@@ -208,12 +194,44 @@ jobs:
         with:
           workspaces: core
 
-      - name: Setup Flutter
+      - name: Setup Flutter (only when the app exists)
+        id: flutter
+        # Phases 01-04 are pure Rust and must not pay for a Flutter clone. Once
+        # phase-05 lands, `app/pubspec.yaml` appears and this turns on.
+        #
+        # Note: `echo >> $GITHUB_PATH` only affects LATER steps, so `flutter` is
+        # invoked by absolute path here. Calling the bare name in this step is
+        # what broke the first five runs with "flutter: command not found".
         run: |
-          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          if [ ! -f app/pubspec.yaml ]; then
+            echo "app/pubspec.yaml absent — skipping Flutter setup."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git clone --depth 1 -b stable \
+            https://github.com/flutter/flutter.git "$HOME/flutter"
+          "$HOME/flutter/bin/flutter" config --no-analytics >/dev/null 2>&1 || true
+          "$HOME/flutter/bin/flutter" --version
           echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
-          flutter config --no-analytics >/dev/null 2>&1 || true
-          flutter --version
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
+
+      - name: Preflight
+        id: preflight
+        run: |
+          # Fail loudly and early rather than burning a 60-minute job on a
+          # missing key or a bad toolchain.
+          if [ -z "${OPENCODE_API_KEY:-}" ]; then
+            echo "::error::OPENCODE_API_KEY is not set. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets. New secrets can take a minute to propagate."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "OPENCODE_API_KEY is set (value not shown)."
+          command -v opencode >/dev/null 2>&1 \
+            || { echo "::error::opencode binary missing"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          echo "opencode: $(command -v opencode)"
+          echo "cargo:    $(cargo --version)"
+          echo "rustc:    $(rustc --version)"
+          echo "ok=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@v4
         with:
@@ -231,13 +249,18 @@ jobs:
 
       - name: Write run budget
         run: |
+          # This job has a checkout, so the counter can be read locally and
+          # written back. The commit step below puts it on main, which is what
+          # makes it survive the runner being wiped between runs.
           mkdir -p workspace
-          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/.runs" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]' || echo 0)
-          echo $(( ${RUNS:-0} + 1 )) > workspace/.runs
-          echo "budget=$(cat workspace/.runs)" >> "$GITHUB_ENV"
+          RUNS=$(tr -dc '0-9' < workspace/.runs 2>/dev/null || echo 0)
+          RUNS=${RUNS:-0}
+          echo $((RUNS + 1)) > workspace/.runs
+          echo "budget now $((RUNS + 1))/250"
 
       - name: Run phase
         id: meta
+        if: steps.preflight.outputs.ok == 'true'
         env:
           PHASE: ${{ needs.select-phase.outputs.phase }}
         run: |
@@ -334,11 +357,17 @@ jobs:
         with:
           workspaces: core
 
-      - name: Setup Flutter
+      - name: Setup Flutter (only when the app exists)
         run: |
-          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          if [ ! -f app/pubspec.yaml ]; then
+            echo "app/pubspec.yaml absent — skipping Flutter setup."
+            exit 0
+          fi
+          git clone --depth 1 -b stable \
+            https://github.com/flutter/flutter.git "$HOME/flutter"
+          "$HOME/flutter/bin/flutter" config --no-analytics >/dev/null 2>&1 || true
+          "$HOME/flutter/bin/flutter" --version
           echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
-          flutter config --no-analytics >/dev/null 2>&1 || true
 
       - uses: actions/cache@v4
         with:
@@ -539,23 +568,50 @@ jobs:
             [ "${PUSHED}" = "0" ] && echo "::error::audit output not pushed"
           fi
 
-  # ---------------------------------------------------------------------------
-  # Self-retrigger. Chains the next run ~10s later instead of waiting on cron,
+# ---------------------------------------------------------------------------
+  # Self-retrigger. Chains the next run ~15s later instead of waiting on cron,
   # which GitHub throttles on public repos.
+  #
+  # CRITICAL: this only chains when the phase actually PROGRESSED. An earlier
+  # version chained whenever a phase was merely selected, so a setup failure
+  # (missing toolchain, bad key) burned a 60-minute job every 15 seconds and
+  # drained the run budget before a human could react. A phase that reached
+  # .attempted, .done, .deferred or .blocked means the pipeline made a decision;
+  # anything else means the job died and the cron safety net should handle it.
   retrigger:
-    needs: [select-phase]
+    needs: [select-phase, run-phase]
     if: always() && needs.select-phase.outputs.exists == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Chain to the next run
+      - name: Chain to the next run, but only if the phase progressed
         env:
           GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select-phase.outputs.phase }}
-          REASON: ${{ needs.select-phase.outputs.reason }}
         run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" --jq '.tree[].path' > /tmp/tree.txt
+
+          PROGRESSED=0
+          REASON=""
+          for marker in attempted done deferred blocked; do
+            if grep -qx "workspace/${PHASE}/.${marker}" /tmp/tree.txt; then
+              PROGRESSED=1
+              REASON="${REASON} .${marker}"
+            fi
+          done
+
+          if [ "${PROGRESSED}" = "0" ]; then
+            echo "::warning::${PHASE} left no progress marker — NOT chaining."
+            echo "The job most likely failed during setup (toolchain, key, or network)."
+            echo "The */20 cron will retry. Fix the cause before it fires again:"
+            echo "  - is OPENCODE_API_KEY set?"
+            echo "  - do the logs in the last run's artefacts show a setup error?"
+            exit 0
+          fi
+
           # 15s backoff so a stacked retrigger cannot tight-loop while the
           # previous run's commit step is still in flight.
           sleep 15
+          echo "Re-dispatching px_tick (${PHASE}:${REASON})"
           gh api \
             -X POST \
             -H "Accept: application/vnd.github+json" \
