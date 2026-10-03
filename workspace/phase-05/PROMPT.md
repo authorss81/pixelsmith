@@ -6,7 +6,17 @@
 
 ## Objective
 
-Create the Dart side of the boundary and a Flutter app that compiles and tests clean, so every later UI phase has something to attach to. No screens beyond a placeholder: this phase is plumbing.
+The Dart side of the boundary and the Flutter app already exist: the scaffold,
+the hand-written `dart:ffi` declarations, the JSON mirrors, the safe wrapper
+and the contract tests were built directly in
+[authorss81/shrinkray](https://github.com/authorss81/shrinkray), which is wired
+in here as the `app/` submodule. No screens beyond a placeholder: this phase
+was always plumbing.
+
+Your job is to verify every acceptance criterion below against what actually
+exists, fill any gaps you find, and leave the submodule pointer, the contract
+tests and the CI glue all green. Do not rebuild what is already built. Do not
+restructure the shrinkray repository.
 
 ## Read first
 
@@ -17,12 +27,19 @@ Create the Dart side of the boundary and a Flutter app that compiles and tests c
 
 ### Do
 
-- Create the app: `flutter create --platforms=android,ios,windows,macos,linux --org dev.pixelsmith app`. Set the Dart SDK constraint from `flutter --version` rather than guessing.
-- Write the native library build glue:
-  - desktop: build `core` as a static or dynamic library, invoked from CMake and from the Windows MSBuild project, copying the artefact where the app expects it;
+- `git submodule update --init --recursive` first. Confirm `app/pubspec.yaml`,
+  `app/lib/rust/` and `app/test/` exist at the pinned commit before touching
+  anything.
+- Verify the native library build glue against the current `core/`:
+  - desktop: `core` builds as a static or dynamic library, invoked from CMake
+    and from the Windows MSBuild project, copying the artefact where the app
+    expects it;
   - Android: `cargo-ndk`; iOS: `cargo-lipo`.
-  - Document the exact commands in `app/README.md`. The next agents will follow that file rather than rediscovering the setup.
-- Write `app/lib/rust/`:
+  - The exact commands must be documented in `app/README.md`. If they have
+    drifted from what `native/build-engine.sh` actually does, fix the docs,
+    not the script — unless the script is wrong, in which case fix the script
+    and say so.
+- Verify `app/lib/rust/` against `core/src/ffi.rs`, function by function:
   - `bindings.dart` — raw `dart:ffi` declarations for every `px_*` function, matching `#[repr(C)]` exactly. Include a test asserting `PxBuffer`'s offsets and sizes against values computed from the Rust side, because a layout mismatch is silent memory corruption.
   - `engine.dart` — the safe wrapper: owns every `PxBuffer`, frees it in a `finally`, never lets a raw pointer escape.
   - `models.dart` — Dart mirrors of the JSON request and response types, with `fromJson`/`toJson` round-trip tests.

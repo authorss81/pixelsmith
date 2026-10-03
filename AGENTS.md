@@ -61,7 +61,29 @@ reviewer will block it.
   have to reverse-engineer. Delete commented-out code.
 - Dart: no `print`. Use the logger. No magic numbers in the UI layer.
 
-## Working on a phase
+## The Flutter app lives in another repository
+
+`app/` is a git submodule pointing at
+[authorss81/shrinkray](https://github.com/authorss81/shrinkray), where the
+Flutter UI, the Dart FFI layer and the APK/EXE builds live. The engine in
+`core/` is the source of truth here; the app consumes it.
+
+Rules for working inside `app/`:
+
+1. The submodule is checked out at a pinned commit. `git submodule update
+   --init --recursive` first, or you are editing a stale or empty directory.
+2. Commit inside the submodule first, push it, then commit the pointer update
+   here. A superproject commit pointing at an unpushed submodule SHA is broken
+   for everyone else.
+3. Never commit build artefacts from `app/` into this repository. The native
+   libraries (`src/rust/*.so`, `*.dll`) and `build/` are gitignored in both
+   repos; CI rebuilds them every run.
+4. The Dart code mirrors the engine's JSON contract exactly. If you change a
+   request, response or enum shape in `core/src/ffi.rs`, update
+   `app/lib/rust/models.dart` in the same phase and extend the contract tests on
+   both sides. A drifting contract is silent corruption.
+5. Slow builds (APK, EXE, release bundles) run in the shrinkray repository's own
+   `build.yml`, not here and not on a developer machine.
 
 1. Read `workspace/<phase>/PROMPT.md` completely.
 2. Read the files you are about to change.

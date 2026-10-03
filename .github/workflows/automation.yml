@@ -198,6 +198,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          submodules: recursive
           # The branch tip, NOT the triggering SHA. verify and review both read
           # markers that run-phase pushes during THIS run, so checking out the
           # event SHA gives them the tree from before the phase ran. That made
@@ -411,6 +412,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          submodules: recursive
           # The branch tip, NOT the triggering SHA. verify and review both read
           # markers that run-phase pushes during THIS run, so checking out the
           # event SHA gives them the tree from before the phase ran. That made
@@ -554,6 +556,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          submodules: recursive
           # The branch tip, NOT the triggering SHA. verify and review both read
           # markers that run-phase pushes during THIS run, so checking out the
           # event SHA gives them the tree from before the phase ran. That made
@@ -626,6 +629,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
+          submodules: recursive
           # The branch tip, NOT the triggering SHA. verify and review both read
           # markers that run-phase pushes during THIS run, so checking out the
           # event SHA gives them the tree from before the phase ran. That made
