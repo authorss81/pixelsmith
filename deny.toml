@@ -10,7 +10,9 @@
 #      crate, because both are how supply-chain compromises get in.
 #
 # There are currently ZERO advisories ignored and ZERO duplicate versions skipped.
-# That is not an accident and it should stay that way. Both an ignore list and a
+# That is not an accident and it should stay that way — and note that it does not
+# mean `cargo deny check bans` is green. It is not; see the note under [bans] for
+# the two duplicates that are left failing on purpose. Both an ignore list and a
 # skip list grew out of the `avif` feature, which was written against the ravif
 # 0.13 API while Cargo.toml resolved 0.11. It never compiled, which meant
 # scripts/verify.sh failed on every run, and it dragged in rav1e -> nasm, an
@@ -21,7 +23,10 @@
 # the value it brings. An exception nobody re-reads is how a supply-chain policy
 # quietly stops meaning anything.
 #
-# Run with: cargo deny check
+# Run with: cargo deny --manifest-path core/Cargo.toml check
+# The manifest path is not optional: run from the repository root without it and
+# cargo-deny reports "the directory ... doesn't contain a Cargo.toml file" and
+# exits 1, which looks like a policy failure and is not one.
 # Enforced in CI via .github/workflows/supply-chain.yml.
 
 [graph]
@@ -45,10 +50,22 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
+# Crates nobody is maintaining any more are how the next compromise gets in, so
+# they are denied rather than warned about. The vocabulary is cargo-deny's, not
+# ours: this key takes "all" / "workspace" / "transitive" / "none", not
+# "deny"/"warn", and "deny" here is a hard config error. Verified against
+# cargo-deny 0.20.2, which is what EmbarkStudios/cargo-deny-action@v2 resolves
+# to when the workflow pins no version of its own.
+unmaintained = "all"
 ignore = []
 
 [licenses]
 version = 2
+# GPL-2.0, GPL-3.0 and AGPL-3.0 are denied by omission: a crate whose licence is
+# not in this list fails the check, so copyleft cannot enter the tree. There is
+# deliberately no explicit `deny = [...]` of the GNU licences — cargo-deny
+# removed that key entirely (EmbarkStudios/cargo-deny#611), and a config that
+# names a removed key does not degrade to a warning, it fails to load.
 allow = [
   "MIT",
   "Apache-2.0",
@@ -68,6 +85,20 @@ confidence-threshold = 0.93
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# KNOWN RED, and deliberately left red. `cargo deny check bans` currently fails
+# on two duplicates that no amount of configuration can remove:
+#
+#   miniz_oxide 0.8 (via png 0.18)  +  0.9 (via flate2, from zip and tiff)
+#   syn         2.0 (via zerocopy-derive <- half <- tiff)
+#                            +  3.0 (via serde_derive, thiserror-impl)
+#
+# Both pairs are pinned by upstream version requirements inside `image` and its
+# own dependency set, so collapsing them needs a dependency change rather than a
+# policy change. Adding `skip` entries would turn the supply-chain job green
+# while making the policy mean less, which is the trade this file exists to
+# refuse. phase-15 ("Supply-chain policy and reproducible builds") owns the fix.
+# Nothing in scripts/verify.sh runs cargo-deny, so the phase gate is unaffected.
+#
 # NOTE: `deny` must be a single array of tables. An earlier version of this file
 # also had a separate `[[bans.deny]]` section, which cargo-deny rejects with
 # "duplicate key: deny". Keep every entry inside this one array.

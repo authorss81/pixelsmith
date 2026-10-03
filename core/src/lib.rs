@@ -53,7 +53,12 @@ pub fn capabilities() -> Capabilities {
         png: true,
         webp_lossy: cfg!(feature = "webp-lossy"),
         webp_lossless: true,
-        avif_encode: cfg!(feature = "avif"),
+        // A constant, not a `cfg!`: there is no `avif` feature, because the
+        // `ravif`-based encoder was deleted rather than shipped broken.
+        // `OutputFormat::Avif` still exists so AVIF *input* is recognised, and
+        // `format::encode` rejects it explicitly. phase-07 adds the encoder and
+        // turns this into a real flag.
+        avif_encode: false,
         gif: true,
         tiff: true,
         bmp: true,

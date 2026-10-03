@@ -172,7 +172,7 @@ pub unsafe extern "C" fn px_string_free(s: *mut std::ffi::c_char) {
 /// a pixel buffer.
 ///
 /// # Safety
-/// See [`borrow`].
+/// `ptr` must be valid for reads of `len` bytes, or null when `len` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_inspect(ptr: *const u8, len: usize, mobile_limits: bool) -> PxBuffer {
     // `let ... else` cannot take a block-expression scrutinee, so the borrow is
@@ -198,7 +198,7 @@ pub unsafe extern "C" fn px_inspect(ptr: *const u8, len: usize, mobile_limits: b
 /// Full EXIF read as JSON.
 ///
 /// # Safety
-/// See [`borrow`].
+/// `ptr` must be valid for reads of `len` bytes, or null when `len` is 0.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_exif(ptr: *const u8, len: usize) -> PxBuffer {
     // `let ... else` cannot take a block-expression scrutinee, so the borrow is

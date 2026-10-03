@@ -1,7 +1,18 @@
+# rustfmt settings for the whole repository. `core/` is the only crate today;
+# `app/` is formatted by `dart format`, which is checked separately.
 edition = "2024"
+
+# 100 is rustfmt's own default, so this line changes nothing about the tree as it
+# stands. It is written out on purpose anyway: a default nobody chose is not a
+# decision, and the next toolchain that moves the default would silently
+# reformat every file and bury whatever real change a reviewer was reading.
+#
+# Going wider (110, 120) was considered and rejected. The engine's doc comments
+# carry the reasoning behind its security decisions and routinely run past 80
+# columns, so a narrow limit mostly produces churn — but the comments a reviewer
+# most needs to check are exactly the ones they are reading line by line, and
+# long lines are worse in a diff.
 max_width = 100
-# 100 rather than the default 100 only where it costs nothing. The engine's
-# comments carry a lot of reasoning and long single-line comments hurt review
-# diffs far more than they help.
+
 newline_style = "Unix"
 use_field_init_shorthand = true
