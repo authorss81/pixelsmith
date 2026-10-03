@@ -210,23 +210,22 @@ pub fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> R
             )?;
         }
         OutputFormat::Avif => {
-            #[cfg(feature = "avif")]
-            {
-                let rgba = to_rgba8(img);
-                let avif = ravif::AvifEncoder::new()
-                    .with_quality(quality)
-                    .with_speed(8)
-                    .write_rgb8(
-                        &rgba,
-                        ravif::ColorSpace::Srgb,
-                        ravif::ChromaSubsampling::A420,
-                    )
-                    .map_err(Error::Encode)?;
-                out.clear();
-                out.extend_from_slice(&avif);
-            }
-            #[cfg(not(feature = "avif"))]
-            return Err(Error::UnknownFormat);
+            // No encoder yet.
+            //
+            // An earlier revision carried a `ravif`-based encoder behind an
+            // `avif` feature. It was written against the ravif 0.13 API while
+            // Cargo.toml resolved 0.11, so `--all-features` never compiled —
+            // which meant fmt, clippy, test, build and doc all failed on every
+            // verification run, so the pipeline could never verify a single
+            // phase. It also dragged in nasm, an unmaintained `paste`
+            // transitive dependency, and four duplicate crate versions.
+            //
+            // Speculative code that has never compiled is worse than no code, so
+            // it is gone. phase-07 implements AVIF properly, against the API of
+            // whichever version actually resolves, with a test that compiles.
+            return Err(Error::UnsupportedFormat(
+                "AVIF encoding is not implemented yet",
+            ));
         }
     }
 

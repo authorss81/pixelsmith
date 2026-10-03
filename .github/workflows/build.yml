@@ -34,6 +34,40 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # The gate. This is the fast feedback loop: if the tree is red, say so in about
+  # three minutes rather than waiting twenty for a phase run to discover it.
+  #
+  # It runs on every push, so a broken tree is caught before the autonomous
+  # pipeline spends a job on it, and before a phase can be marked .done.
+  gate:
+    name: verify.sh
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Run the verification gate
+        run: |
+          chmod +x scripts/*.sh
+          set +e
+          bash scripts/verify.sh 2>&1 | tee /tmp/verify.log
+          rc=${PIPESTATUS[0]}
+          echo "### verify.sh exit code: ${rc}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${rc}" -ne 0 ]; then
+            echo "### Failing checks" >> "$GITHUB_STEP_SUMMARY"
+            grep -E '^\s+FAIL:' /tmp/verify.log >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          exit "${rc}"
+
+  # ---------------------------------------------------------------------------
   detect:
     # One job, so the APK and EXE jobs do not each pay for a checkout just to
     # ask whether there is an app yet.
@@ -256,15 +290,6 @@ jobs:
           - { target: aarch64-apple-ios, os: macos-latest }
     steps:
       - uses: actions/checkout@v5
-
-      - name: Install nasm (rav1e, for the AVIF encoder)
-        if: runner.os != 'Windows'
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update -q && sudo apt-get install -y -q nasm
-          else
-            brew install nasm
-          fi
 
       # Cross-compiling to Android needs the NDK's linker. Plain `cargo build
       # --target aarch64-linux-android` fails at link time with no linker, so the

@@ -7,6 +7,11 @@ pub enum Error {
     #[error("unsupported or unrecognised image format")]
     UnknownFormat,
 
+    /// A format we recognise on input but cannot yet write. Distinct from
+    /// `UnknownFormat` because the user's file is fine — we are the limitation.
+    #[error("{0}")]
+    UnsupportedFormat(&'static str),
+
     #[error("image is larger than the {limit} byte input limit ({actual} bytes)")]
     InputTooLarge { limit: usize, actual: usize },
 

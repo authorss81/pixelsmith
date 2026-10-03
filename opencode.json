@@ -9,7 +9,16 @@
     "edit": "allow",
     "bash": "allow",
     "webfetch": "deny",
-    "websearch": "deny"
+    "websearch": "deny",
+    "external_directory": {
+      "*": "deny",
+      "~/.cargo/registry/**": "allow",
+      "~/.cargo/git/**": "allow",
+      "~/.pub-cache/**": "allow",
+      "$HOME/flutter/**": "allow",
+      "/opt/**": "allow",
+      "/usr/lib/**": "allow"
+    }
   },
   "agent": {
     "build": {
@@ -18,7 +27,13 @@
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "webfetch": "deny"
+        "webfetch": "deny",
+        "external_directory": {
+          "*": "deny",
+          "~/.cargo/registry/**": "allow",
+          "~/.cargo/git/**": "allow",
+          "~/.pub-cache/**": "allow"
+        }
       }
     },
     "reviewer": {

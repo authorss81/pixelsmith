@@ -9,7 +9,7 @@ homepage = "https://github.com/authorss81/pixelsmith"
 documentation = "https://docs.rs/pixelsmith_core"
 readme = "../README.md"
 rust-version = "1.85"
-keywords = ["image", "resize", "jpeg", "webp", "avif", "exif", "offline", "privacy"]
+keywords = ["image", "resize", "jpeg", "webp", "exif", "offline", "privacy"]
 categories = ["multimedia::images"]
 exclude = ["target/**"]
 
@@ -42,16 +42,11 @@ default = []
 # toolchain requirement and stays fast to compile in CI; WebP output then falls
 # back to the lossless encoder, which still beats PNG for photographs.
 webp-lossy = ["dep:webp"]
-# AVIF encoding. Heavy build (pulls in rav1e), so it is opt-in.
-avif = ["dep:ravif"]
 
 [dependencies.webp]
 version = "0.3"
 optional = true
 
-[dependencies.ravif]
-version = "0.11"
-optional = true
 
 [dev-dependencies]
 tempfile = "3"

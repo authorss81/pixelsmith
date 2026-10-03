@@ -185,12 +185,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install nasm (required by rav1e, which builds the AVIF encoder)
-        # scripts/verify.sh runs cargo with --all-features, and the `avif`
-        # feature pulls in rav1e, whose build script shells out to nasm for the
-        # AV1 assembly routines. Without this, clippy/doc/test all fail at the
-        # build-script stage on every runner.
-        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -369,12 +363,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install nasm (required by rav1e, which builds the AVIF encoder)
-        # scripts/verify.sh runs cargo with --all-features, and the `avif`
-        # feature pulls in rav1e, whose build script shells out to nasm for the
-        # AV1 assembly routines. Without this, clippy/doc/test all fail at the
-        # build-script stage on every runner.
-        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -512,12 +500,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install nasm (required by rav1e, which builds the AVIF encoder)
-        # scripts/verify.sh runs cargo with --all-features, and the `avif`
-        # feature pulls in rav1e, whose build script shells out to nasm for the
-        # AV1 assembly routines. Without this, clippy/doc/test all fail at the
-        # build-script stage on every runner.
-        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -584,12 +566,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install nasm (required by rav1e, which builds the AVIF encoder)
-        # scripts/verify.sh runs cargo with --all-features, and the `avif`
-        # feature pulls in rav1e, whose build script shells out to nasm for the
-        # AV1 assembly routines. Without this, clippy/doc/test all fail at the
-        # build-script stage on every runner.
-        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
