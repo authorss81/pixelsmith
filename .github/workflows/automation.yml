@@ -59,6 +59,9 @@ jobs:
     # No checkout. Marker files are read through the GitHub trees API in one call
     # (~1-2s), so an idle tick costs only a VM boot.
     runs-on: ubuntu-latest
+    # A hung selector must never be able to wedge the queue. This job only makes
+    # a handful of API calls; 10 minutes is already pathological.
+    timeout-minutes: 10
     outputs:
       phase: ${{ steps.pick.outputs.phase }}
       exists: ${{ steps.pick.outputs.exists }}
@@ -318,17 +321,44 @@ jobs:
             fi
           fi
 
+
+      - name: Publish the log tail to the step summary
+        if: always()
+        env:
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          # The artifact upload below can fail (quota, network, a 409 on a
+          # duplicate name) and take the logs with it. The step summary is
+          # written by this job and survives independently, so the reasoning
+          # behind a failure is always recoverable.
+          LOG="logs/${PHASE}.log"
+          {
+            echo "### ${PHASE} log tail"
+            echo ""
+            if [ -f "${LOG}" ]; then
+              echo '```'
+              tail -n 60 "${LOG}"
+              echo '```'
+            else
+              echo "No log at \`${LOG}\`. The phase failed before the runner wrote one."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload logs and recovery patch
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
+          # A transient artifact failure must not lose the log, so the action's
+          # own retry budget is raised. The step summary above is the backstop if
+          # this still fails.
+          retention-days: 14
+          overwrite: false
           name: px-logs-${{ needs.select-phase.outputs.phase }}-${{ github.run_id }}
           path: |
             logs/${{ needs.select-phase.outputs.phase }}*
             px-*.patch
           if-no-files-found: ignore
-          retention-days: 14
 
       - name: Report status
         if: always()
@@ -346,8 +376,10 @@ jobs:
             if [ "$OPEN" = "0" ]; then
               { echo "Phase **${PHASE}** is blocked."; echo "";
                 echo "## Log tail"; echo '```';
-                tail -60 "logs/${PHASE}.log" 2>/dev/null || echo "(no log)";
+                tail -60 "logs/${PHASE}.log" 2>/dev/null || echo "(no log — the phase died before writing one)";
                 echo '```'; echo "";
+                echo "Artifacts for this run may hold the full log:";
+                echo "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"; echo "";
                 echo "Fix the cause, then delete \`workspace/${PHASE}/.blocked\` and \`workspace/${PHASE}/.attempts\` and push."; } > /tmp/issue.md
               gh issue create --title "PX blocked: ${PHASE}" --body-file /tmp/issue.md || true
             fi
@@ -659,6 +691,8 @@ jobs:
     needs: [select-phase, run-phase]
     if: always() && needs.select-phase.outputs.exists == 'true'
     runs-on: ubuntu-latest
+    # Short by design. This job sleeps 15s then makes one API call.
+    timeout-minutes: 5
     steps:
       - name: Chain to the next run, but only if the phase progressed
         env:

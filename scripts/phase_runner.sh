@@ -66,6 +66,11 @@ STOP_FILE="workspace/.stop"
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-3}"
 MAX_DEFERRALS="${MAX_DEFERRALS:-5}"
 MAX_VERIFY_FAILURES="${MAX_VERIFY_FAILURES:-3}"
+# A no-work failure is almost never transient: the model refused, or the phase
+# prompt is unclear, or it hit a wall it could not get past. Retrying it three
+# times at up to 90 minutes each is expensive and almost always ends in the same
+# place, so it gets a tighter cap.
+MAX_NOWORK_ATTEMPTS="${MAX_NOWORK_ATTEMPTS:-2}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL_SECONDS:-300}"
 WIP_BRANCH="px-wip/${PHASE}"
 REVIEWER_AGENT="${REVIEWER_AGENT:-reviewer}"
@@ -268,17 +273,33 @@ checkpoint_loop() {
 }
 
 resume_wip() {
-  if git ls-remote --exit-code origin "refs/heads/${WIP_BRANCH}" >/dev/null 2>&1; then
-    echo "== [phase] continuing from prior partial work (${WIP_BRANCH}) =="
-    git fetch origin "${WIP_BRANCH}" 2>/dev/null || true
-    git merge --no-edit FETCH_HEAD 2>/dev/null || true
-    git push origin main 2>/dev/null || true
+  # Two places partial work can survive: the periodic WIP checkpoint branch, and
+  # the recovery branch the workflow force-pushes when the push to main was
+  # rejected five times. Checking only the first one loses the second, which is
+  # exactly the case where nothing else exists.
+  local branch
+  for branch in "px-wip/${PHASE}" "px-recovery/${PHASE}"; do
+    if ! git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+      continue
+    fi
+    echo "== [phase] recovering partial work from ${branch} =="
+    git fetch origin "${branch}" 2>/dev/null || continue
+    # `|| true` on the merge is deliberate: a WIP branch based on an older main
+    # will conflict, and the agent is better at resolving that than a script is.
+    # The conflict is left in the tree for the agent to see and finish.
+    git merge --no-edit FETCH_HEAD 2>&1 | tail -5 || true
+    git push origin main 2>&1 | tail -3 || true
     touch "${PHASE_DIR}/.checkpoint"
-  fi
+    return 0
+  done
+  return 0
 }
 
 clear_wip() {
-  git push origin --delete "${WIP_BRANCH}" 2>/dev/null || true
+  # Both branches, not just the checkpoint one: a px-recovery branch left behind
+  # would be merged into a future run of the same phase and re-conflict forever.
+  git push origin --delete "px-wip/${PHASE}" 2>/dev/null || true
+  git push origin --delete "px-recovery/${PHASE}" 2>/dev/null || true
   rm -f "${PHASE_DIR}/.checkpoint"
 }
 
@@ -385,7 +406,7 @@ fi
 if [ -f "${DONE_FILE}" ]; then
   echo "== [phase] ${PHASE} already DONE — skipping, clearing stale markers =="
   rm -f "${DEFERRED_FILE}" "${SESSION_FILE}" "${BLOCKED_FILE}" "${ATTEMPTS_FILE}" \
-        "${DEFERRED_ATTEMPTS_FILE}" "${NOWORK_FILE}" "${VERIFY_FAILURES_FILE}"
+        "${DEFERRED_ATTEMPTS_FILE}" "${NOWORK_FILE}" "${NOWORK_FILE}.n" "${VERIFY_FAILURES_FILE}"
   exit 0
 fi
 
@@ -411,12 +432,28 @@ if [ "${RUN_OK}" = "1" ]; then
     echo "== [phase] SUCCESS + evidence gate passed — awaiting verification =="
     # NOT .done. The workflow writes that only after scripts/verify.sh passes.
     touch "${ATTEMPTED_FILE}"
-    rm -f "${DEFERRED_FILE}" "${NOWORK_FILE}" "${SESSION_FILE}" "${ATTEMPTS_FILE}" "${DEFERRED_ATTEMPTS_FILE}"
+    rm -f "${DEFERRED_FILE}" "${NOWORK_FILE}" "${NOWORK_FILE}.n" "${SESSION_FILE}" "${ATTEMPTS_FILE}" "${DEFERRED_ATTEMPTS_FILE}"
     clear_wip
     exit 0
   fi
   echo "== [phase] NO-WORK FAILURE: opencode exited 0 but changed nothing — not marking attempted =="
   touch "${NOWORK_FILE}"
+  # A no-work failure is the one class that is almost never transient, so it gets
+  # its own tight cap. Two attempts, then blocked: three 90-minute runs that all
+  # do nothing is two hours burned to learn nothing new. Read the log first — the
+  # usual cause is a phase prompt that asks for something the current toolchain
+  # cannot do.
+  NOWORK_N=0
+  [ -f "${NOWORK_FILE}.n" ] && NOWORK_N="$(cat "${NOWORK_FILE}.n" 2>/dev/null || echo 0)"
+  NOWORK_N=$((NOWORK_N + 1))
+  printf '%s' "${NOWORK_N}" > "${NOWORK_FILE}.n"
+  if [ "${NOWORK_N}" -ge "${MAX_NOWORK_ATTEMPTS}" ]; then
+    echo "== [phase] NO WORK ${NOWORK_N}/${MAX_NOWORK_ATTEMPTS}: ${PHASE} BLOCKED =="
+    echo "== [phase] Read ${LOG_DIR}/${PHASE}.log before retrying. ==" >&2
+    touch "${BLOCKED_FILE}"
+    exit 3
+  fi
+  echo "== [phase] no work ${NOWORK_N}/${MAX_NOWORK_ATTEMPTS}, will retry =="
 else
   echo "== [phase] opencode exited non-zero: ${PHASE}"
 fi

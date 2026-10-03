@@ -108,9 +108,16 @@ writes `docs/AUDIT.md`, and generates the next phases. Because it pushes new
 That is the loop closing, and it needs no change to the workflow.
 
 **Limits.** 250 runs, 80 phases, 3 attempts per phase, 5 rate-limit deferrals per
-phase, 3 verification failures per phase. A phase that exhausts any of them
-becomes `.blocked` and is skipped. There is no path by which this loop runs
+phase, 3 verification failures, 2 no-work failures. A phase that exhausts any of
+them becomes `.blocked` and is skipped. There is no path by which this loop runs
 forever on its own.
+
+**Recovery.** Transient failures recover themselves: rate limits retry on the
+next tick, a killed job resumes from a checkpoint branch every 5 minutes, and a
+rejected push is recovered from `px-recovery/<phase>`. The log tail is written to
+the job's step summary as well as to an artifact, so a failed upload does not
+destroy the diagnosis. Every marker, every limit, and every manual recovery
+command is in **[docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)**.
 
 ### Running it yourself
 
