@@ -62,13 +62,12 @@ allow = ["LicenseRef-ring"]
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
+# NOTE: `deny` must be a single array of tables. An earlier version of this file
+# also had a separate `[[bans.deny]]` section, which cargo-deny rejects with
+# "duplicate key: deny". Keep every entry inside this one array.
 deny = [
-  # Placeholder data is not code and carries no obligation.
-  { name = "ansi_term" },
-  # Noisy, slow, and superseded by std.
-  { name = "atty" },
+  { name = "ansi_term", reason = "Placeholder data is not code and carries no obligation." },
+  { name = "atty", reason = "Noisy, slow, and superseded by std." },
+  { name = "openssl", reason = "Pulls a C toolchain into the build for no benefit; rustls has no native dependency." },
+  { name = "native-tls", reason = "Same as openssl. Use rustls if TLS is ever genuinely needed." },
 ]
-
-[[bans.deny]]
-name = "openssl"
-reason = "Pulls a C toolchain into the build for no benefit here; rustls has no native dependency."

@@ -60,18 +60,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Generate SBOM
-        uses: rustsec/cargo-cyclonedx@v1
+        # `rustsec/cargo-cyclonedx` and `CycloneDX/cargo-cyclonedx` do not exist.
+        # anchore/sbom-action produces a CycloneDX document from the directory and
+        # picks up Cargo.lock directly.
+        uses: anchore/sbom-action@v0
         with:
-          manifest-path: core/Cargo.toml
+          path: core
+          format: cyclonedx-json
+          output-file: pixelsmith-sbom.cdx.json
+          artifact-name: sbom-cyclonedx
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: sbom-cyclonedx
-          path: |
-            *bom.json
-            **/*bom.json
-            **/bom.json
+          path: pixelsmith-sbom.cdx.json
           if-no-files-found: ignore
+          retention-days: 30
 
   no-network:
     name: hard rule 1 — engine has no network capability
