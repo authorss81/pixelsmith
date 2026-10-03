@@ -1,0 +1,145 @@
+# Fuzzing harness for the engine. A dev tool, never a dependency of `core`:
+#
+#   grep -i fuzz core/Cargo.toml   # must stay empty
+#
+# The fuzz crate links `pixelsmith_core` as a normal path dependency, which is the
+# only way a target can reach the engine's own entry points rather than a
+# reimplementation of them. `libfuzzer-sys` and `arbitrary` are declared here and
+# nowhere else, so nothing that ships in the APK or the EXE can pull them in.
+#
+# Build and run targets with `bash scripts/fuzz.sh`, never with a bare `cargo run`:
+# a fuzz target built without `-Z sanitizer=address` and without coverage
+# instrumentation is much slower and finds much less.
+
+[package]
+name = "pixelsmith-fuzz"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "cargo-fuzz targets for every pixelsmith entry point that touches untrusted bytes"
+license = "MIT OR Apache-2.0"
+exclude = ["target/**", "corpus/**", "artifacts/**", "coverage/**"]
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "px_fuzz"
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+pixelsmith_core = { path = "../core" }
+# The same codec set `core` enables. Fuzzing a decoder the product cannot build
+# would test code no user can reach, and a decoder the product *does* build but
+# the harness cannot name would leave a hole.
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+  "bmp",
+  "tiff",
+  "ico",
+] }
+
+# Rewrites `fuzz/seeds/` from the same fixtures the unit tests use, so the
+# committed corpus cannot silently drift away from the engine it exercises.
+# Not a fuzz target, so it has no `[[bin]]` `fuzz_targets/` path and cargo fuzz
+# never sees it.
+[[bin]]
+name = "seed-corpus"
+path = "src/bin/seed_corpus.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detect_format"
+path = "fuzz_targets/detect_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate_bytes"
+path = "fuzz_targets/validate_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_bounded"
+path = "fuzz_targets/decode_bounded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "exif_read"
+path = "fuzz_targets/exif_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_jpeg"
+path = "fuzz_targets/decode_jpeg.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_png"
+path = "fuzz_targets/decode_png.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_webp"
+path = "fuzz_targets/decode_webp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_gif"
+path = "fuzz_targets/decode_gif.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_tiff"
+path = "fuzz_targets/decode_tiff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_bmp"
+path = "fuzz_targets/decode_bmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_ico"
+path = "fuzz_targets/decode_ico.rs"
+test = false
+doc = false
+bench = false
+
+# Own workspace: this directory is deliberately excluded from `core`'s workspace
+# so a nightly-only fuzz dependency can never end up in the engine's lock file.
+[workspace]
+members = ["."]
+
+# `-C debug-assertions=on` and overflow checks come from cargo-fuzz itself; this
+# profile only pins the optimisation level, because a debug-assertion-free
+# release build would let integer overflow in a decoder pass silently.
+[profile.release]
+debug = 1
