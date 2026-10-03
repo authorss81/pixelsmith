@@ -304,6 +304,9 @@ jobs:
 
       - name: Build and test the engine
         working-directory: core
+        # Windows runners default to PowerShell, which cannot parse bash `[[ ]]`.
+        # This step is bash on every platform.
+        shell: bash
         run: |
           if [[ "${{ matrix.target }}" == *android* ]]; then
             cargo ndk -t arm64-v8a -o /tmp/px-jni build --release --lib --target aarch64-linux-android
