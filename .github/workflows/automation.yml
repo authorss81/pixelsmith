@@ -215,19 +215,31 @@ jobs:
           echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
+      - name: Install opencode (pinned)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
+          # The installer writes to $GITHUB_PATH, which only affects LATER
+          # steps. Verify by absolute path, or this step exits 127.
+          export PATH="$HOME/.opencode/bin:$PATH"
+          opencode --version
+          opencode models | head -n 5
+
       - name: Preflight
         id: preflight
         run: |
-          # Fail loudly and early rather than burning a 60-minute job on a
-          # missing key or a bad toolchain.
+          # Runs AFTER the opencode install, or it would always report the
+          # binary missing.
           if [ -z "${OPENCODE_API_KEY:-}" ]; then
             echo "::error::OPENCODE_API_KEY is not set. Add it under Settings -> Secrets and variables -> Actions -> Repository secrets. New secrets can take a minute to propagate."
             echo "ok=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           echo "OPENCODE_API_KEY is set (value not shown)."
-          command -v opencode >/dev/null 2>&1 \
-            || { echo "::error::opencode binary missing"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          if ! command -v opencode >/dev/null 2>&1; then
+            echo "::error::opencode binary missing after install"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "opencode: $(command -v opencode)"
           echo "cargo:    $(cargo --version)"
           echo "rustc:    $(rustc --version)"
@@ -380,6 +392,33 @@ jobs:
           key: pub-${{ hashFiles('app/pubspec.lock') }}
           restore-keys: pub-
 
+      - name: Did this phase actually produce work?
+        id: gate
+        env:
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          # THIS GATE EXISTS BECAUSE IT ALREADY WENT WRONG ONCE.
+          #
+          # scripts/verify.sh checks the REPOSITORY. If the tree happens to be
+          # green before a phase starts — which it always is, because the
+          # previous phase left it green — then verify passes even when the
+          # agent did absolutely nothing. On 2026-10-03 that marked phase-01
+          # AND phase-02 .done with zero work, and the pipeline cheerfully
+          # skipped two phases.
+          #
+          # A phase is only eligible for .done if run-phase wrote .attempted,
+          # which the evidence gate in phase_runner.sh only does when the run
+          # left real file changes or real commits.
+          if [ -f "workspace/${PHASE}/.attempted" ]; then
+            echo "has_work=true" >> "$GITHUB_OUTPUT"
+            echo "${PHASE} produced work — eligible for verification."
+          else
+            echo "has_work=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::${PHASE} has no .attempted marker."
+            echo "verify.sh checks the REPOSITORY, not the PHASE. A green tree"
+            echo "here does not mean this phase ran. Refusing to write .done."
+          fi
+
       - name: Run verification
         id: verify
         env:
@@ -396,12 +435,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PHASE: ${{ needs.select-phase.outputs.phase }}
+          HAS_WORK: ${{ steps.gate.outputs.has_work }}
+          RC: ${{ steps.verify.outputs.rc }}
         run: |
           mkdir -p logs
           git config user.name "pixelsmith-bot"
           git config user.email "pixelsmith-bot@users.noreply.github.com"
 
-          if [ "${{ steps.verify.outputs.rc }}" = "0" ]; then
+          if [ "${HAS_WORK}" != "true" ]; then
+            echo "::warning::${PHASE} did no work. Not marking done; leaving it for the next tick."
+            exit 0
+          fi
+
+          if [ "${RC}" = "0" ]; then
             touch "workspace/${PHASE}/.done"
             rm -f "workspace/${PHASE}/.attempted" \
                   "workspace/${PHASE}/.blocked" \
