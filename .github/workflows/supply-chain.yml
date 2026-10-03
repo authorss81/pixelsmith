@@ -63,22 +63,17 @@ jobs:
 
       - name: Generate SBOM
         # `rustsec/cargo-cyclonedx` and `CycloneDX/cargo-cyclonedx` do not exist.
-        # anchore/sbom-action produces a CycloneDX document from the directory and
-        # picks up Cargo.lock directly.
+        # anchore/sbom-action reads Cargo.lock directly and emits CycloneDX JSON.
+        #
+        # It uploads its own artifact, so there is deliberately no second
+        # upload-artifact step below: two uploads with the same name is a 409
+        # Conflict, which is what failed this job before.
         uses: anchore/sbom-action@v0
         with:
           path: core
           format: cyclonedx-json
           output-file: pixelsmith-sbom.cdx.json
-          artifact-name: sbom-cyclonedx
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sbom-cyclonedx
-          path: pixelsmith-sbom.cdx.json
-          if-no-files-found: ignore
-          retention-days: 30
+          artifact-name: pixelsmith-sbom-cyclonedx
 
   no-network:
     name: hard rule 1 — engine has no network capability

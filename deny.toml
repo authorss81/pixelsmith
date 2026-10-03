@@ -33,7 +33,17 @@ targets = [
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+  # `paste` is archived upstream with no safe upgrade (RUSTSEC-2024-0436).
+  # It is reachable ONLY through the opt-in `avif` feature, via
+  # rav1e -> ravif -> paste. The default build does not contain it.
+  #
+  # A time-boxed exception, not a permanent shrug: the expiry makes cargo-deny
+  # start failing again, and phase-07 is the phase that decides whether AVIF
+  # encoding ships at all. If it does not, delete the feature and this entry
+  # together.
+  { id = "RUSTSEC-2024-0436", reason = "Unmaintained `paste`, reachable only via the opt-in `avif` feature (rav1e). No safe upgrade exists. Revisit in phase-07.", expiry = "2027-01-01" },
+]
 
 [licenses]
 version = 2
@@ -70,4 +80,16 @@ deny = [
   { name = "atty", reason = "Noisy, slow, and superseded by std." },
   { name = "openssl", reason = "Pulls a C toolchain into the build for no benefit; rustls has no native dependency." },
   { name = "native-tls", reason = "Same as openssl. Use rustls if TLS is ever genuinely needed." },
+]
+
+# Duplicate versions are denied by default. These four are the only exceptions,
+# and every one of them comes from rav1e's pinned dependency set under the
+# opt-in `avif` feature — none of them is reachable from the default build.
+# phase-07 either resolves them by dropping or replacing the AVIF encoder, or
+# moves this list to a documented "accepted risk" in docs/SUPPLY-CHAIN.md.
+skip = [
+  { crate = "miniz_oxide", reason = "rav1e (avif) pins an older miniz_oxide alongside the current one." },
+  { crate = "syn", reason = "rav1e (avif) pins an older syn alongside the current one." },
+  { crate = "thiserror", reason = "rav1e (avif) pins an older thiserror alongside the current one." },
+  { crate = "thiserror-impl", reason = "rav1e (avif) pins an older thiserror-impl alongside the current one." },
 ]
