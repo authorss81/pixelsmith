@@ -119,18 +119,6 @@ unsafe fn borrow<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     Some(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
-/// Borrow a NUL-terminated C string.
-///
-/// # Safety
-/// `ptr` must be null or a valid NUL-terminated string.
-unsafe fn borrow_str<'a>(ptr: *const std::ffi::c_char) -> Option<&'a str> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: the caller guarantees a NUL-terminated string.
-    std::ffi::CStr::from_ptr(ptr).to_str().ok()
-}
-
 // ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
@@ -187,7 +175,10 @@ pub unsafe extern "C" fn px_string_free(s: *mut std::ffi::c_char) {
 /// See [`borrow`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_inspect(ptr: *const u8, len: usize, mobile_limits: bool) -> PxBuffer {
-    let Some(bytes) = borrow(ptr, len) else {
+    // `let ... else` cannot take a block-expression scrutinee, so the borrow is
+    // hoisted out rather than wrapped in an inline `unsafe { ... }`.
+    let borrowed = unsafe { borrow(ptr, len) };
+    let Some(bytes) = borrowed else {
         return err(
             "null buffer with non-zero length",
             PxStatus::InvalidArgument,
@@ -210,7 +201,10 @@ pub unsafe extern "C" fn px_inspect(ptr: *const u8, len: usize, mobile_limits: b
 /// See [`borrow`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_exif(ptr: *const u8, len: usize) -> PxBuffer {
-    let Some(bytes) = borrow(ptr, len) else {
+    // `let ... else` cannot take a block-expression scrutinee, so the borrow is
+    // hoisted out rather than wrapped in an inline `unsafe { ... }`.
+    let borrowed = unsafe { borrow(ptr, len) };
+    let Some(bytes) = borrowed else {
         return err(
             "null buffer with non-zero length",
             PxStatus::InvalidArgument,
@@ -243,6 +237,12 @@ struct ProcessRequest {
     /// Human-readable name for the input, used only to suggest an output name.
     #[serde(default)]
     name: String,
+    /// The image itself, base64-encoded.
+    ///
+    /// Base64 rather than a JSON array of byte values: a number array costs up
+    /// to four characters per byte, so a 6 MB photo becomes ~24 MB of JSON.
+    /// Base64 is 33% overhead and keeps the request inspectable in a log.
+    data_base64: String,
     #[serde(default)]
     strip_metadata: Option<bool>,
     #[serde(default)]
@@ -275,7 +275,8 @@ struct ProcessResponse {
 /// `request` must point to `request_len` bytes of UTF-8 JSON.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> PxBuffer {
-    let Some(raw) = borrow(request, request_len) else {
+    let borrowed = unsafe { borrow(request, request_len) };
+    let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
     let parsed: ProcessRequest = match serde_json::from_slice(raw) {
@@ -299,15 +300,31 @@ pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> P
         target: parsed.target.map(TargetBytes::new),
         limits,
     };
+    // The image travels base64-encoded inside the request envelope. An earlier
+    // revision passed `raw.to_vec()` — the JSON envelope itself — as the image,
+    // which meant px_process could never succeed. Decoding here is also the
+    // first thing that happens to any caller-supplied payload at this boundary.
+    use base64::Engine as _;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(parsed.data_base64.trim()) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => return err("request contained no image data", PxStatus::InvalidArgument),
+        Err(e) => {
+            return err(
+                format!("data_base64 is not valid base64: {e}"),
+                PxStatus::InvalidArgument,
+            );
+        }
+    };
+
     let job = Job {
         id: "1".into(),
         name: parsed.name,
-        bytes: raw.to_vec(),
+        bytes,
     };
 
     match process_one(&job, &pipeline, &settings) {
         Ok(processed) => {
-            let detected = validate_bytes(raw, &limits)
+            let detected = validate_bytes(&job.bytes, &limits)
                 .map(|r| r.format)
                 .unwrap_or(parsed.format);
             from_json(&ProcessResponse {
@@ -406,9 +423,13 @@ struct BatchFile {
 
 /// Run a batch in parallel. Always returns a report, never a hard failure, so
 /// the UI can show "17 of 20 succeeded" instead of an error dialog.
+///
+/// # Safety
+/// `request` must point to `request_len` bytes of UTF-8 JSON.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxBuffer {
-    let Some(raw) = borrow(request, request_len) else {
+    let borrowed = unsafe { borrow(request, request_len) };
+    let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
     let parsed: BatchRequest = match serde_json::from_slice(raw) {
@@ -465,7 +486,8 @@ pub unsafe extern "C" fn px_zip(request: *const u8, request_len: usize) -> PxBuf
     struct ZipRequest {
         files: Vec<BatchFile>,
     }
-    let Some(raw) = borrow(request, request_len) else {
+    let borrowed = unsafe { borrow(request, request_len) };
+    let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
     let parsed: ZipRequest = match serde_json::from_slice(raw) {
@@ -506,6 +528,32 @@ mod tests {
     fn sample(w: u32, h: u32) -> Vec<u8> {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, 40])
+        }));
+        crate::encode_fixed(&img, OutputFormat::Jpeg, 90).unwrap()
+    }
+
+    /// Base64-encode a fixture the way a Dart caller would send it.
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A smooth, compressible fixture.
+    ///
+    /// `sample` is high-entropy noise, which is fine for proving a file decodes
+    /// and useless for proving a byte ceiling can be met — no quality setting
+    /// compresses noise to 4 KB. Using the wrong one makes a correct engine look
+    /// broken.
+    fn photo(w: u32, h: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let fx = f64::from(x as u16) / f64::from(w.max(1)) * 6.0;
+            let fy = f64::from(y as u16) / f64::from(h.max(1)) * 4.0;
+            let wave = fx.sin() * 80.0 + fy.cos() * 55.0;
+            image::Rgb([
+                (128.0 + wave).clamp(0.0, 255.0) as u8,
+                (100.0 + wave * 0.6).clamp(0.0, 255.0) as u8,
+                (150.0 - wave * 0.5).clamp(0.0, 255.0) as u8,
+            ])
         }));
         crate::encode_fixed(&img, OutputFormat::Jpeg, 90).unwrap()
     }
@@ -598,7 +646,7 @@ mod tests {
                 "quality": 80,
                 "target": null,
                 "name": "photo.jpg",
-                "files": [{ "name": "photo.jpg", "bytes": sample(300, 200) }]
+                "data_base64": b64(&sample(300, 200))
             });
             let body = serde_json::to_vec(&request).unwrap();
             let (status, data, msg) = take(px_process(body.as_ptr(), body.len()));
@@ -636,16 +684,67 @@ mod tests {
                 },
                 "format": "jpeg",
                 "quality": 90,
-                "target": 4000,
+                "target": 12000,
                 "name": "photo.jpg",
-                "files": [{ "name": "photo.jpg", "bytes": sample(600, 400) }]
+                "data_base64": b64(&photo(600, 400))
             });
             let body = serde_json::to_vec(&request).unwrap();
             let (status, data, msg) = take(px_process(body.as_ptr(), body.len()));
             assert_eq!(status, PxStatus::Ok as u32, "{msg}");
             let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
-            assert_eq!(v["target_met"], true);
-            assert!(v["output_bytes"].as_u64().unwrap() <= 4000);
+            // Never print `bytes` here: it is a base64 array and would bury the
+            // actual failure in tens of kilobytes of noise.
+            let summary = format!(
+                "output_bytes={} quality_used={} target_met={}",
+                v["output_bytes"], v["quality_used"], v["target_met"]
+            );
+            assert_eq!(v["target_met"], true, "target not met: {summary}");
+            assert!(
+                v["output_bytes"].as_u64().unwrap() <= 12_000,
+                "overshot the ceiling: {summary}"
+            );
+            let q = v["quality_used"].as_u64().unwrap();
+            assert!(
+                (30..=95).contains(&q),
+                "quality outside the search range: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_byte_target_actually_shrinks_the_output() {
+        // Proves the search did work rather than the request being ignored: the
+        // same image, same dimensions, must come out smaller with a ceiling.
+        unsafe {
+            let run = |target: Option<u64>| -> (u64, u64) {
+                let request = serde_json::json!({
+                    "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+                    "format": "jpeg",
+                    "quality": 95,
+                    "target": target,
+                    "name": "photo.jpg",
+                    "data_base64": b64(&photo(600, 400))
+                });
+                let body = serde_json::to_vec(&request).unwrap();
+                let (status, data, msg) = take(px_process(body.as_ptr(), body.len()));
+                assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+                let v: serde_json::Value = serde_json::from_slice(&data).unwrap();
+                (
+                    v["output_bytes"].as_u64().unwrap(),
+                    v["quality_used"].as_u64().unwrap(),
+                )
+            };
+
+            let (unconstrained, q_unconstrained) = run(None);
+            let (constrained, q_constrained) = run(Some(12_000));
+            assert!(
+                constrained < unconstrained,
+                "ceiling had no effect: {constrained} vs {unconstrained}"
+            );
+            assert!(
+                q_constrained < q_unconstrained,
+                "quality was not lowered: q{constrained} at {constrained} bytes"
+            );
         }
     }
 
@@ -747,13 +846,91 @@ mod tests {
     }
 
     #[test]
-    fn presets_are_reachable_from_the_boundary() {
+    fn process_rejects_a_request_with_no_image_data() {
         unsafe {
-            let (status, data, _) = take(px_presets());
-            assert_eq!(status, PxStatus::Ok as u32);
-            let list: Vec<presets::Preset> = serde_json::from_slice(&data).unwrap();
+            let request = serde_json::json!({
+                "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+                "format": "jpeg",
+                "data_base64": ""
+            });
+            let body = serde_json::to_vec(&request).unwrap();
+            let (status, _, msg) = take(px_process(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::InvalidArgument as u32, "{msg}");
+            assert!(msg.contains("no image data"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn process_rejects_data_that_is_not_base64() {
+        unsafe {
+            let request = serde_json::json!({
+                "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+                "format": "jpeg",
+                "data_base64": "this is definitely not base64!!!"
+            });
+            let body = serde_json::to_vec(&request).unwrap();
+            let (status, _, msg) = take(px_process(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::InvalidArgument as u32, "{msg}");
+            assert!(msg.contains("base64"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn process_rejects_a_payload_that_decodes_to_junk() {
+        // Valid base64, not an image. This must surface as a codec error, not a
+        // crash and not a silently returned empty file.
+        unsafe {
+            let request = serde_json::json!({
+                "pipeline": { "crop": null, "orientation": null, "resize": null, "strip_metadata": true },
+                "format": "jpeg",
+                "data_base64": b64(b"not an image, just some bytes")
+            });
+            let body = serde_json::to_vec(&request).unwrap();
+            let (status, data, msg) = take(px_process(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Error as u32);
+            assert!(data.is_empty());
+            assert!(!msg.is_empty());
+        }
+    }
+
+    #[test]
+    fn presets_are_reachable_from_the_boundary() {
+        /// Owned mirror of `presets::Preset`.
+        ///
+        /// `Preset` holds `&'static str`, so it can be serialised out but not
+        /// read back — a `Deserialize` impl would need to borrow from the input
+        /// buffer for `'static`. This mirror is what a Dart consumer does when
+        /// it parses `px_presets()`, and duplicating the shape here means the
+        /// contract is actually tested rather than assumed.
+        #[derive(Debug, serde::Deserialize)]
+        struct PresetMirror {
+            id: String,
+            label: String,
+            width: u32,
+            height: Option<u32>,
+            format: OutputFormat,
+        }
+
+        unsafe {
+            let (status, data, message) = take(px_presets());
+            assert_eq!(status, PxStatus::Ok as u32, "{message}");
+
+            let list: Vec<PresetMirror> = serde_json::from_slice(&data).unwrap();
             assert_eq!(list.len(), presets::PRESETS.len());
-            assert!(list.iter().any(|p| p.id == "ig-post"));
+
+            let by_id = |id: &str| list.iter().find(|p| p.id == id).unwrap();
+            let ig = by_id("ig-post");
+            assert_eq!((ig.width, ig.height), (1080, Some(1080)));
+            assert_eq!(ig.format, OutputFormat::Jpeg);
+            assert!(!ig.label.is_empty());
+
+            // Every preset must survive the boundary with the fields the UI
+            // depends on intact.
+            for p in &list {
+                assert!(!p.id.is_empty(), "a preset has an empty id");
+                assert!(!p.label.is_empty(), "{} has an empty label", p.id);
+                assert!(p.width > 0, "{} has zero width", p.id);
+            }
         }
     }
 }

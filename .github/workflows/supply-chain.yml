@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install nasm (rav1e / AVIF)
+        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

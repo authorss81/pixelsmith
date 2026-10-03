@@ -44,6 +44,8 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+      - name: Install nasm (rav1e / AVIF)
+        run: sudo apt-get update -q && sudo apt-get install -y -q nasm
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android, x86_64-linux-android
@@ -236,6 +238,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install nasm (rav1e / AVIF)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -q && sudo apt-get install -y -q nasm
+          else
+            brew install nasm
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

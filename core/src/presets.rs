@@ -20,7 +20,16 @@ pub enum Category {
     Developer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// A built-in preset.
+///
+/// Derives `Serialize` only, deliberately. The `&'static str` fields mean a
+/// `Deserialize` impl would require `Preset<'a>` borrowing from the input buffer,
+/// which this shape cannot express — so `Vec<Preset>` can be written out to JSON
+/// but never read back. An earlier revision derived both and the resulting
+/// `Deserialize` was a trap that failed to compile the moment anything tried to
+/// use it. Consumers that need to read a preset back must use an owned mirror
+/// with `String` fields; see the FFI contract test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Preset {
     pub id: &'static str,
     pub label: &'static str,
