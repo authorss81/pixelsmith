@@ -1,0 +1,59 @@
+# Force LF in the repository and in every checkout. Without this, a Windows
+# contributor's autocrlf setting rewrites scripts/*.sh with CRLF and the phase
+# pipeline dies with "$'\r': command not found" on the runner.
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.dart text eol=lf
+*.md text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.gradle text eol=lf
+*.kt text eol=lf
+*.xml text eol=lf
+*.plist text eol=lf
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.keystore binary
+*.jks binary
+*.so binary
+*.dll binary
+*.dylib binary
+*.a binary
+*.lib binary
+
+# Keep build and cache directories out of language statistics and diffs.
+core/target/** linguist-generated=true
+**/target/** linguist-generated=true
+fuzz/** linguist-vendored
+app/.dart_tool/** linguist-generated=true
+app/build/** linguist-generated=true
+
+# The pipeline's own runtime state must never be committed by an agent.
+logs/** linguist-generated=true
+workspace/*/.session linguist-generated=true
+workspace/*/.checkpoint linguist-generated=true
+workspace/*/.attempted linguist-generated=true
+workspace/*/.deferred linguist-generated=true
+workspace/*/.blocked linguist-generated=true
+workspace/*/.no_work linguist-generated=true
+workspace/*/.attempts linguist-generated=true
+workspace/*/.deferred_attempts linguist-generated=true
+workspace/*/.verify_failures linguist-generated=true
+workspace/.runs linguist-generated=true
+
+# Hand-authored pipeline definition stays reviewable.
+workspace/**/PROMPT.md linguist-generated=false
+workspace/**/.timeout linguist-generated=false

@@ -1,0 +1,63 @@
+[package]
+name = "pixelsmith_core"
+version = "0.1.0"
+edition = "2024"
+description = "Memory-safe local image processing engine: decode, resize, compress, strip metadata. Zero network I/O."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/authorss81/pixelsmith"
+homepage = "https://github.com/authorss81/pixelsmith"
+documentation = "https://docs.rs/pixelsmith_core"
+readme = "../README.md"
+rust-version = "1.85"
+keywords = ["image", "resize", "jpeg", "webp", "avif", "exif", "offline", "privacy"]
+categories = ["multimedia::images"]
+exclude = ["target/**"]
+
+[lib]
+name = "pixelsmith_core"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = [
+  "jpeg",
+  "png",
+  "webp",
+  "gif",
+  "bmp",
+  "tiff",
+  "ico",
+  "rayon",
+] }
+kamadak-exif = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rayon = "1"
+zip = { version = "6", default-features = false, features = ["deflate", "time"] }
+thiserror = "2"
+
+[features]
+default = []
+# Lossy WebP via libwebp. Off by default so the pure-Rust build has no C
+# toolchain requirement and stays fast to compile in CI; WebP output then falls
+# back to the lossless encoder, which still beats PNG for photographs.
+webp-lossy = ["dep:webp"]
+# AVIF encoding. Heavy build (pulls in rav1e), so it is opt-in.
+avif = ["dep:ravif"]
+
+[dependencies.webp]
+version = "0.3"
+optional = true
+
+[dependencies.ravif]
+version = "0.11"
+optional = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

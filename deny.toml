@@ -1,0 +1,74 @@
+# cargo-deny policy.
+#
+# This app holds the user's photos, so "what is actually in this binary" must be
+# answerable by a stranger. Two things are enforced here:
+#
+#   1. No licence that would impose obligations on a downstream user. The engine
+#      is MIT OR Apache-2.0; a GPL or AGPL dependency in a dependency tree is a
+#      licensing event, not a detail.
+#   2. No unmaintained or yanked crate, and no duplicate version of the same
+#      crate, because both are how supply-chain compromises get in.
+#
+# Run with: cargo deny check
+# Enforced in CI via .github/workflows/supply-chain.yml.
+
+[graph]
+all-features = true
+no-default-features = false
+
+# The engine is a library consumed by a Flutter app. Platform crates and build
+# tooling are expected; we only need to name them so the licence check has a
+# verdict for each.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "aarch64-linux-android",
+  "aarch64-apple-ios",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+  "MPL-2.0",
+  # Placeholder data is not code and carries no obligation.
+  "Unlicense",
+]
+confidence-threshold = 0.93
+
+[[licenses.exceptions]]
+# Ring pulls in a small C library under a permissive but non-SPDX-identifiable
+# notice. Reviewed: no source-distribution obligation.
+crate = "ring"
+allow = ["LicenseRef-ring"]
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+deny = [
+  # Placeholder data is not code and carries no obligation.
+  { name = "ansi_term" },
+  # Noisy, slow, and superseded by std.
+  { name = "atty" },
+]
+
+[[bans.deny]]
+name = "openssl"
+reason = "Pulls a C toolchain into the build for no benefit here; rustls has no native dependency."

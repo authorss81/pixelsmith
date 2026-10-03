@@ -1,0 +1,115 @@
+name: supply-chain
+
+# Licence policy, advisory database, dependency audits and SBOM emission.
+# Kept separate from `automation` so a supply-chain failure is obviously a
+# supply-chain failure and not a phase failing to build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly. The advisory database changes without the repository changing.
+    - cron: "43 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  deny:
+    name: cargo-deny — licences and advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: core/Cargo.toml
+          command: check advisories licenses bans sources
+
+  duplicate-versions:
+    name: no duplicate dependency versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Report duplicates
+        run: |
+          cargo tree --manifest-path core/Cargo.toml --duplicates \
+            | tee /tmp/dupes.txt
+          if [ -s /tmp/dupes.txt ]; then
+            echo "::warning::Duplicate crate versions present. See deny.toml [bans]."
+          fi
+
+  sbom:
+    name: SBOM (CycloneDX)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Generate SBOM
+        uses: rustsec/cargo-cyclonedx@v1
+        with:
+          manifest-path: core/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: |
+            *bom.json
+            **/*bom.json
+            **/bom.json
+          if-no-files-found: ignore
+
+  no-network:
+    name: hard rule 1 — engine has no network capability
+    # The single most important check in this repository. It is here, and in
+    # scripts/verify.sh, so that neither can be quietly removed without the
+    # other failing.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Dependency tree
+        run: |
+          cargo tree --manifest-path core/Cargo.toml --all-features --prefix none \
+            | awk '{print $1}' | sort -u > /tmp/crates.txt
+          BANNED='^(reqwest|hyper|ureq|curl|isahc|surf|attohttpc|tokio|async-std|smol|quinn|http|tungstenite|openssl|native-tls|rustls|webpki|hickory-dns|trust-dns|socket2|mio|dns-lookup)$'
+          if grep -E "$BANNED" /tmp/crates.txt; then
+            echo "::error::Network-capable crate found in the engine dependency tree."
+            exit 1
+          fi
+          echo "OK: no network-capable crate in the engine dependency tree"
+
+      - name: Source symbols
+        run: |
+          if grep -rnE 'std::net|TcpStream|UdpSocket|lookup_host|reqwest|hyper::|curl' \
+               core/src --include='*.rs'; then
+            echo "::error::Networking symbol referenced in core/src."
+            exit 1
+          fi
+          echo "OK: no networking symbol in core/src"
+
+      - name: Release binary has no TLS/curl in its dynamic imports
+        run: |
+          cargo build --manifest-path core/Cargo.toml --release
+          SO=core/target/release/libpixelsmith_core.so
+          [ -f "$SO" ] || { echo "::error::no .so produced"; exit 1; }
+          if ldd "$SO" | grep -Ei 'ssl|crypto|curl'; then
+            echo "::error::Release binary links a TLS or curl library."
+            exit 1
+          fi
+          echo "OK: release binary links no TLS or curl library"

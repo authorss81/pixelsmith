@@ -1,0 +1,58 @@
+# Rust
+/core/target/
+**/target/
+**/*.rs.bk
+
+# Fuzzing
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+
+# Flutter / Dart
+/app/.dart_tool/
+/app/.flutter-plugins
+/app/.flutter-plugins-dependencies
+/app/.packages
+/app/build/
+/app/android/.gradle/
+/app/android/local.properties
+/app/ios/Pods/
+/app/ios/.symlinks/
+/app/macos/Pods/
+/app/linux/flutter/ephemeral/
+/app/windows/flutter/ephemeral/
+/app/macos/Flutter/ephemeral/
+/app/**/GeneratedPluginRegistrant.*
+**/*.iml
+
+# Native build output of the engine
+/app/src/rust/.dart_tool/
+/native/
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+
+# Pipeline state that must never be committed by accident
+/logs/
+workspace/.stop
+workspace/.runs
+workspace/*/.session
+workspace/*/.checkpoint
+
+# Secrets — belt and braces; the workflow uses Actions secrets
+*.keystore
+*.jks
+.env
+.env.*
+secrets/
+
+# Editors and OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/space-bunny-free",
+  "small_model": "opencode/space-bunny-free",
+  "share": "disabled",
+  "autoupdate": false,
+  "instructions": ["AGENTS.md", "docs/ARCHITECTURE.md"],
+  "permission": {
+    "edit": "allow",
+    "bash": "allow",
+    "webfetch": "deny",
+    "websearch": "deny"
+  },
+  "agent": {
+    "build": {
+      "description": "Implements exactly one pipeline phase, then stops.",
+      "steps": 120,
+      "permission": {
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "deny"
+      }
+    },
+    "reviewer": {
+      "mode": "subagent",
+      "description": "Reviews one phase's committed work and emits numbered findings.",
+      "steps": 40
+    },
+    "auditor": {
+      "mode": "subagent",
+      "description": "Audits the whole repository against the roadmap and generates new phases.",
+      "steps": 60
+    }
+  }
+}

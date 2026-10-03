@@ -1,0 +1,567 @@
+name: automation
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "Force a specific phase (e.g. phase-03). Empty = auto-select."
+        required: false
+        default: ""
+      review:
+        description: "Run the reviewer subagent after verification"
+        required: false
+        type: boolean
+        default: true
+  schedule:
+    # Safety net. The `retrigger` job chains runs ~10s apart, so this only fires
+    # when a chain was broken. GitHub throttles scheduled workflows on public
+    # repos, which is exactly why the self-retrigger exists.
+    - cron: "*/20 * * * *"
+  repository_dispatch:
+    types: [px_tick]
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+
+# Least privilege. `pull-requests` is intentionally NOT granted: nothing in this
+# pipeline needs it, and an API key with write access in a public repo is an
+# exfiltration target. This workflow never runs on `pull_request`, so a fork
+# cannot reach it.
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: px-pipeline
+  # Deliberately false. The checkpoint loop in phase_runner.sh pushes in-progress
+  # work to px-wip/<phase>, but anything since the last checkpoint (~5 min) exists
+  # only in the working tree. Cancelling a run to start the next one would destroy
+  # exactly that window. With false, the next tick queues and runs after the
+  # current one finishes its commit step.
+  cancel-in-progress: false
+
+env:
+  OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+  # Primary model is space-bunny. The runner walks this chain one entry at a
+  # time via `--model`; the raw list is never handed to opencode verbatim.
+  OPENCODE_MODEL: >-
+    opencode/space-bunny-free,
+    opencode-go/space-bunny-free,
+    opencode/muse-spark-1.3-contributor-free,
+    opencode/big-pickle,
+    openrouter/poolside/laguna-s-2.1:free
+
+jobs:
+  # ---------------------------------------------------------------------------
+  select-phase:
+    # No checkout. Marker files are read through the GitHub trees API in one call
+    # (~1-2s), so an idle tick costs only a VM boot.
+    runs-on: ubuntu-latest
+    outputs:
+      phase: ${{ steps.pick.outputs.phase }}
+      exists: ${{ steps.pick.outputs.exists }}
+      reason: ${{ steps.pick.outputs.reason }}
+      timeout: ${{ steps.pick.outputs.timeout }}
+    steps:
+      - name: Pick the next phase
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_PHASE: ${{ inputs.phase }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/git/trees/HEAD?recursive=1" --jq '.tree[].path' > /tmp/tree.txt
+          mkdir -p /tmp/phases
+
+          grep -E '^workspace/phase-[0-9]+/' /tmp/tree.txt | cut -d/ -f2 | sort -V -u > /tmp/phase_names.txt
+
+          while read -r name; do
+            [ -n "$name" ] || continue
+            for marker in done deferred blocked attempted; do
+              grep -qx "workspace/${name}/.${marker}" /tmp/tree.txt && touch "/tmp/phases/${name}.${marker}"
+            done
+          done < /tmp/phase_names.txt
+
+          emit() {
+            echo "phase=$1"     >> "$GITHUB_OUTPUT"
+            echo "exists=true"   >> "$GITHUB_OUTPUT"
+            echo "reason=$2"     >> "$GITHUB_OUTPUT"
+            echo "timeout=$(phase_timeout "$1")" >> "$GITHUB_OUTPUT"
+          }
+          finish_empty() {
+            echo "phase="   >> "$GITHUB_OUTPUT"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+          }
+
+          # Per-phase job budget. Phases that build Flutter for a release
+          # platform need much more than a pure-Rust phase.
+          phase_timeout() {
+            local n="$1" t
+            t=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/${n}/.timeout" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]')
+            if [ -n "$t" ] && [ "$t" -ge 1 ] 2>/dev/null; then printf '%s' "$t"; else printf '60'; fi
+          }
+
+          # 0) Hard halt switch.
+          if grep -qx "workspace/.stop" /tmp/tree.txt; then
+            echo "::notice::workspace/.stop present — pipeline halted."
+            finish_empty "stopped"; exit 0
+          fi
+
+          # 1) Run budget. An autonomous loop must be unable to burn Actions
+          # minutes forever, including via its own self-retrigger chain.
+          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/.runs" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]')
+          RUNS=${RUNS:-0}
+          MAX_RUNS=250
+          if [ "$RUNS" -ge "$MAX_RUNS" ]; then
+            echo "::error::Run budget exhausted (${RUNS}/${MAX_RUNS}). Create workspace/.stop or reset workspace/.runs."
+            finish_empty "budget_exhausted"; exit 0
+          fi
+
+          # 2) Phase ceiling. Same reasoning: the auditor can append phases, so
+          # the number of phases is not bounded by the initial commit.
+          COUNT=$(wc -l < /tmp/phase_names.txt | tr -d ' ')
+          MAX_PHASES=80
+          if [ "$COUNT" -gt "$MAX_PHASES" ]; then
+            echo "::error::Phase count ${COUNT} exceeds ceiling ${MAX_PHASES}. Human review required."
+            finish_empty "phase_ceiling"; exit 0
+          fi
+
+          # 3) Manual override.
+          if [ -n "${MANUAL_PHASE}" ]; then
+            if grep -qx "workspace/${MANUAL_PHASE}/PROMPT.md" /tmp/tree.txt; then
+              emit "${MANUAL_PHASE}" "manual"; exit 0
+            fi
+            echo "::error::Requested phase '${MANUAL_PHASE}' does not exist."
+            finish_empty "manual_miss"; exit 0
+          fi
+
+          # 4) A phase whose work landed but failed verification. Retry it before
+          # anything new, so a phase is never half-finished and half-forgotten.
+          for d in /tmp/phases/*.attempted; do
+            [ -e "$d" ] || continue
+            name="$(basename "$d" .attempted)"
+            [ -f "/tmp/phases/${name}.done" ] && continue
+            echo "::notice::${name} has unverified work — retrying."
+            emit "${name}" "unverified"; exit 0
+          done
+
+          # 5) A deferred phase (rate-limited earlier) always goes first.
+          for d in /tmp/phases/*.deferred; do
+            [ -e "$d" ] || continue
+            name="$(basename "$d" .deferred)"
+            emit "${name}" "deferred"; exit 0
+          done
+
+          # 6) Otherwise the lowest phase with neither .done nor .blocked.
+          while read -r name; do
+            [ -n "$name" ] || continue
+            if [ ! -f "/tmp/phases/${name}.done" ] && [ ! -f "/tmp/phases/${name}.blocked" ]; then
+              emit "${name}" "next"; exit 0
+            fi
+          done < /tmp/phase_names.txt
+
+          # 7) Surface blocked phases on every tick, not only when idle.
+          BLOCKED=$(ls /tmp/phases/*.blocked 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$BLOCKED" -gt 0 ]; then
+            echo "::warning::${BLOCKED} blocked phase(s) need a human: $(ls /tmp/phases/*.blocked 2>/dev/null | xargs -n1 basename | sed 's/.blocked//' | tr '\n' ' ')"
+          fi
+          finish_empty "idle"
+
+      - name: Consume one run from the budget
+        if: steps.pick.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/.runs" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]' || echo 0)
+          RUNS=${RUNS:-0}
+          echo $((RUNS + 1)) > /tmp/runs
+          {
+            cd "$GITHUB_WORKSPACE" 2>/dev/null || { mkdir -p /tmp/ws && cd /tmp/ws; }
+            git init -q . 2>/dev/null || true
+            mkdir -p workspace
+            cp /tmp/runs workspace/.runs
+          }
+          # Upload as an artifact; the commit step below writes it to main.
+          echo "runs=$((RUNS + 1))" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  run-phase:
+    needs: select-phase
+    if: needs.select-phase.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(needs.select-phase.outputs.timeout) }}
+    outputs:
+      phase: ${{ steps.meta.outputs.phase }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Setup Flutter
+        run: |
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          flutter config --no-analytics >/dev/null 2>&1 || true
+          flutter --version
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            app/.dart_tool
+          key: pub-${{ hashFiles('app/pubspec.lock') }}
+          restore-keys: pub-
+
+      - name: Install opencode (pinned)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          opencode --version
+
+      - name: Write run budget
+        run: |
+          mkdir -p workspace
+          RUNS=$(gh api "repos/${GITHUB_REPOSITORY}/contents/workspace/.runs" --jq '.content' 2>/dev/null | base64 -d 2>/dev/null | tr -d '[:space:]' || echo 0)
+          echo $(( ${RUNS:-0} + 1 )) > workspace/.runs
+          echo "budget=$(cat workspace/.runs)" >> "$GITHUB_ENV"
+
+      - name: Run phase
+        id: meta
+        env:
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          chmod +x scripts/*.sh
+          bash scripts/phase_runner.sh "${PHASE}"
+          echo "phase=${PHASE}" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Commit and push phase work
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          git config user.name "pixelsmith-bot"
+          git config user.email "pixelsmith-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "px: ${PHASE}"
+            PUSHED=0
+            for i in 1 2 3 4 5; do
+              if git push origin main; then PUSHED=1; echo "pushed on attempt $i"; break; fi
+              echo "push rejected (attempt $i) — rebasing"
+              git pull --rebase origin main || true
+              sleep 3
+            done
+            # Never lose the bot's work: recovery branch plus a patch artifact.
+            if [ "${PUSHED}" = "0" ]; then
+              echo "::error::Push failed after 5 attempts — saving recovery branch + patch."
+              git branch -f "px-recovery/${PHASE}" HEAD
+              git push origin "px-recovery/${PHASE}" --force || true
+              git format-patch --stdout -1 > "px-${PHASE}.patch" || true
+            fi
+          fi
+
+      - name: Upload logs and recovery patch
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: px-logs-${{ needs.select-phase.outputs.phase }}-${{ github.run_id }}
+          path: |
+            logs/${{ needs.select-phase.outputs.phase }}*
+            px-*.patch
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Report status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          if [ -f "workspace/${PHASE}/.attempted" ]; then
+            echo "::notice::${PHASE} produced work; handing to the verify job."
+          elif [ -f "workspace/${PHASE}/.deferred" ]; then
+            echo "::notice::${PHASE} rate-limited — next tick retries."
+          elif [ -f "workspace/${PHASE}/.blocked" ]; then
+            echo "::error::${PHASE} blocked — human intervention needed."
+            OPEN=$(gh issue list --state open --search "PX blocked ${PHASE}" --json number --jq 'length' 2>/dev/null || echo 0)
+            if [ "$OPEN" = "0" ]; then
+              { echo "Phase **${PHASE}** is blocked."; echo "";
+                echo "## Log tail"; echo '```';
+                tail -60 "logs/${PHASE}.log" 2>/dev/null || echo "(no log)";
+                echo '```'; echo "";
+                echo "Fix the cause, then delete \`workspace/${PHASE}/.blocked\` and \`workspace/${PHASE}/.attempts\` and push."; } > /tmp/issue.md
+              gh issue create --title "PX blocked: ${PHASE}" --body-file /tmp/issue.md || true
+            fi
+          else
+            echo "::error::${PHASE} failed — check logs/${PHASE}.log"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # The gate. The phase agent never writes .done; this job does, and only when
+  # scripts/verify.sh passes. A phase that compiles, passes its tests and has
+  # not broken a hard rule is verified. Anything else gets another attempt.
+  verify:
+    needs: [select-phase, run-phase]
+    if: needs.select-phase.outputs.exists == 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Setup Flutter
+        run: |
+          git clone --depth 1 -b stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          flutter config --no-analytics >/dev/null 2>&1 || true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            app/.dart_tool
+          key: pub-${{ hashFiles('app/pubspec.lock') }}
+          restore-keys: pub-
+
+      - name: Run verification
+        id: verify
+        env:
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          chmod +x scripts/*.sh
+          set +e
+          bash scripts/verify.sh 2>&1 | tee "logs/${PHASE}.verify.log"
+          rc=${PIPESTATUS[0]}
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Mark done, or count a verification failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          mkdir -p logs
+          git config user.name "pixelsmith-bot"
+          git config user.email "pixelsmith-bot@users.noreply.github.com"
+
+          if [ "${{ steps.verify.outputs.rc }}" = "0" ]; then
+            touch "workspace/${PHASE}/.done"
+            rm -f "workspace/${PHASE}/.attempted" \
+                  "workspace/${PHASE}/.blocked" \
+                  "workspace/${PHASE}/.verify_failures"
+            git add -A
+            git commit -m "px: ${PHASE} verified" || true
+            git push origin main 2>/dev/null || { git pull --rebase origin main && git push origin main; }
+            echo "::notice::${PHASE} VERIFIED — pipeline will advance."
+            exit 0
+          fi
+
+          N=$(cat "workspace/${PHASE}/.verify_failures" 2>/dev/null || echo 0)
+          N=$((N + 1))
+          echo "${N}" > "workspace/${PHASE}/.verify_failures"
+          rm -f "workspace/${PHASE}/.attempted"
+          git add -A
+          git commit -m "px: ${PHASE} verification failed (${N})" || true
+          git push origin main 2>/dev/null || true
+          echo "::error::${PHASE} verification FAILED (${N}/3) — see logs/${PHASE}.verify.log"
+          if [ "${N}" -ge 3 ]; then
+            touch "workspace/${PHASE}/.blocked"
+            git add -A
+            git commit -m "px: ${PHASE} blocked after ${N} verification failures" || true
+            git push origin main 2>/dev/null || true
+          fi
+
+      - name: Upload verification log
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: px-verify-${{ needs.select-phase.outputs.phase }}-${{ github.run_id }}
+          path: logs/*.verify.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Separate job with its own budget, so review can never be starved by phase
+  # work or truncated by the phase job's timeout.
+  review:
+    needs: [select-phase, run-phase, verify]
+    if: >-
+      needs.select-phase.outputs.exists == 'true' &&
+      inputs.review != false &&
+      github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Install opencode (pinned)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Review phase
+        env:
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          if [ ! -f "workspace/${PHASE}/.done" ]; then
+            echo "::notice::${PHASE} not verified — skipping review."
+            exit 0
+          fi
+          chmod +x scripts/*.sh
+          bash scripts/phase_runner.sh "${PHASE}" --review-only
+        continue-on-error: true
+
+      - name: Commit review fixes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+        run: |
+          git config user.name "pixelsmith-bot"
+          git config user.email "pixelsmith-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no review changes"
+          else
+            git commit -m "px: ${PHASE} review fixes"
+            PUSHED=0
+            for i in 1 2 3 4 5; do
+              if git push origin main; then PUSHED=1; break; fi
+              git pull --rebase origin main || true
+              sleep 3
+            done
+            [ "${PUSHED}" = "0" ] && echo "::warning::review fixes not pushed"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Audit. Runs once, after every planned phase is verified. The auditor reads the
+  # repo, writes docs/AUDIT.md, and generates the next phases. Because it creates
+  # new workspace/phase-NN directories on main, the next select-phase tick picks
+  # them up with no change to this file. That is the loop closing.
+  audit:
+    needs: [select-phase]
+    if: >-
+      needs.select-phase.outputs.exists == 'false' &&
+      needs.select-phase.outputs.reason == 'idle'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Install opencode (pinned)
+        run: |
+          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.15.12
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+      - name: Check whether the audit has already run
+        id: gate
+        run: |
+          if [ -f docs/AUDIT.md ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::docs/AUDIT.md exists — audit already ran."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the auditor
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/phase_runner.sh audit-00 || true
+        continue-on-error: true
+
+      - name: Commit audit output
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "pixelsmith-bot"
+          git config user.email "pixelsmith-bot@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "auditor changed nothing"
+          else
+            git commit -m "px: audit — new phases generated"
+            PUSHED=0
+            for i in 1 2 3 4 5; do
+              if git push origin main; then PUSHED=1; break; fi
+              git pull --rebase origin main || true
+              sleep 3
+            done
+            [ "${PUSHED}" = "0" ] && echo "::error::audit output not pushed"
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Self-retrigger. Chains the next run ~10s later instead of waiting on cron,
+  # which GitHub throttles on public repos.
+  retrigger:
+    needs: [select-phase]
+    if: always() && needs.select-phase.outputs.exists == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chain to the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PHASE: ${{ needs.select-phase.outputs.phase }}
+          REASON: ${{ needs.select-phase.outputs.reason }}
+        run: |
+          # 15s backoff so a stacked retrigger cannot tight-loop while the
+          # previous run's commit step is still in flight.
+          sleep 15
+          gh api \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -f "event_type=px_tick" \
+            -f "client_payload[phase]=${PHASE}" \
+            -f "client_payload[reason]=${REASON}" \
+            -f "client_payload[run_id]=${{ github.run_id }}" \
+            || echo "::warning::re-dispatch failed — the cron safety net will pick it up"
