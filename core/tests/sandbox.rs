@@ -250,6 +250,75 @@ fn a_file_over_the_memory_cap_reports_memory_not_a_generic_failure() {
     );
 }
 
+/// A worker killed by a signal under a ceiling the parent set is reported as a
+/// memory refusal, not a crash.
+///
+/// This is the case the stderr-signature check cannot see, and it is the one that
+/// actually happens: Rust's allocation failure calls `handle_alloc_error`, which
+/// aborts, and the abort cannot print anything because there is no memory left to
+/// print with. So the child dies on SIGABRT with empty stderr, and the parent has
+/// to infer the cause from what it knows - the ceiling it chose, and the fact that
+/// the child could not raise it.
+#[cfg(unix)]
+#[test]
+fn a_worker_killed_by_a_signal_under_a_ceiling_is_a_memory_refusal() {
+    // The status of a process killed by SIGKILL cannot be produced by spawning
+    // one, so it is constructed: `from_raw` on the wait status a shell would see.
+    // SIGKILL = 9, so the raw status is 9.
+    let killed = std::os::unix::process::ExitStatusExt::from_raw(9);
+
+    let err = pixelsmith_core::sandbox::classify_for_test(
+        Some(killed),
+        Vec::new(),
+        // Empty stderr, which is what an allocation abort actually leaves behind.
+        String::new(),
+        false,
+        &Limits::mobile(),
+        64 * 1024 * 1024,
+    )
+    .expect_err("a signalled worker must be an error");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("memory"),
+        "a signalled worker under a ceiling must be reported as memory: {message}"
+    );
+    assert!(
+        message.contains("67108864"),
+        "the message must name the ceiling: {message}"
+    );
+    assert!(
+        !message.contains("crashed"),
+        "a memory refusal must not be reported as a crash: {message}"
+    );
+}
+
+/// The same inference must not fire when the worker exited on its own code. A
+/// clean `FILE_REJECTED` is about the file, and calling it memory would send the
+/// user to the wrong setting.
+#[test]
+fn a_clean_exit_is_not_reported_as_a_memory_refusal() {
+    // Exit status 2 is FILE_REJECTED.
+    let rejected = exit_status(2);
+    let err = pixelsmith_core::sandbox::classify_for_test(
+        Some(rejected),
+        Vec::new(),
+        "px-reject: this file is not a picture".to_string(),
+        false,
+        &Limits::mobile(),
+        DEFAULT_MEMORY_LIMIT,
+    )
+    .expect_err("must be an error");
+    assert!(
+        !err.to_string().contains("memory ceiling"),
+        "a rejected file was reported as a memory problem: {err}"
+    );
+    assert!(
+        err.to_string().contains("not a picture"),
+        "the worker's own sentence must survive: {err}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_memory_refusal_is_distinguishable_from_a_rejected_file() {
@@ -426,6 +495,20 @@ fn a_worker_panic_does_not_kill_the_parent() {
 
 /// Drive the parent's classification for a raw worker run, using the same
 /// function production code uses.
+/// An `ExitStatus` carrying a specific exit code, for the classifier tests.
+fn exit_status(code: i32) -> std::process::ExitStatus {
+    let arg = format!("exit {code}");
+    let args: Vec<&str> = if cfg!(windows) {
+        vec!["/C", arg.as_str()]
+    } else {
+        vec!["-c", arg.as_str()]
+    };
+    std::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
+        .args(args)
+        .status()
+        .expect("spawning a trivial process cannot fail")
+}
+
 fn classify_run(run: &WorkerRun) -> String {
     use pixelsmith_core::sandbox::RawOutcomeForTest;
     let outcome = RawOutcomeForTest {

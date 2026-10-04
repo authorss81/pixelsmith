@@ -364,10 +364,7 @@ fn classify(outcome: RawOutcome, limits: &Limits, memory_limit: u64) -> Result<S
     let memory_signature = looks_like_memory_exhaustion(&outcome.stderr);
 
     if memory_signature {
-        return Err(Error::Sandbox(format!(
-            "this photo needs more memory than the {memory_limit} byte ceiling \
-             allows: it was refused rather than risking a crash"
-        )));
+        return Err(memory_refusal(memory_limit));
     }
 
     match code {
@@ -382,13 +379,34 @@ fn classify(outcome: RawOutcome, limits: &Limits, memory_limit: u64) -> Result<S
         Some(other) => Err(Error::Sandbox(format!(
             "the decode worker exited with an unexpected status {other}"
         ))),
-        None if signalled => Err(Error::Sandbox(
-            "the image engine crashed on this photo".into(),
-        )),
+        // A child that died on a signal while running under a ceiling the parent chose,
+        // and which the child could not raise, hit the memory ceiling. It is not a
+        // crash, and calling it one tells the user the one thing they cannot act
+        // on.
+        //
+        // This is the *common* case under `RLIMIT_AS`, and it arrives with no
+        // stderr at all: Rust's allocation failure calls `handle_alloc_error`,
+        // which aborts, and writing an explanation needs memory that is not
+        // there. So the signature check above never fires for it. The parent knows
+        // the ceiling and knows the child could not raise it, so the inference is
+        // sound rather than a guess.
+        None if signalled => Err(memory_refusal(memory_limit)),
         None => Err(Error::Sandbox(
             "the decode worker produced no exit status".into(),
         )),
     }
+}
+
+/// The sentence a user sees when the ceiling, not the file, is the problem.
+///
+/// Names the ceiling because the actionable things are to pick a smaller photo or
+/// raise the budget. "The image engine crashed" offers neither, which is why the
+/// signalled case below reports this instead.
+fn memory_refusal(memory_limit: u64) -> Error {
+    Error::Sandbox(format!(
+        "this photo needs more memory than the {memory_limit} byte ceiling allows: \
+         it was refused rather than risking a crash on this device"
+    ))
 }
 
 /// Turn the worker's stderr into a user-facing refusal.
