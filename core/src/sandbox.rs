@@ -383,7 +383,21 @@ fn looks_like_memory_exhaustion(stderr: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// Parse the worker's response: a length-prefixed buffer.
+/// Trailing metadata the worker appends after the encoded bytes: width, height,
+/// quality. Nine bytes, fixed, so the encoded portion is everything before it.
+const RESPONSE_META_LEN: usize = 9;
+
+/// Parse the worker's response.
+///
+/// The layout is `len:u64 | encoded bytes | width:u32 | height:u32 | quality:u8`.
+/// The length prefix covers the **encoded bytes only** - not the metadata - because
+/// the worker writes `response.bytes.len()`, and the metadata is appended after.
+///
+/// That distinction is the bug this function's own test caught: an earlier version
+/// compared the prefix against the *whole* remaining body, so every successful
+/// decode was rejected as "promised N bytes and sent N+9". The worker was right
+/// and the parser was wrong, which is why the check is against `len` and the
+/// metadata is split off first.
 fn decode_response(stdout: &[u8]) -> Result<Sandboxed> {
     if stdout.len() < 8 {
         return Err(Error::Sandbox(
@@ -392,19 +406,22 @@ fn decode_response(stdout: &[u8]) -> Result<Sandboxed> {
     }
     let len = u64::from_le_bytes(stdout[0..8].try_into().expect("checked length"));
     let body = &stdout[8..];
-    if body.len() != len as usize {
-        return Err(Error::Sandbox(format!(
-            "the decode worker promised {len} bytes and sent {}",
-            body.len()
-        )));
-    }
-    // width, height, quality
-    if body.len() < 9 {
+
+    if body.len() < RESPONSE_META_LEN {
         return Err(Error::Sandbox(
             "the decode worker returned no dimensions".into(),
         ));
     }
-    let (encoded, meta) = body.split_at(body.len() - 9);
+    let split = body.len() - RESPONSE_META_LEN;
+    let (encoded, meta) = body.split_at(split);
+
+    if encoded.len() != len as usize {
+        return Err(Error::Sandbox(format!(
+            "the decode worker promised {len} bytes and sent {}",
+            encoded.len()
+        )));
+    }
+
     Ok(Sandboxed {
         width: u32::from_le_bytes(meta[0..4].try_into().expect("checked length")),
         height: u32::from_le_bytes(meta[4..8].try_into().expect("checked length")),
@@ -652,12 +669,18 @@ mod tests {
             let err = decode_response(&vec![0u8; len]).expect_err("must refuse");
             assert!(err.to_string().contains("truncated"), "{err}");
         }
-        // Right length prefix, wrong body.
+        // Right length prefix, wrong body. The prefix covers the encoded bytes only,
+        // so "promised 99" with 1 encoded byte must be refused.
         let mut bad = Vec::new();
         bad.extend_from_slice(&99u64.to_le_bytes());
-        bad.extend_from_slice(&[0u8; 10]);
+        bad.extend_from_slice(&[0u8; 1]);
+        bad.extend_from_slice(&[0u8; RESPONSE_META_LEN]);
         let err = decode_response(&bad).expect_err("must refuse");
         assert!(err.to_string().contains("promised 99"), "{err}");
+
+        // A response with encoded bytes but no room for the metadata.
+        let err = decode_response(&[0u8; 12]).expect_err("must refuse");
+        assert!(err.to_string().contains("no dimensions"), "{err}");
     }
 
     #[test]
