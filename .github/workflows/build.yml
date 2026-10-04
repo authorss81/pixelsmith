@@ -117,7 +117,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-linux-android, x86_64-linux-android
+          # armeabi-v7a is in this list because Flutter packages libflutter.so
+          # for it by default. Without an engine .so for the same ABI, the app
+          # loads on a 32-bit device and then fails at the first DynamicLibrary
+          # lookup -- so the ABI sets have to match exactly.
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
 
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
@@ -140,7 +144,7 @@ jobs:
           # library — it opened and would have crashed on first tap.
           mkdir -p ../app/android/app/src/main/jniLibs
           cargo ndk \
-            -t arm64-v8a -t x86_64 \
+            -t arm64-v8a -t armeabi-v7a -t x86_64 \
             -o ../app/android/app/src/main/jniLibs \
             build --release --lib
           find ../app/android/app/src/main/jniLibs -name '*.so'
@@ -175,10 +179,35 @@ jobs:
           # An APK with no native library opens fine and crashes on first tap,
           # which no build log will ever tell you about.
           unzip -l "${APK}" | grep -q 'classes.dex' \
-            || { echo "::error::APK has no classes.dex — this is not an app"; exit 1; }
-          unzip -l "${APK}" | grep -q 'lib/.*/libpixelsmith_core\.so' \
-            || { echo "::error::APK has no lib/*/libpixelsmith_core.so"; exit 1; }
-          echo "OK: native engine present"
+            || { echo "::error::APK has no classes.dex - this is not an app"; exit 1; }
+
+          # Per-ABI completeness. Flutter ships libflutter.so for every ABI it
+          # supports; the engine must be there for each one too. Checking only
+          # that *some* ABI has the engine is how a build passes while
+          # armeabi-v7a has libflutter.so and no engine at all - a 32-bit device
+          # would install the app and then crash on the first resize.
+          echo "--- native libraries ---"
+          unzip -l "${APK}" | grep -E 'lib/[^/]+/.*\.so$' | awk '{printf "  %-52s %10d bytes\n", $4, $1}'
+
+          FLUTTER_ABIS=$(unzip -l "${APK}" | grep -oE 'lib/[^/]+/libflutter\.so' | cut -d/ -f2 | sort -u)
+          ENGINE_ABIS=$(unzip -l "${APK}" | grep -oE 'lib/[^/]+/libpixelsmith_core\.so' | cut -d/ -f2 | sort -u)
+          echo "flutter ABIs: ${FLUTTER_ABIS}"
+          echo "engine  ABIs: ${ENGINE_ABIS}"
+
+          if [ -z "${ENGINE_ABIS}" ]; then
+            echo "::error::APK has no libpixelsmith_core.so at all"
+            exit 1
+          fi
+          MISSING=""
+          for abi in ${FLUTTER_ABIS}; do
+            echo "${ENGINE_ABIS}" | grep -qx "${abi}" || MISSING="${MISSING} ${abi}"
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "::error::these ABIs ship libflutter.so but no libpixelsmith_core.so:${MISSING}"
+            echo "::error::those devices would install the app and crash on first resize"
+            exit 1
+          fi
+          echo "OK: engine present for every ABI: ${ENGINE_ABIS}"
 
   # ---------------------------------------------------------------------------
   windows-exe:
