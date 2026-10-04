@@ -14,8 +14,8 @@ ever disagree, the marker wins and the table is a bug.
 | --- | --- | --- | --- | --- |
 | phase-01 | Verification baseline and project scaffolding | DONE | `4cf3df6` | See [phase-01 notes](#phase-01-notes) below |
 | phase-02 | Fuzz harness for every decode path | PENDING | | |
-| phase-03 | Hostile-input corpus and property tests | PENDING | | |
-| phase-04 | Sandboxed decode worker with a hard memory cap | PENDING | | |
+| phase-03 | Hostile-input corpus and property tests | DONE | `f0a23ff` | See [phase-03 notes](#phase-03-notes) below |
+| phase-04 | Sandboxed decode worker with a hard memory cap | DONE | `40bb083` | See [phase-04 notes](#phase-04-notes) below |
 | phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
 | phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | `d815024` | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
@@ -124,6 +124,157 @@ recording it always needs a follow-up commit. Two such follow-ups already exist
 (`8a33b6f`, `510267b`) because an earlier recorded sha was invalidated by a
 rebase. The convention is therefore "the commit holding the work", and the
 bookkeeping commits that follow are expected rather than a sign of drift.
+
+## phase-03 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` on CI run `37187541451`
+(157 lib tests, 20 hostile, 19 property, none skipped).
+
+**The `.done` marker existed before the work did.** `workspace/phase-03/.done` was
+written while the phase had delivered a single line: a `proptest` dev-dependency.
+The prompt's deliverables did not exist. This is recorded because the gate
+described at the top of this file is only as good as the evidence behind the
+marker, and here the marker was the evidence for itself.
+
+**Three of the tests were passing while asserting nothing.** Both cases come from
+fixtures that lied, which is the failure mode a generated corpus is supposed to
+prevent and does not:
+
+- Patching a PNG's `IHDR` without recomputing its CRC produces a file that fails
+  `CrcMismatch` before any dimension check runs. Three tests were green while
+  testing PNG corruption and appearing to test oversized headers. They now rewrite
+  the chunk coherently (`png_crc32` plus `png_claiming`), and
+  `png_dimension_rewriting_produces_a_still_valid_png` proves the rewriter still
+  produces a decodable file.
+- A hand-rolled TIFF IFD entry that is 14 bytes instead of 12 parses cleanly as
+  "no orientation present", so every EXIF truncation test built on it was
+  vacuous. The fixture goes through the engine's own `exif::build_block` now, and
+  `the_exif_fixture_really_carries_the_orientation` is the positive control.
+
+**The dimension ceilings are tested through `Limits::check_header`, not through a
+file.** `check_header` is what actually stops a bomb: it runs on numbers read from
+a header, before a pixel buffer exists. Testing only through a file would be
+weaker than it looks, because the PNG decoder enforces its own limits too — a
+file test can pass while `check_header` has been deleted. `validate_bytes` is
+documented as the advisory path it is, and
+`validate_bytes_warns_where_decode_bounded_refuses` pins the split: it sets
+`suspicious` and returns `Ok`, `decode_bounded` refuses.
+
+**Two real defects, both in `worker.rs`, both found by the properties:**
+
+1. `sanitise_stem` emitted reserved Windows device names. All eleven spellings —
+   `con.png`, `NUL`, `Com4.gif`, `lpt9.bmp` — sanitised to a name Windows refuses to
+   create whatever extension follows, because the reservation is on the stem. A
+   phone photo called `nul.jpg` produced an export that failed only *after* the
+   encode. Fixed by prefixing an underscore, so the name stays recognisable and
+   becomes creatable. The 64-char cap runs *before* the reserved-name check, so a
+   name that only becomes reserved once truncated is still caught.
+2. `sanitise_path_component` kept a dot whenever both neighbours were
+   `is_alphanumeric()`, which Rust considers true for CJK ideographs and
+   superscripts alike — so `U+3400 '..' U+00B9` passed through unchanged with its
+   dot-dot intact. Not an escape, since separators are already gone at that point,
+   but a dot-dot is the exact token a consumer splits on when rebuilding a path.
+   Dot runs now collapse to one.
+
+Each has a named regression test in `worker.rs`'s own test module, in addition to
+the property that found it.
+
+**Four property failures were my test bugs, not engine bugs**, and are recorded as
+such rather than deleted: the orientation table had `MirrorHorizontal` where the
+code has `MirrorHorizontalRotate90/270` (the code was right); a square-source check
+I had written as a general transposition claim, which is false for small targets
+where the 1-pixel clamp dominates; an over-strict stem equality; and a
+target-bytes case below the `min_quality` floor of 30.
+
+**Proptest seeds are pinned, and `PX_PROPTEST_SEED` overrides them.** A random
+default seed means a shrunk counterexample cannot be replayed, so the failure is
+not actionable and `git bisect` over a failing property does not work.
+
+**Not done, and named:** the corpus covers truncation, dimension and pixel-count
+lies, magic/content mismatch, GIF and JPEG structural corruption and a truncated
+EXIF IFD, but no animated-format state machine and no fuzz-derived regression
+case beyond what `fuzz/` already produces.
+
+## phase-04 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` on CI run `37193442044`
+(164 lib tests, 20 hostile, 19 property, 25 sandbox, none skipped).
+
+**The `.done` marker existed before `core/src/sandbox.rs` did**, as in phase-03.
+
+**Untrusted decoding now runs in a re-exec'd child process** with an address-space
+ceiling the parent sets in `pre_exec`, so the limit is in force before any engine
+code runs. `rlim_cur` and `rlim_max` are set to the same value, because a soft
+limit is raisable up to the hard limit: a worker that wants more memory must ask
+the kernel, and the kernel says no. A limit the worker set for itself would be a
+limit a compromised worker could ignore, which is the entire point of the module.
+
+**It is a process, not a thread.** Threads share an address space, so an allocation
+failure in a worker thread aborts the process; there is no way to cap a thread's
+memory in Rust, and `setrlimit` is per-process. A thread here would have been the
+same containment as none.
+
+**The exit-code contract is documented in the module and is what makes the failure
+modes distinguishable** — 2 the file is unacceptable, 3 memory ceiling, 4 engine
+panic, 5 protocol violation, 6 timeout. Code 1 is deliberately unused: it is what a
+shell reports for a generic failure, so an unexplained exit is visibly *not* one of
+ours. Three tests assert the codes are distinct, non-zero, and not 1.
+
+**Four defects this phase found in itself, all caught by CI rather than by reading
+the code**, and recorded because each one was invisible locally:
+
+- The response parser compared the length prefix against the whole remaining body,
+  but the prefix covers the encoded bytes only — the worker appends 9 bytes of
+  metadata. Every successful sandboxed decode was rejected as "promised N bytes and
+  sent N+9". The sandbox could never have worked.
+- A tight `RLIMIT_AS` makes the write to the worker's stdin fail with `EPIPE`,
+  because the child can die before reading anything. That was reported as "could not
+  send the job", relabelling every memory refusal as a transport failure.
+- The memory test asserted one exact message shape, but three distinct paths are
+  all correct — exec failure, allocation abort, signal death. The test is now a
+  statement about the contract rather than about 1 MiB.
+- **The common `RLIMIT_AS` outcome is signal death with empty stderr**, since
+  `handle_alloc_error` aborts and printing the explanation needs memory that is not
+  there. The classifier only looked for a stderr signature, so it reported "the
+  image engine crashed" — the one sentence a user cannot act on. A child that died
+  on a signal under a ceiling the parent chose and the child could not raise hit
+  the memory ceiling; the parent knows both halves of that, so the inference is
+  sound. All three refusals now share one message naming the ceiling.
+  `a_clean_exit_is_not_reported_as_a_memory_refusal` stops the new inference from
+  swallowing legitimate file rejections.
+
+**Two test-harness problems, both of which had been passing on Windows and only
+failed on Linux CI**, which is the argument for running the gate in both places:
+
+- `current_exe()` under `cargo test` is the test harness, so `decode_sandboxed`
+  re-executed the entire suite in a child instead of decoding. `decode_sandboxed_with`
+  takes the path explicitly — also the only way to test without mutating a
+  process-global environment variable, which races across the parallel harness.
+- The leak test counted every child of the test process. `cargo test` runs tests in
+  parallel threads, so a sibling may legitimately have a worker in flight, and
+  scoping by binary name does not help because it is the same binary. It now takes
+  an exclusive lock while every other spawning test takes a shared one. A leak test
+  that fails when there is no leak is worse than no leak test, so the observation
+  was narrowed rather than the test deleted.
+
+**The two memory-ceiling tests are `#[cfg(unix)]`, deliberately.** `RLIMIT_AS` is
+Unix-only and `apply_memory_limit` is a no-op on Windows, where the job-object
+equivalent is not implemented. Ungated, they would have been green assertions about
+containment that is not present on that platform. A `cfg(not(unix))` test asserts
+the opposite — that a 1 MiB ceiling does *not* stop a decode on Windows — so the
+gate cannot quietly hide a real failure later.
+
+**Not done, and named:**
+
+- **Windows job objects.** No Windows sandbox exists on the runner to test
+  against, and an untested `unsafe` block calling `CreateJobObjectW` would be worse
+  than an honest absence. The in-process `Limits` still bound the decode there,
+  which is the property that protects the user.
+- **The sandbox is not on the default decode path.** It costs a process spawn per
+  image, so `decode_bounded` remains the default for ordinary files; the sandbox is
+  available for the untrusted case and not yet chosen automatically.
+- **The timeout is 30 seconds and untuned against real hardware.** No measurement
+  of typical decode time informed it.
 
 ## phase-05 notes
 
