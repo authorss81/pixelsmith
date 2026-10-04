@@ -205,7 +205,19 @@ pub fn decode_sandboxed_with(
         .stderr(Stdio::piped())
         .apply_memory_limit(memory_limit)
         .spawn()
-        .map_err(|e| Error::Sandbox(format!("could not start the decode worker: {e}")))?;
+        .map_err(|e| {
+            // A ceiling low enough that the dynamic linker cannot map libc makes
+            // `execve` itself fail with ENOMEM, which Rust surfaces as a spawn
+            // error rather than an exit status. That is still a memory refusal,
+            // and calling it a generic spawn failure would hide the one fact the
+            // caller needs - the ceiling they chose is below what the process
+            // needs just to start.
+            Error::Sandbox(format!(
+                "could not start the decode worker under the {memory_limit} byte \
+                 memory ceiling: {e}. The ceiling is too low even to launch the \
+                 engine."
+            ))
+        })?;
     let mut child = spawn;
 
     // Write the job, then close stdin so the worker sees EOF and stops reading.

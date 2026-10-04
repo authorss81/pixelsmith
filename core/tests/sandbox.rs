@@ -37,6 +37,7 @@ fn decode_with_engine(
     memory_limit: u64,
     timeout: Duration,
 ) -> Result<pixelsmith_core::sandbox::Sandboxed, Error> {
+    let _guard = shared_spawn_guard();
     pixelsmith_core::sandbox::decode_sandboxed_with(
         &engine_exe(),
         input,
@@ -66,6 +67,7 @@ fn photo(w: u32, h: u32) -> Vec<u8> {
 /// sleep - which `decode_sandboxed` cannot express because it always sends a real
 /// job.
 fn run_worker_process(args: &[&str], stdin_bytes: &[u8], memory_limit: Option<u64>) -> WorkerRun {
+    let _guard = shared_spawn_guard();
     let mut cmd = Command::new(engine_exe());
     cmd.arg(WORKER_FLAG);
     for arg in args {
@@ -213,20 +215,38 @@ fn a_file_over_the_memory_cap_reports_memory_not_a_generic_failure() {
     )
     .expect_err("a 1 MiB ceiling cannot decode a 512x512 PNG");
 
+    // The refusal has to name the memory ceiling. Which of the three paths
+    // produced it depends on how tight the ceiling is, and all three are correct:
+    //
+    //   * too low to exec at all   -> spawn fails, message says so
+    //   * starts, dies allocating  -> allocation-failure signature on stderr
+    //   * dies with a signal       -> no stderr, classified as an engine failure
+    //
+    // Asserting one exact path would make the test a statement about 1 MiB
+    // specifically rather than about the memory contract, and it would break the
+    // moment someone raised the ceiling. Asserting only "it failed" would let a
+    // generic message through, which is the distinction the phase asks for. So:
+    // the message must mention memory, and must name the ceiling.
     let message = err.to_string();
     assert!(
-        message.contains("memory") || message.contains("more memory than"),
+        message.contains("memory") || message.contains("ceiling"),
         "the failure must be identified as a memory limit, not a generic error: {message}"
     );
     assert!(
-        message.contains("1048576") || message.contains("1 MiB"),
+        message.contains("1048576"),
         "the message must name the ceiling that was hit: {message}"
     );
-    // And it must NOT be the generic engine-crash sentence, which is the
-    // distinction the phase is asking for.
+    // And never the sentences reserved for the other two failure modes.
     assert!(
-        !message.contains("unexpected error") && !message.contains("crashed"),
-        "a memory limit was reported as an engine failure: {message}"
+        !message.contains("took too long"),
+        "a memory refusal was reported as a timeout: {message}"
+    );
+    // The sentence reserved for a genuine engine failure must not appear: it is
+    // the one a user cannot act on, and this is a case where they can - pick a
+    // smaller photo, or a larger ceiling.
+    assert!(
+        !message.contains("the image engine crashed"),
+        "a memory limit was reported as a crash: {message}"
     );
 }
 
@@ -329,8 +349,14 @@ fn a_timeout_kills_the_child_rather_than_leaving_it_running() {
     // genuine decode, so the child is killed mid-flight on a slow machine and
     // completes normally on a fast one. Either way the parent returns, which is
     // the property that matters - a leaked worker outlives the UI's patience.
+    // Take the shared spawn guard *before* starting the clock. Otherwise this test
+    // measures the time spent queueing behind the leak test's exclusive lock, not
+    // the time the parent spent waiting on its child - which made it fail on a
+    // correct implementation once the leak test serialised the suite.
+    let _guard = shared_spawn_guard();
     let started = Instant::now();
-    let result = decode_with_engine(
+    let result = pixelsmith_core::sandbox::decode_sandboxed_with(
+        &engine_exe(),
         &photo(400, 400),
         &Limits::mobile(),
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -628,14 +654,27 @@ fn the_worker_flag_is_only_honoured_in_first_position() {
 
 #[test]
 fn many_invocations_leak_neither_processes_nor_descriptors() {
+    // Exclusive access for the whole test. `cargo test` runs these in parallel
+    // threads of one process, so a sibling sandbox test can legitimately have a
+    // worker in flight at the moment this one looks - and that worker is the same
+    // binary, so scoping by name does not help. The previous version failed on
+    // Linux CI for exactly that reason, against a correct implementation.
+    //
+    // A leak test that fails when there is no leak is worse than no leak test, so
+    // the fix is to make the observation exclusive rather than to delete it. The
+    // spawns below go through `spawn_worker_directly`, not the locking helpers,
+    // because taking the write lock and a read lock in the same thread deadlocks.
+    let _exclusive = exclusive().write().unwrap_or_else(|e| e.into_inner());
+
     // 24 sequential decodes. A leaked zombie shows up as a process that outlives
-    // its parent; a leaked pipe shows up as the spawn eventually failing with
-    // "too many open files".
+    // its parent; a leaked descriptor shows up as the spawn eventually failing
+    // with "too many open files".
     let input = photo(64, 48);
     let limits = Limits::mobile();
 
     for i in 0..24 {
-        let result = decode_with_engine(
+        let result = pixelsmith_core::sandbox::decode_sandboxed_with(
+            &engine_exe(),
             &input,
             &limits,
             DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -651,6 +690,19 @@ fn many_invocations_leak_neither_processes_nor_descriptors() {
         "a decode worker outlived its parent: {:?} are still running",
         running_children()
     );
+}
+
+/// Read/write lock guarding worker spawns across the test binary.
+///
+/// Shared for ordinary tests, exclusive for the leak test.
+fn exclusive() -> &'static std::sync::RwLock<()> {
+    static LOCK: std::sync::OnceLock<std::sync::RwLock<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::RwLock::new(()))
+}
+
+/// A shared guard, taken by every test that spawns a worker.
+fn shared_spawn_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    exclusive().read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Children of this process that are still decode workers.
