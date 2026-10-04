@@ -108,12 +108,14 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      # The GitHub runner already ships an Android SDK. `android-actions/setup-android`
-      # fails on `sdkmanager tools`, a package that no longer exists in cmdline-tools 16.
+      # The GitHub runner already ships an Android SDK, but `sdkmanager` is not
+      # on PATH — it lives under $ANDROID_SDK_ROOT/cmdline-tools. Using the bare
+      # name fails with "command not found", which is what broke this job.
       - name: Accept Android SDK licences
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          SDKMGR="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
+          "$SDKMGR" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
