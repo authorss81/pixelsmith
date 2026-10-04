@@ -314,6 +314,17 @@ pub fn zip_outputs(items: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
 /// A filename arriving from an untrusted picker can be `../../evil.png` or
 /// `C:\Windows\x.png` or `nul`. Only the stem survives, and only after this
 /// filter.
+///
+/// Reserved Windows device names are also refused. `nul.png`, `CON.jpg` and
+/// `com1.jpeg` all sanitise to a stem Windows will refuse to create, whatever
+/// extension follows - the reservation is on the stem alone - so a photo named
+/// `nul.jpg` from a phone would produce an export that fails at the last step,
+/// after the user had already waited for the encode. Found by
+/// `sanitise_stem_never_names_a_reserved_windows_device` in
+/// `core/tests/properties.rs`, which reports all eleven spellings.
+///
+/// Named `RESERVED_DEVICE_NAMES` rather than inlining the list in the `matches!`
+/// so the test and the implementation cannot drift apart.
 pub fn sanitise_stem(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
     let stem = base.rsplit_once('.').map_or(base, |(s, _)| s);
@@ -329,25 +340,89 @@ pub fn sanitise_stem(name: &str) -> String {
         .collect();
     let trimmed = cleaned.trim_matches(['-', ' ', '.']).to_string();
     if trimmed.is_empty() {
-        "image".into()
-    } else {
-        trimmed.chars().take(64).collect()
+        return "image".into();
     }
+    // Cap before the reserved-name check, so a name that only *becomes* reserved
+    // after truncation is still caught. `NUL` padded out to 64 characters is
+    // still a name Windows will not take.
+    let capped: String = trimmed.chars().take(64).collect();
+    if is_reserved_windows_name(&capped) {
+        // Prefix rather than replace: the user still sees which file this was,
+        // and `_nul` is creatable.
+        return format!("_{capped}");
+    }
+    capped
+}
+
+/// Device names Windows reserves regardless of extension, in the canonical
+/// uppercase spelling. `COM1`-`COM9` and `LPT1`-`LPT9` are written out rather
+/// than generated so the list can be read against the Microsoft documentation
+/// without running anything.
+const RESERVED_DEVICE_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Whether Windows would refuse to create this name.
+///
+/// The reservation applies to the part before the first dot, case-insensitively,
+/// and with any trailing spaces or dots ignored - `con`, `CON`, `con ` and
+/// `con.` are all the same device. Trailing dots and spaces are stripped before
+/// the lookup because `sanitise_stem` can produce them by truncation.
+fn is_reserved_windows_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name);
+    let base = base.trim_end_matches([' ', '.']);
+    let upper = base.to_ascii_uppercase();
+    RESERVED_DEVICE_NAMES.contains(&upper.as_str())
 }
 
 /// Same idea, for a path component inside an archive.
+///
+/// Named by the property test `sanitise_path_component_cannot_contain_a_dot_dot_run`
+/// in `core/tests/properties.rs`, which found that a `.` is kept whenever *both*
+/// of its neighbours are alphanumeric. That let `..` survive in the middle of a
+/// name: the input `㐀..¹` came out unchanged, because U+3400 and U+00B9 are both
+/// `is_alphanumeric()` in Rust. A `..` in the middle of an archive entry name is
+/// not by itself an escape - the separators are already gone by this point - but
+/// it is the exact shape a downstream consumer splits on when it reconstructs a
+/// path, and there is no reason to emit it. Collapsing every run of dots to one
+/// removes the class rather than the instance.
+///
+/// The trailing `take(96)` matters for the same reason it does in
+/// [`sanitise_stem`]: truncation can land mid-run and leave a lone `.`, so the
+/// trim has to happen *after* the cap, not before.
 pub fn sanitise_path_component(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
-    let cleaned: String = base
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
-        .collect();
-    let trimmed = cleaned.trim_matches('.').to_string();
-    if trimmed.is_empty() {
-        "file".into()
-    } else {
-        trimmed.chars().take(96).collect()
+    let mut cleaned = String::with_capacity(base.len());
+    let mut last_was_dot = false;
+    for c in base.chars() {
+        if c == '.' {
+            // Keep one dot for readability; drop the rest of any run.
+            if !last_was_dot {
+                cleaned.push('.');
+            }
+            last_was_dot = true;
+            continue;
+        }
+        if c.is_alphanumeric() || c == '-' || c == '_' {
+            cleaned.push(c);
+            last_was_dot = false;
+        }
+        // Anything else is dropped outright (a separator has already been split
+        // off, so this is punctuation, a NUL, or a control character).
     }
+
+    // Trim after capping, not before: capping first is what keeps a cut from
+    // leaving a trailing dot behind.
+    let capped: String = cleaned.chars().take(96).collect();
+    let trimmed = capped.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        return "file".into();
+    }
+    if is_reserved_windows_name(&trimmed) {
+        return format!("_{trimmed}");
+    }
+    trimmed
 }
 
 #[cfg(test)]
@@ -953,5 +1028,128 @@ mod tests {
     #[test]
     fn rayon_has_more_than_one_thread() {
         assert!(rayon::current_num_threads() >= 1);
+    }
+
+    /// Regression test for the defect found by
+    /// `sanitise_stem_never_names_a_reserved_windows_device` in
+    /// `core/tests/properties.rs`.
+    ///
+    /// Windows reserves these device names regardless of extension, so a photo
+    /// called `nul.jpg` produced an export that could not be saved - and the
+    /// failure surfaced only after the encode, which is the worst possible moment.
+    /// The fix prefixes an underscore, which keeps the name recognisable to the
+    /// user and creatable by the OS.
+    ///
+    /// Every reserved spelling is listed rather than sampled, because the case
+    /// sensitivity and the COM/LPT numbering are exactly what is easy to get
+    /// wrong.
+    #[test]
+    fn reserved_windows_device_names_are_prefixed_not_emitted() {
+        for reserved in RESERVED_DEVICE_NAMES {
+            for spelling in [
+                reserved.to_string(),
+                reserved.to_lowercase(),
+                format!("{reserved}.jpg"),
+                format!("{}.jpeg", reserved.to_lowercase()),
+                format!("  {reserved}  .png"),
+            ] {
+                let out = sanitise_stem(&spelling);
+                assert!(
+                    !is_reserved_windows_name(&out),
+                    "sanitise_stem({spelling:?}) produced {out:?}, which Windows \
+                     will refuse to create"
+                );
+                assert!(
+                    !out.is_empty(),
+                    "sanitise_stem({spelling:?}) produced an empty name"
+                );
+            }
+        }
+    }
+
+    /// The same defect in the archive path: a ZIP entry called `con.txt` cannot
+    /// be extracted on Windows either.
+    #[test]
+    fn reserved_windows_device_names_are_refused_in_archive_components() {
+        for reserved in RESERVED_DEVICE_NAMES {
+            let out = sanitise_path_component(&format!("{reserved}.jpg"));
+            assert!(
+                !is_reserved_windows_name(&out),
+                "sanitise_path_component({reserved}.jpg) produced {out:?}"
+            );
+        }
+    }
+
+    /// Regression test for the defect found by
+    /// `sanitise_path_component_cannot_contain_a_dot_dot_run` in
+    /// `core/tests/properties.rs`.
+    ///
+    /// A dot was kept whenever both neighbours were `is_alphanumeric()`, which
+    /// Rust considers true for CJK ideographs and superscripts alike. So `㐀..¹`
+    /// passed through unchanged with its `..` intact. The separators are already
+    /// gone by this point in the function, so this was not an escape - but a `..`
+    /// is the exact token a consumer splits on when rebuilding a path, and there
+    /// is no reason to emit one.
+    #[test]
+    fn a_dot_dot_run_between_alphanumerics_is_collapsed() {
+        // The minimal case proptest found, plus a few shapes of the same class.
+        for input in ["㐀..¹", "a..b.txt", "x..y..z.zip", "..", "...", "...."] {
+            let out = sanitise_path_component(input);
+            assert!(
+                !out.contains(".."),
+                "sanitise_path_component({input:?}) produced {out:?}, which \
+                 still contains a dot-dot run"
+            );
+            assert!(!out.is_empty(), "empty output for {input:?}");
+        }
+        // Collapsing, not deletion: a single extension separator must survive,
+        // or every archive entry would lose its extension.
+        assert_eq!(sanitise_path_component("photo.jpg"), "photo.jpg");
+        assert_eq!(sanitise_path_component("a.b.c.png"), "a.b.c.png");
+    }
+
+    /// Truncation happens before the reserved-name check, so a name that only
+    /// becomes reserved once capped is still caught.
+    #[test]
+    fn a_name_that_becomes_reserved_after_truncation_is_still_refused() {
+        // 64 characters of padding followed by nothing: capping cannot manufacture
+        // a device name, so this asserts the ordering rather than the reverse.
+        let padded = format!("{}{}", "A".repeat(64), "");
+        let out = sanitise_stem(&padded);
+        assert!(!is_reserved_windows_name(&out));
+
+        // And the cap is still enforced after the check.
+        assert!(
+            sanitise_stem(&format!("{}.jpg", "A".repeat(200)))
+                .chars()
+                .count()
+                <= 65,
+            "the 64-char cap must still apply"
+        );
+    }
+
+    /// The ordinary cases must be unaffected by the reserved-name work. A
+    /// sanitiser that mangled everything would pass every safety property above.
+    #[test]
+    fn ordinary_stems_are_still_untouched() {
+        for (input, expected) in [
+            ("IMG_1234.jpg", "IMG_1234"),
+            ("DSC00001.jpeg", "DSC00001"),
+            ("photo.png", "photo"),
+            ("my holiday.jpg", "my holiday"),
+            ("a-b_c.png", "a-b_c"),
+            // Dots are not in the keep-set, so they become `-` and are then
+            // trimmed off the ends. Underscores are kept, so `___` survives as a
+            // name - unusual, but harmless and creatable.
+            ("___.jpg", "___"),
+            ("...png", "image"),
+            ("-.-.png", "image"),
+        ] {
+            assert_eq!(
+                sanitise_stem(input),
+                expected,
+                "sanitise_stem({input:?}) changed unexpectedly"
+            );
+        }
     }
 }

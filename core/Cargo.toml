@@ -95,6 +95,21 @@ features = ["std"]
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# Already a normal dependency, and Cargo unifies the same version across normal
+# and dev builds, so this adds no compilation to a release. It is here because an
+# integration test under core/tests/ can only reach the crate's public API plus
+# its dev-dependencies: building a valid fixture needs `image::DynamicImage`,
+# and `worker::tests::photo` is inside a #[cfg(test)] module, so it is not
+# visible from out here. Naming the same crate is the honest way to get a real
+# fixture instead of committing binary blobs.
+image = { version = "0.25", default-features = false }
+# Same reason, and the same version as the normal dependency, so nothing extra
+# is compiled. `exif::build_block` and `exif::field` are public, but naming their
+# argument types requires depending on `kamadak-exif` directly. Hand-rolling a
+# TIFF header instead was tried first and is a bad idea: an entry that is 14
+# bytes instead of 12 still produces a file that parses as "no orientation",
+# which makes every truncation test built on top of it silently vacuous.
+kamadak-exif = "0.6"
 # The same crate as the dependency above, plus `bench`, which is what publishes
 # `heic_rs::hevc::synth`. That module builds complete HEVC bitstreams bit by bit,
 # so the HEIC fixtures in `core/src/heic.rs`'s tests are generated rather than
