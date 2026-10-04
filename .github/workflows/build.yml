@@ -215,6 +215,9 @@ jobs:
           # is merely sitting in windows/runner/ unless an install rule names it.
           New-Item -ItemType Directory -Force -Path ..\app\windows\runner | Out-Null
           Copy-Item target\release\pixelsmith_core.dll ..\app\windows\runner\ -Force
+          # src/rust/ is gitignored, so a fresh checkout has no such directory.
+          # It is the local-development output of native/build-engine.sh.
+          New-Item -ItemType Directory -Force -Path ..\app\src\rust | Out-Null
           Copy-Item target\release\pixelsmith_core.dll ..\app\src\rust\ -Force
 
       - name: Build the EXE
