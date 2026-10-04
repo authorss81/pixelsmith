@@ -15,6 +15,7 @@ pub mod format;
 pub mod heic;
 pub mod pipeline;
 pub mod presets;
+pub mod sandbox;
 pub mod target;
 pub mod validate;
 pub mod worker;

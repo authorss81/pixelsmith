@@ -41,6 +41,12 @@ base64 = { version = "0.23.1", features = ["alloc"] }
 # Pure Rust, no C, no build script.
 jpeg-encoder = "0.6"
 
+# `setrlimit`/`getrlimit` for the sandbox's address-space ceiling. Unix-only,
+# already in the dependency tree through rayon and friends, and not a
+# network-capable crate, so it does not touch hard rule 1.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["avif"]
 # Lossy WebP via libwebp. Off by default so the pure-Rust build has no C

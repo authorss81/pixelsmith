@@ -62,6 +62,18 @@ pub enum Error {
 
     #[error("operation was cancelled")]
     Cancelled,
+
+    /// A sandboxed decode failed. The message is already written for a person:
+    /// it names what happened to the file and what the limit was, because the
+    /// alternative is surfacing a child's exit status or a Rust panic string to
+    /// someone trying to make a photo smaller.
+    ///
+    /// One variant rather than four because the *distinction the caller needs* is
+    /// carried in the message, and inventing a variant per exit code would give
+    /// the UI five near-identical error branches to render. The exit-code
+    /// contract itself is documented in [`crate::sandbox`].
+    #[error("{0}")]
+    Sandbox(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
