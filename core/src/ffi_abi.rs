@@ -122,19 +122,24 @@ impl ToDart for *mut u8 {
     const DART: &'static str = "ffi.Pointer<ffi.Uint8>";
 }
 
-// C's `char` is unsigned on ARM (Android, iOS) and signed everywhere else, so
-// `*mut c_char` coincides with `*mut u8` exactly on the mobile targets. A
-// second impl would be a conflicting implementation there (E0119) — which is
-// precisely what broke the Android and iOS builds while x86 stayed green.
-// This impl therefore exists only where the types differ; on ARM the `*mut u8`
-// impl above covers `*mut c_char` automatically, since they are the same type.
-//
-// Consequence to be aware of: on ARM the generated Dart text says
-// `ffi.Pointer<ffi.Uint8>` where the hand-written binding says
-// `ffi.Pointer<ffi.Char>`. Both are 1-byte pointers and the drift test checks
-// arity rather than spelling, so this is cosmetic — but a future phase that
-// compares type strings must account for it.
-#[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+// C's `char` is unsigned on ARM Linux/Android and signed everywhere else —
+// including ARM Apple, which is why gating on `target_arch` alone broke iOS
+// immediately after fixing Android. Where the types coincide, `*mut c_char` IS
+// `*mut u8` and a second impl is a conflicting implementation (E0119); where
+// they differ it needs its own. So exactly one of the two impls below exists on
+// any target. Per-target truth table, verified against CI failures, not memory:
+//   linux x86_64 ......... c_char = i8, impl present, no conflict
+//   windows x86_64 ....... c_char = i8, impl present, no conflict
+//   macos x86_64 ......... c_char = i8, impl present, no conflict
+//   macos aarch64 ........ c_char = i8, impl present, no conflict
+//   android aarch64 ...... c_char = u8, impl absent, covered by *mut u8
+//   ios aarch64 .......... c_char = i8, impl present, no conflict
+// A new target with a different convention fails loudly here (missing ToDart)
+// rather than silently, which is the point: add its row to this table.
+#[cfg(not(all(
+    any(target_arch = "arm", target_arch = "aarch64"),
+    any(target_os = "linux", target_os = "android")
+)))]
 impl ToDart for *mut c_char {
     const NATIVE: &'static str = "ffi.Pointer<ffi.Char>";
     const DART: &'static str = "ffi.Pointer<ffi.Char>";
