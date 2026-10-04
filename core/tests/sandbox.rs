@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use pixelsmith_core::error::Error;
 use pixelsmith_core::sandbox::{
     DEFAULT_MEMORY_LIMIT, DEFAULT_MOBILE_MEMORY_LIMIT, DEFAULT_TIMEOUT, WORKER_FLAG,
-    decode_sandboxed, is_worker_invocation, run_worker,
+    is_worker_invocation, run_worker,
 };
 use pixelsmith_core::validate::Limits;
 
@@ -97,9 +97,21 @@ fn run_worker_process(args: &[&str], stdin_bytes: &[u8], memory_limit: Option<u6
     let mut child = cmd.spawn().expect("the worker binary must be spawnable");
     {
         let mut handle = child.stdin.take().expect("stdin was piped");
-        handle
-            .write_all(stdin_bytes)
-            .expect("writing to the worker");
+        // A broken pipe here is expected, not a test failure: under a tight
+        // RLIMIT_AS the worker can die before it reads anything, which is exactly
+        // the condition several of these tests are trying to create. Panicking on
+        // EPIPE would turn "the ceiling worked" into "the harness broke".
+        // `run` is only used for the diagnostics it prints.
+        let run = handle.write_all(stdin_bytes);
+        if let Err(e) = run {
+            assert!(
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::UnexpectedEof
+                ),
+                "writing to the worker failed for an unexpected reason: {e}"
+            );
+        }
     }
     let output = child.wait_with_output().expect("waiting for the worker");
     WorkerRun {
@@ -641,16 +653,34 @@ fn many_invocations_leak_neither_processes_nor_descriptors() {
     );
 }
 
+/// Children of this process that are still decode workers.
+///
+/// Scoped to the engine binary by name, not to "any child at all". `cargo test`
+/// runs tests in parallel threads, so a sibling sandbox test may legitimately have
+/// a worker in flight at the moment this one looks - counting those made the
+/// leak test fail on a correct implementation, and a leak test that fails when
+/// there is no leak is worse than no leak test.
 #[cfg(unix)]
 fn running_children() -> Vec<u32> {
+    let engine_name = engine_exe()
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
     std::fs::read_dir("/proc")
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok())
         .filter_map(|entry| {
             let pid: u32 = entry.file_name().to_string_lossy().parse().ok()?;
+            // /proc/<pid>/comm holds the executable's base name.
+            let comm = std::fs::read_to_string(entry.path().join("comm")).ok()?;
+            if comm.trim() != engine_name {
+                return None;
+            }
             let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            // Field 4 is ppid.
+            // Field 4 is ppid. A zombie still has a ppid, and a zombie is
+            // exactly what a leaked worker looks like, so it is not skipped.
             let ppid = stat.split_whitespace().nth(3)?.parse::<u32>().ok()?;
             (ppid == std::process::id()).then_some(pid)
         })

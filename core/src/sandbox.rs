@@ -224,11 +224,30 @@ pub fn decode_sandboxed_with(
     let outcome = match write_result {
         Ok(()) => collect_with_timeout(&mut child, timeout, started)?,
         Err(e) => {
+            // The write failed, which almost always means the child had already
+            // exited - and under a tight `RLIMIT_AS` that happens before it can
+            // read a single byte, because the allocation fails during start-up.
+            //
+            // So do not report the write error. The child's own stderr and exit
+            // status are the better diagnosis, and they are exactly what
+            // distinguishes "the ceiling was too low" from "the worker is
+            // broken". Reporting `EPIPE` here would relabel every memory refusal
+            // as a generic transport failure.
             let _ = child.kill();
-            let _ = child.wait();
-            return Err(Error::Sandbox(format!(
-                "could not send the job to the decode worker: {e}"
-            )));
+            let recovered = collect_with_timeout(&mut child, timeout, started)?;
+            return match classify(recovered, limits, memory_limit) {
+                // Keep the write error only if the child said nothing useful.
+                Err(classified) => {
+                    let message = classified.to_string();
+                    if message.contains("could not") && !message.contains("memory") {
+                        return Err(Error::Sandbox(format!(
+                            "could not send the job to the decode worker: {e}"
+                        )));
+                    }
+                    Err(classified)
+                }
+                Ok(sandboxed) => Ok(sandboxed),
+            };
         }
     };
 
