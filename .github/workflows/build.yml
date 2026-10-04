@@ -29,8 +29,6 @@ on:
 permissions:
   contents: read
 
-env:
-  FLUTTER_VERSION: stable
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -126,7 +124,6 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
 
@@ -195,7 +192,6 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
 
@@ -268,7 +264,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: subosito/flutter-action@v2
         with:
-          flutter-version: ${{ env.FLUTTER_VERSION }}
           channel: stable
           cache: true
       - name: Build
