@@ -89,6 +89,11 @@ allow = [
   "MPL-2.0",
   # Placeholder data is not code and carries no obligation.
   "Unlicense",
+  # The Independent JPEG Group license, carried by `jpeg-encoder` (used for
+  # progressive JPEG output since phase-07). Same terms as the libjpeg every
+  # Linux ships: permissive, commercial use allowed, acknowledgement required.
+  # FSF classifies it as free. Valid SPDX identifier.
+  "IJG",
 ]
 confidence-threshold = 0.93
 
