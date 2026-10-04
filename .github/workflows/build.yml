@@ -134,10 +134,16 @@ jobs:
       - name: Build the Rust library for Android ABIs
         working-directory: core
         run: |
+          # Gradle only picks up .so files from android/app/src/main/jniLibs/<abi>/.
+          # An earlier revision wrote them to app/src/rust/jniLibs, where the
+          # desktop builds look. The APK built fine and contained no native
+          # library — it opened and would have crashed on first tap.
+          mkdir -p ../app/android/app/src/main/jniLibs
           cargo ndk \
             -t arm64-v8a -t x86_64 \
-            -o ../app/src/rust/jniLibs \
+            -o ../app/android/app/src/main/jniLibs \
             build --release --lib
+          find ../app/android/app/src/main/jniLibs -name '*.so'
 
       - name: Build the APK
         working-directory: app
@@ -223,8 +229,19 @@ jobs:
         working-directory: app
         shell: pwsh
         run: |
-          $exe = Get-ChildItem -Path build\windows -Recurse -Filter '*.exe' |
-                 Where-Object { $_.Name -notlike '*flutter*' } | Select-Object -First 1
+          # Look ONLY under runner/Release. A recursive search across
+          # build/windows catches CMake's compiler-detection stub
+          # (CMakeFiles/.../CompilerIdCXX.exe, 15 KB), which an earlier
+          # revision mistook for the app and then rejected as "implausibly
+          # small" — a correct check aimed at the wrong file.
+          $release = Join-Path (Get-Location) 'build\windows\x64\runner\Release'
+          if (-not (Test-Path $release)) {
+            Write-Output "::error::no Release bundle at $release — flutter build windows produced nothing"
+            exit 1
+          }
+          $exe = Get-ChildItem -Path $release -Filter '*.exe' |
+                 Where-Object { $_.Name -notlike '*flutter*' } |
+                 Select-Object -First 1
           if (-not $exe) { Write-Output '::error::no EXE produced'; exit 1 }
           Write-Output "EXE: $($exe.FullName) ($($exe.Length) bytes)"
           if ($exe.Length -lt 100kb) {
@@ -234,8 +251,7 @@ jobs:
           # The engine must ship alongside the app. A missing DLL means the app
           # opens to a crash on first use, so check the whole bundle rather than
           # the Release directory alone.
-          $bundle = Split-Path (Split-Path $exe.FullName -Parent) -Parent
-          $dll = Get-ChildItem -Path $bundle -Recurse -Filter 'pixelsmith_core.dll' -ErrorAction SilentlyContinue |
+          $dll = Get-ChildItem -Path $release -Recurse -Filter 'pixelsmith_core.dll' |
                  Select-Object -First 1
           if (-not $dll) {
             Write-Output '::error::pixelsmith_core.dll is not in the bundle'
