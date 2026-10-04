@@ -25,6 +25,27 @@ fn engine_exe() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_px-abi-dump"))
 }
 
+/// [`pixelsmith_core::sandbox::decode_sandboxed`] pointed at the engine binary.
+///
+/// `current_exe()` under `cargo test` is the *test* harness, which does not
+/// implement worker mode, so the production entry point cannot be used here. An
+/// explicit path also avoids setting an environment variable, which would race
+/// across the parallel test harness.
+fn decode_with_engine(
+    input: &[u8],
+    limits: &Limits,
+    memory_limit: u64,
+    timeout: Duration,
+) -> Result<pixelsmith_core::sandbox::Sandboxed, Error> {
+    pixelsmith_core::sandbox::decode_sandboxed_with(
+        &engine_exe(),
+        input,
+        limits,
+        memory_limit,
+        timeout,
+    )
+}
+
 /// A valid, compressible PNG.
 fn photo(w: u32, h: u32) -> Vec<u8> {
     let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
@@ -122,7 +143,7 @@ fn a_file_within_limits_succeeds_and_matches_the_in_process_path() {
     )
     .expect("encoding a decoded PNG cannot fail");
 
-    let sandboxed = decode_sandboxed(
+    let sandboxed = decode_with_engine(
         &input,
         &limits,
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -140,7 +161,7 @@ fn a_file_within_limits_succeeds_and_matches_the_in_process_path() {
 #[test]
 fn the_sandbox_reports_the_dimensions_the_image_actually_has() {
     for (w, h) in [(1u32, 1u32), (17, 33), (200, 150)] {
-        let sandboxed = decode_sandboxed(
+        let sandboxed = decode_with_engine(
             &photo(w, h),
             &Limits::mobile(),
             DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -159,6 +180,12 @@ fn the_sandbox_reports_the_dimensions_the_image_actually_has() {
 // 2. A file over the memory cap fails with the memory error, not a generic one
 // ---------------------------------------------------------------------------
 
+// `RLIMIT_AS` is a Unix facility. On Windows the equivalent is a job object,
+// which this phase does not implement - see the `apply_memory_limit` note in
+// `sandbox.rs`. So these two are Unix-only rather than silently passing on a
+// platform where no ceiling is applied at all, which would be the worst outcome:
+// a green test asserting containment that does not exist.
+#[cfg(unix)]
 #[test]
 fn a_file_over_the_memory_cap_reports_memory_not_a_generic_failure() {
     // A ceiling far below what decoding this needs. The parent sets it, the child
@@ -166,7 +193,7 @@ fn a_file_over_the_memory_cap_reports_memory_not_a_generic_failure() {
     let input = photo(512, 512);
     let tiny_ceiling = 1024 * 1024; // 1 MiB
 
-    let err = decode_sandboxed(
+    let err = decode_with_engine(
         &input,
         &Limits::mobile(),
         tiny_ceiling,
@@ -191,11 +218,12 @@ fn a_file_over_the_memory_cap_reports_memory_not_a_generic_failure() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_memory_refusal_is_distinguishable_from_a_rejected_file() {
     let input = photo(256, 256);
 
-    let memory = decode_sandboxed(
+    let memory = decode_with_engine(
         &input,
         &Limits::mobile(),
         1024 * 1024,
@@ -203,7 +231,7 @@ fn a_memory_refusal_is_distinguishable_from_a_rejected_file() {
     )
     .expect_err("must fail under a 1 MiB ceiling");
 
-    let rejected = decode_sandboxed(
+    let rejected = decode_with_engine(
         b"this is not an image at all".as_ref(),
         &Limits::mobile(),
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -220,7 +248,7 @@ fn a_memory_refusal_is_distinguishable_from_a_rejected_file() {
 
 #[test]
 fn an_invalid_file_is_reported_as_the_file_and_names_the_limit() {
-    let err = decode_sandboxed(
+    let err = decode_with_engine(
         b"\x89PNG\r\n\x1a\n truncated right after the signature",
         &Limits::mobile(),
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -290,7 +318,7 @@ fn a_timeout_kills_the_child_rather_than_leaving_it_running() {
     // completes normally on a fast one. Either way the parent returns, which is
     // the property that matters - a leaked worker outlives the UI's patience.
     let started = Instant::now();
-    let result = decode_sandboxed(
+    let result = decode_with_engine(
         &photo(400, 400),
         &Limits::mobile(),
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -345,7 +373,7 @@ fn a_worker_panic_does_not_kill_the_parent() {
     assert!(!run.status.success());
 
     // The parent is demonstrably fine: it decodes another file normally.
-    let ok = decode_sandboxed(
+    let ok = decode_with_engine(
         &photo(32, 32),
         &Limits::mobile(),
         DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -595,7 +623,7 @@ fn many_invocations_leak_neither_processes_nor_descriptors() {
     let limits = Limits::mobile();
 
     for i in 0..24 {
-        let result = decode_sandboxed(
+        let result = decode_with_engine(
             &input,
             &limits,
             DEFAULT_MOBILE_MEMORY_LIMIT,
@@ -721,3 +749,29 @@ fn the_worker_entry_point_is_reachable_and_exits_cleanly() {
 }
 
 use std::io::Write as _;
+
+/// The two memory-ceiling tests are Unix-only. On Windows `RLIMIT_AS` does not
+/// exist and the equivalent job object is not implemented yet, so
+/// `apply_memory_limit` is a no-op there. Gating the tests is deliberate: leaving
+/// them ungated would produce a green assertion about containment that is not
+/// present on that platform, which is worse than no test at all.
+#[cfg(not(unix))]
+#[test]
+fn the_memory_ceiling_is_unix_only_and_windows_is_not_claimed_to_have_one() {
+    // The honest statement on Windows: the in-process `Limits` are the
+    // containment, and the process-level ceiling is not implemented.
+    let limits = Limits::mobile();
+    assert!(limits.check_header(60_000, 60_000).is_err());
+    assert!(
+        pixelsmith_core::sandbox::decode_sandboxed_with(
+            &engine_exe(),
+            &photo(16, 16),
+            &limits,
+            1024 * 1024,
+            DEFAULT_TIMEOUT,
+        )
+        .is_ok(),
+        "without a process ceiling this must succeed - if it failed, some other \
+         limit is in play and the Unix-only gate above is hiding a real failure"
+    );
+}

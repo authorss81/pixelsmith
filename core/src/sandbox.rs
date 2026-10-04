@@ -173,6 +173,23 @@ pub fn decode_sandboxed(
     timeout: Duration,
 ) -> Result<Sandboxed> {
     let exe = worker_executable()?;
+    decode_sandboxed_with(&exe, input, limits, memory_limit, timeout)
+}
+
+/// [`decode_sandboxed`] against a named worker binary.
+///
+/// Split out because `current_exe()` is the *test* binary when this runs under
+/// `cargo test`, and a test binary does not implement worker mode - it would
+/// re-run the whole suite in a loop. An explicit path is also the only way to
+/// test without mutating a process-global environment variable, which would race
+/// across the parallel test harness.
+pub fn decode_sandboxed_with(
+    exe: &std::path::Path,
+    input: &[u8],
+    limits: &Limits,
+    memory_limit: u64,
+    timeout: Duration,
+) -> Result<Sandboxed> {
     let job = Job {
         input: input.to_vec(),
         max_memory_bytes: memory_limit,
