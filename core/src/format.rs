@@ -786,9 +786,7 @@ fn webp_encode_error(err: webp::WebPEncodingError) -> Error {
         E::VP8_ENC_ERROR_INVALID_CONFIGURATION => {
             "was given settings libwebp rejected, which is an engine bug"
         }
-        E::VP8_ENC_ERROR_BAD_DIMENSION => {
-            "is larger than WebP can store (16383 pixels a side)"
-        }
+        E::VP8_ENC_ERROR_BAD_DIMENSION => "is larger than WebP can store (16383 pixels a side)",
         E::VP8_ENC_ERROR_PARTITION0_OVERFLOW | E::VP8_ENC_ERROR_PARTITION_OVERFLOW => {
             "has detail that does not fit in WebP's block structure"
         }
@@ -1338,7 +1336,10 @@ mod tests {
         // empty buffer that happens to be small.
         let back = image::load_from_memory(&lossy).unwrap();
         assert_eq!((back.width(), back.height()), (600, 400));
-        assert!(!webp_is_lossy_bitstream(&lossless), "the comparison must be real");
+        assert!(
+            !webp_is_lossy_bitstream(&lossless),
+            "the comparison must be real"
+        );
     }
 
     #[cfg(feature = "webp-lossy")]
@@ -1346,20 +1347,12 @@ mod tests {
     fn webp_quality_ten_is_smaller_than_quality_ninety_five() {
         let img = photo(600, 400);
         for format in [OutputFormat::WebP, OutputFormat::Jpeg] {
-            let small = encode(
-                &img,
-                format,
-                EncodingOptions::default().with_quality(10),
-            )
-            .unwrap()
-            .len();
-            let large = encode(
-                &img,
-                format,
-                EncodingOptions::default().with_quality(95),
-            )
-            .unwrap()
-            .len();
+            let small = encode(&img, format, EncodingOptions::default().with_quality(10))
+                .unwrap()
+                .len();
+            let large = encode(&img, format, EncodingOptions::default().with_quality(95))
+                .unwrap()
+                .len();
             assert!(
                 large > small,
                 "{format:?}: q95 ({large}) should exceed q10 ({small})"
@@ -1422,11 +1415,10 @@ mod tests {
             "every pixel is 255, so the packed path applies"
         );
 
-        let one_transparent = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
-            8,
-            8,
-            |_, _| image::Rgba([10, 20, 30, 254]),
-        ));
+        let one_transparent =
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(8, 8, |_, _| {
+                image::Rgba([10, 20, 30, 254])
+            }));
         assert!(
             !is_opaque(&to_rgba8(&one_transparent)),
             "a single sub-opaque pixel has to switch the whole picture to RGBA"
@@ -1570,13 +1562,14 @@ mod tests {
         // export, which is worse than not offering one.
         let img = photo(600, 400);
         for target in [20_000u64, 60_000, 150_000] {
-            let (bytes, quality, met) = crate::TargetBytes::new(target).encode_with(
-                &img,
-                OutputFormat::WebP,
-                EncodingOptions::default(),
-                &crate::target::default_encoder,
-            )
-            .unwrap();
+            let (bytes, quality, met) = crate::TargetBytes::new(target)
+                .encode_with(
+                    &img,
+                    OutputFormat::WebP,
+                    EncodingOptions::default(),
+                    &crate::target::default_encoder,
+                )
+                .unwrap();
             assert!(
                 met,
                 "{target} bytes was not reachable at any quality ({} bytes at q{quality})",

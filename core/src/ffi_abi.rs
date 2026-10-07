@@ -420,11 +420,18 @@ mod tests {
     /// that skipped the comparison instead would be green forever and would catch
     /// nothing.
     ///
-    /// See `workspace/phase-05/FINDINGS.md`.
-    const KNOWN_DART_DRIFT: &[&str] = &[
-        "px_inspect: Dart declares 2 arguments, the engine takes 3",
-        "px_abi_layout: no Dart declaration",
-    ];
+    /// **Empty, and that is the point.** It held two entries — `px_inspect`
+    /// declared two arguments against the engine's three, and `px_abi_layout` was
+    /// declared nowhere — recorded in `workspace/phase-05/FINDINGS.md`. Both were
+    /// fixed in `app/` at `5d0e9cc` and the superproject pointer was moved in
+    /// `9435636`. The list is emptied here rather than left to rot, which is the
+    /// second half of that deal: the drift test exists to fail the moment either
+    /// side moves, and a stale entry would have made it fail for the opposite
+    /// reason.
+    ///
+    /// If a future entry appears here, it is a real boundary defect and needs the
+    /// same treatment: fix it in `app/`, push, move the pointer, empty the entry.
+    const KNOWN_DART_DRIFT: &[&str] = &[];
 
     #[test]
     fn every_exported_symbol_is_in_the_table() {

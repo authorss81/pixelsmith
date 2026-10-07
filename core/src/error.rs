@@ -48,7 +48,11 @@ pub enum Error {
     /// person rather than libwebp's numeric code. Separate from `Encode` because
     /// the encoder is not `image`, and because `webp`'s errors arrive as bare C
     /// enum constants that say nothing about what to do next.
-    #[error("this image cannot be written as WebP because {0}")]
+    ///
+    /// The reason is a clause, not a sentence: the period is here rather than in
+    /// each of libwebp's twelve codes, so `Error::Webp` renders as one sentence
+    /// however it was constructed.
+    #[error("this image cannot be written as WebP because {0}.")]
     Webp(&'static str),
 
     #[error("output could not be written: {0}")]
