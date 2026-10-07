@@ -20,7 +20,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | `d815024` | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
 | phase-08 | Lossy WebP via libwebp, verified on every target | DONE | `374e6ed` | See [phase-08 notes](#phase-08-notes) below. The two prior attempts failed on a pre-existing gate defect, not on their work. |
-| phase-09 | SIMD resize path behind a feature flag | DONE | (this commit) | See [phase-09 notes](#phase-09-notes) below. |
+| phase-09 | SIMD resize path behind a feature flag | DONE | `e906fa6` | See [phase-09 notes](#phase-09-notes) below. |
 | phase-10 | Benchmarks and a performance regression gate | PENDING | | |
 | phase-11 | Low-peak-memory decode for very large images | PENDING | | |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
