@@ -364,9 +364,11 @@ pub fn resize_to(img: &image::DynamicImage, spec: ResizeSpec) -> Result<image::D
         spec.filter.to_imageops()
     };
 
-    // `imageops::resize` is generic over the concrete buffer, so normalise the
-    // result back into a DynamicImage at exactly one place.
-    let resized = image::DynamicImage::from(image::imageops::resize(img, w, h, filter));
+    // `resize` owns the kernel choice: the reference implementation from
+    // `image`, or `fast_image_resize` when the `simd` feature is on. Both are
+    // one pass, and the filter chosen above is what both receive, so the two
+    // kernels cannot disagree about which filter an extreme reduction uses.
+    let resized = crate::resize::resample(img, w, h, filter);
     if spec.fit == FitMode::Cover {
         let x = resized.width().saturating_sub(w) / 2;
         let y = resized.height().saturating_sub(h) / 2;

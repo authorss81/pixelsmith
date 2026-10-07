@@ -121,6 +121,44 @@ heic = ["dep:heic-rs"]
 # cannot imply a round trip it cannot make.
 avif = ["image/avif"]
 
+# SIMD resize, OFF by default. `fast_image_resize` is pure Rust with runtime CPU
+# detection, no C toolchain, no build script and no nasm, so unlike `webp-lossy`
+# it costs nothing at build time on any target; what it costs is a second code
+# path that has to be proved to agree with the reference, and that is what phase-09
+# spent its time on rather than on the build.
+#
+# Off by default because a second resampling kernel is a permanent maintenance
+# cost and the benchmark that would justify flipping it does not exist yet. The
+# reference kernel in `image` stays the default and stays the correctness oracle:
+# `resize::resample_reference` is the thing the SIMD path is measured against,
+# so deleting it would delete the only way to check the other one. See
+# docs/BENCHMARKS.md for the measured difference and docs/ARCHITECTURE.md for
+# the module.
+#
+# `only_u8x4` drops every convolution kernel except U8x4. `resize::simd`
+# normalises to RGBA8 before calling, which is not a limitation imposed on it —
+# `image::imageops::resize` on a `DynamicImage` already goes through
+# `GenericImageView`, whose associated `Pixel` is `Rgba<u8>`, so the reference
+# has always produced RGBA8 whatever the source buffer type was. The flag
+# therefore removes code this build can never call, and nothing else.
+simd = ["dep:fast_image_resize", "fast_image_resize/only_u8x4"]
+
+[dependencies.fast_image_resize]
+# SIMD convolution resampler. Chosen over `libvips` deliberately: libvips is a
+# C library with a build script and a large native toolchain requirement, and it
+# would be paid on every target to accelerate one operation. MIT OR Apache-2.0,
+# matching the engine, so it needs no entry in deny.toml's licence list.
+#
+# `default-features = false` with an explicit `std`: the default feature set is
+# `std`, and the crate is `no_std` otherwise. `image` is NOT enabled — the
+# optional integration is the one thing this tree must not take, because it
+# would put a second `image` version in the tree and hard rule 1 wants the
+# engine's dependency graph small and legible.
+version = "6.1"
+optional = true
+default-features = false
+features = ["std"]
+
 [dependencies.webp]
 # Safe bindings to libwebp, the reference WebP implementation. `libwebp-sys`
 # vendors libwebp's own C source and compiles it with `cc`, so this is where the
