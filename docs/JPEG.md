@@ -37,8 +37,12 @@ the option the caller passed.
 | Licence | MIT OR Apache-2.0 | MIT OR Apache-2.0 |
 
 It is pure Rust with no build script, which is the same reason the `heic` feature
-and the `webp-lossy` feature are the *optional* ones and this is not: nothing
-here needs a C compiler, so nothing here has to be opt-in for CI to build it.
+is the one optional codec left, and is why `avif` — another pure-Rust encoder —
+could join `default` immediately. `webp-lossy` is the exception that proves the
+rule: it is in `default` too, because it vendors libwebp's C source and pays
+`cc` for 159 files, which is ~39 seconds on a cold release build and not a new
+toolchain. `docs/ARCHITECTURE.md` has that argument; the point here is narrower,
+which is that nothing about *JPEG* needs opt-in now.
 
 The one genuine cost is that `image` cannot read back what `jpeg-encoder` writes
 through its own JPEG decoder — it can, actually, but the engine does not rely on

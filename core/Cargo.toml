@@ -66,8 +66,16 @@ default = ["avif", "webp-lossy"]
 # generator. That is the line that mattered: `avif` and `jpeg-encoder` are pure
 # Rust and need none of this, and `webp-lossy` was off for a long time for the
 # C-toolchain reason. Now that a CI job builds it for every shipped target
-# (`.github/workflows/build.yml`, the `webp-lossy-matrix` job), keeping it off
-# would mean shipping an encoder the matrix has not checked.
+# keeping it off would mean shipping an encoder the matrix has not checked.
+#
+# That job is NOT in the tree yet: `workspace/phase-08/build-webp-lossy-matrix.patch`
+# adds a `webp-lossy-matrix` job to `.github/workflows/build.yml` for Linux x64,
+# Windows x64 and arm64, macOS x64 and arm64, Android arm64 and x86_64, and iOS
+# arm64, but this pipeline's push credential is refused `workflows` permission on
+# that path — the same class of limit as the `app/` submodule being unpushable.
+# Until it is applied, the honest statement is the one the phase prompt asks for:
+# lossy WebP is claimed for no target, because no CI job builds it yet. See
+# `docs/phase-status.md` under phase-08.
 #
 # The fallback is kept deliberately, and is not dead code: a target that cannot
 # compile C can still write WebP, just losslessly, and `is_lossless` reports that

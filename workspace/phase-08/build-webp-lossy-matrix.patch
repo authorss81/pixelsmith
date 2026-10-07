@@ -1,0 +1,133 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 614a8ac..83e8e42 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -40,7 +40,14 @@ jobs:
+   gate:
+     name: verify.sh
+     runs-on: ubuntu-latest
+-    timeout-minutes: 20
++    # 30, not 20. verify.sh grew once `webp-lossy` joined the default feature
++    # set: libwebp's 159 vendored .c files are compiled by `cc` on the way to every
++    # one of clippy, the tests, the release build and the docs, and the
++    # `presets_convert_to_working_pipelines` test alone is about four minutes of
++    # it. A gate that times out reports "timed out" for a tree that was fine,
++    # which is the same unreadable-red the rest of this file keeps trying to
++    # avoid.
++    timeout-minutes: 30
+     steps:
+       - uses: actions/checkout@v5
+         with:
+@@ -397,4 +404,111 @@ jobs:
+             core/target/${{ matrix.target }}/release/*.dylib
+             core/target/${{ matrix.target }}/release/*.a
+           if-no-files-found: warn
++          retention-days: 14
++
++  # ---------------------------------------------------------------------------
++  # `webp-lossy` on every shipped target.
++  #
++  # A separate job from `engine-matrix` rather than an extra dimension on it,
++  # because the thing being checked is not "the engine cross-compiles" but
++  # "the encoder that phase-08 put in the *default* build links on this target".
++  # `webp-lossy` is in `default` now, so `engine-matrix` does compile it — but a
++  # future feature split, a `default-features = false` edit, or a vendored
++  # `libwebp-sys` bump would quietly stop that, and the failure would surface on a
++  # user's device rather than here. Naming the feature in a job of its own is
++  # what makes it a check rather than an accident of the default set.
++  #
++  # `--features webp-lossy` is spelled out even though it is already a default,
++  # deliberately: if the flag is ever dropped from `default` this job still builds
++  # it, and the default build stops claiming lossy WebP rather than losing it
++  # silently.
++  #
++  # Windows arm64 gets its own runner because there is no cross path: the MSVC
++  # ARM64 libraries are not on an x64 runner, so a job that tried to build it from
++  # `windows-latest` would fail for a toolchain reason and teach nobody anything.
++  webp-lossy-matrix:
++    name: webp-lossy ${{ matrix.target }}
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 45
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
++          - { target: x86_64-pc-windows-msvc, os: windows-latest }
++          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
++          - { target: x86_64-apple-darwin, os: macos-latest }
++          - { target: aarch64-apple-darwin, os: macos-latest }
++          - { target: aarch64-linux-android, os: ubuntu-latest }
++          - { target: x86_64-linux-android, os: ubuntu-latest }
++          - { target: aarch64-apple-ios, os: macos-latest }
++    steps:
++      - uses: actions/checkout@v5
++
++      - name: Install cargo-ndk
++        if: contains(matrix.target, 'android')
++        run: cargo install cargo-ndk
++
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: ${{ matrix.target }}
++
++      - name: Build the engine with lossy WebP
++        working-directory: core
++        # bash on every platform: Windows runners default to PowerShell, which
++        # cannot parse the `[[ ]]` below.
++        shell: bash
++        run: |
++          if [[ "${{ matrix.target }}" == *android* ]]; then
++            # cargo ndk, not a bare --target: the NDK's linker is what makes the
++            # link step work, and libwebp-sys links a static archive into the
++            # cdylib, so an absent linker fails here rather than at package time.
++            if [[ "${{ matrix.target }}" == aarch64-linux-android ]]; then ABI=arm64-v8a; else ABI=x86_64; fi
++            cargo ndk -t "${ABI}" -o /tmp/px-webp-jni \
++              build --release --lib --features webp-lossy --target ${{ matrix.target }}
++            if [ -z "$(find /tmp/px-webp-jni -name 'libpixelsmith_core.so')" ]; then
++              echo "::error::no libpixelsmith_core.so produced for $ABI"
++              exit 1
++            fi
++            find /tmp/px-webp-jni -name '*.so' -printf '  %p %s bytes\n'
++          else
++            cargo build --release --lib --features webp-lossy --target ${{ matrix.target }}
++            # `--no-run` on the test binary, not a second `build`: linking the
++            # harness is what proves libwebp's symbols resolve for this target.
++            # `cargo build --lib` already links, but this links the same code
++            # through a different set of objects, and it is the one that would
++            # catch a WebP symbol that only the tests reference.
++            cargo test --release --lib --features webp-lossy \
++              --target ${{ matrix.target }} --no-run
++          fi
++
++# Only where the tests can actually run. A cross-compiled test binary
++      # cannot execute, so this is the *host* half of the same claim: that
++      # libwebp links is not the same that libwebp works, and eight targets
++      # that link with nothing ever running them would be a claim nobody made.
++      #
++      # The whole lib suite minus the one slow test, rather than a `webp` filter:
++      # four of the WebP tests do not have the word in their names, so a filter
++      # would quietly stop covering the packed-RGB path and the alpha case, and
++      # the filter would need editing every time a test is added.
++      # `presets_convert_to_working_pipelines` is 41 Lanczos3 resamples of a
++      # 4000x3000 image — about four minutes of debug-build CPU, and it is about
++      # geometry rather than codecs.
++      - name: Run the tests against libwebp on this runner
++        if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'android')
++        working-directory: core
++        shell: bash
++        run: |
++          cargo test --lib --features webp-lossy -- \
++            --skip presets_convert_to_working_pipelines
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: webp-lossy-${{ matrix.target }}
++          path: |
++            core/target/${{ matrix.target }}/release/*.so
++            core/target/${{ matrix.target }}/release/*.dll
++            core/target/${{ matrix.target }}/release/*.dylib
++            core/target/${{ matrix.target }}/release/*.a
++          if-no-files-found: warn
+           retention-days: 14
+\ No newline at end of file

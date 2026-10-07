@@ -60,7 +60,7 @@ places and a Dart model.
 
 | Field | Default | Honoured by |
 | --- | --- | --- |
-| `quality` | 85 | JPEG; AVIF and lossy WebP where those encoders are compiled in. Ignored everywhere else. |
+| `quality` | 85 | JPEG; AVIF and lossy WebP, both of whose encoders are in the default build. Ignored everywhere else. |
 | `progressive` | `false` | JPEG only. |
 | `chroma_subsampling` | `Luma420` | JPEG only. |
 
@@ -159,6 +159,64 @@ HEVC only, so `capabilities().avif_decode` is `false` and a UI must not imply a
 round trip it cannot make. Writing a format you cannot read is still worth it —
 the file leaves the device and the user opens it in a browser — but the capability
 list is where that difference is stated, not left to be discovered.
+
+### WebP: on by default, and it costs a C toolchain
+
+The `webp-lossy` feature was off for most of this project's life for one reason:
+libwebp is C. It is still the reason it is a *feature* rather than a hard
+dependency, and phase-08's judgement call was whether to move it into `default`.
+It is in `default` now.
+
+**What it bought.** Lossless WebP has no quality setting and no byte ceiling, so
+the format could only be an also-ran: measured on the 600×400
+`format::tests::photo` fixture, **101,656 bytes lossless against 2,638 at q80**.
+That is 39×, and it is why `web-hero`, `web-card` and `web-thumb` were exporting
+with their byte ceilings silently dropped by `to_pipeline` — the UI showed a
+number the engine was not trying to meet. With the encoder in the build those
+ceilings are kept, the quality slider does something, and
+`format::tests::webp_byte_ceilings_are_reachable` proves the search can actually
+meet them rather than reporting `target_met: false` forever.
+
+**What it costs.** `libwebp-sys` vendors libwebp's own C source and compiles it
+with `cc`. On this CI runner, a cold `cargo build --release --lib` is 55 s without
+the feature and 1 m 34 s with it — **39 extra seconds**, and no new toolchain to
+install: `cc` is the same compiler already building the Rust code. No CMake, no
+nasm, no code generator. That is the line that mattered, because it is the reason
+`avif` and `jpeg-encoder` are pure Rust and pay none of this, and it is why
+`webp-lossy` was worth revisiting when `avif` had already shown that a codec does
+not have to be free to be in the default set.
+
+**What makes the claim checkable — and what does not yet.** The
+`webp-lossy-matrix` job that does this is written but **not in the tree**:
+`workspace/phase-08/build-webp-lossy-matrix.patch` adds it to
+`.github/workflows/build.yml`, for Linux x64, Windows x64 and arm64, macOS x64
+and arm64, Android arm64 and x86_64, and iOS arm64, building the crate with
+`--features webp-lossy`, linking the test binary with `--no-run` because that is
+what proves libwebp's symbols resolve, and running the suite on the Linux x64
+runner so the claim is not eight targets that link and nothing that runs.
+
+It cannot be applied by this pipeline. The push credential is refused
+`workflows` permission on `.github/workflows/`, which is the same class of limit
+as the `app/` submodule being unpushable (see phase-05), and adding
+`workflows: write` to `automation.yml`'s own `permissions:` block would need a
+workflow push to take effect.
+
+**So the honest position today is the phase prompt's own rule: do not claim lossy
+WebP on a target whose CI job does not build it.** The encoder is in the default
+build and `verify.sh` runs it on Linux x64 on every push, which is one target
+genuinely built and tested. The other seven are a patch away and are not claimed
+until it lands. `engine-matrix` does compile the default feature set, so a
+cross-compilation break on another target would still show up there — but a
+*silent* stop of the encoder being compiled would not, which is precisely what
+the dedicated job is for.
+
+**What stays behind the flag.** The `#[cfg(not(feature = "webp-lossy"))]` arm of
+`encode_webp` is kept, not deleted. It is the configuration a target with no C
+toolchain builds, it is what the capability flags are written against, and
+`is_lossless` reports the truth for it —
+`format::tests::webp_reports_the_truth_about_this_build` asserts all four facts
+(capability flag, `is_lossless`, `supports_quality`, and the actual VP8/VP8L
+chunk in the output) agree, in *both* configurations.
 
 ## The fixed transform order: crop → orient → resize
 
@@ -315,17 +373,22 @@ Buffer ownership, in full:
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codecs below are off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
-| `webp-lossy` | off | Swaps in the `webp` crate (libwebp) for lossy WebP. Off by default so the pure-Rust build needs no C toolchain and compiles fast in CI; with it off, WebP output is lossless. |
-| `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default until phase-08 has cross-compiled it for all four shipped targets; CI builds it on every run because CI uses `--all-features`. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
+| `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codec below was off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
+| `webp-lossy` | **on** | Lossy WebP *write*, through the `webp` crate (libwebp, the reference encoder). On since phase-08: without it WebP is lossless, so there is no quality control and no byte ceiling — measured on the 600×400 `format::tests::photo` fixture, 101,656 bytes lossless against 2,638 at q80, which is 39× and the difference between a resizer whose WebP export is worth choosing and one where it is an also-ran. What it costs is a C toolchain: `libwebp-sys` compiles 159 vendored `.c` files with `cc`, about 39 s on a cold release build of this crate — no CMake, no nasm, no code generator, and `cc` is the same compiler already building the Rust. The per-target matrix that checks it is `workspace/phase-08/build-webp-lossy-matrix.patch`, not yet applied; see the WebP section above. With the feature off, WebP output is lossless again and `is_lossless()` says so. |
+| `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default, and the reason is now stated rather than deferred: phase-08 was the phase this flag waited for, and what it actually did was turn on `webp-lossy` instead — the reason recorded here was "an opt-in feature that has never been cross-compiled is a promise nobody has checked", and that check still has not happened for `heic`, because the `webp-lossy-matrix` job does not build it. Enabling it would put the flag in front of a target matrix nothing has run against. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
-`default = ["avif"]`. `lib::capabilities()` is generated from these flags, so
-adding a codec means adding a flag *and* a field there — a capability the UI
-cannot see is a capability the UI will offer and then fail at export time. The
-HEIC flag is `heic_decode`, deliberately not an encode flag: the engine can read
-HEIC and cannot write it, and one boolean cannot honestly say both. AVIF is the
-same shape inverted — `avif_encode` on, `avif_decode` off, because this tree has
-no AV1 decoder in any configuration.
+`default = ["avif", "webp-lossy"]`. `lib::capabilities()` is generated from
+these flags, so adding a codec means adding a flag *and* a field there — a
+capability the UI cannot see is a capability the UI will offer and then fail at
+export time. The HEIC flag is `heic_decode`, deliberately not an encode flag: the
+engine can read HEIC and cannot write it, and one boolean cannot honestly say
+both. AVIF is the same shape inverted — `avif_encode` on, `avif_decode` off,
+because this tree has no AV1 decoder in any configuration. `webp_lossy` is the
+one flag whose value is a *build* property rather than a format property:
+`OutputFormat::is_lossless(WebP)` is `!lossy_webp_enabled()`, so a build without
+the feature reports the knob as inert rather than offering a slider that changes
+nothing. Both configurations are asserted by
+`format::tests::webp_reports_the_truth_about_this_build`.
 
 ## Gotchas
 
@@ -341,12 +404,45 @@ named so you can check the handling rather than re-derive it.
    is counter-clockwise, and the enum is named for what it does, not for the
    number. Handled in `core/src/pipeline.rs` (`Orientation::from_exif`,
    `Orientation::apply`).
-3. **WebP output is lossless unless the `webp-lossy` feature is on**, which means
-   no quality control and no byte ceiling: `supports_quality()` and
-   `supports_byte_target()` are both false, so a "fit under N bytes" request
-   silently degrades to a fixed encode. Handled in `core/src/format.rs`
+3. **`OutputFormat::is_lossless(WebP)` is a property of the *build*, not of the
+   format.** With `webp-lossy` on — the default since phase-08 — WebP is lossy, the
+   quality slider does something and a byte ceiling can be met. Without it the
+   pure-Rust lossless encoder is the only one compiled in, so
+   `supports_quality()` and `supports_byte_target()` are both false and a "fit
+   under N bytes" request would silently degrade to a fixed encode. The two facts
+   are one `cfg!` (`lossy_webp_enabled`) read by both, so the capability list and
+   the encoder cannot disagree. Handled in `core/src/format.rs`
    (`lossy_webp_enabled`, `encode_webp`) and reported honestly by
-   `core/src/lib.rs` (`capabilities()`).
+   `core/src/lib.rs` (`capabilities()`). The `#[cfg(not(feature =
+   "webp-lossy"))]` arm is kept rather than deleted: it is the configuration the
+   capability flags are written for, and it is what a target with no C toolchain
+   would build.
+4. **libwebp stops at 16383 pixels a side, and `validate::Limits` stops at 30000.**
+   An 18 000 × 200 panorama therefore passes every limit the engine applies,
+   decodes, resizes — and then dies inside the encoder. `webp::Encoder::encode`
+   unwraps internally, so reaching that point used to be a hard crash, which hard
+   rule 3 forbids on bytes the user picked off their disk; `encode_simple` returns
+   the error instead, and `check_webp_dimensions` refuses first with a sentence
+   naming the limit and a format that can do it. Handled in `core/src/format.rs`
+   (`check_webp_dimensions`, `WEBP_MAX_DIMENSION`).
+5. **Handing libwebp `from_rgba` for an opaque picture costs a copy and a scan,
+   and nothing at all in the output.** The obvious reading — that dropping the
+   constant alpha plane first makes the *file* smaller — is false: measured at
+   q10 through q100, the packed-RGB and RGBA encodes are byte-identical, because
+   libwebp detects the constant alpha plane and discards it before compressing.
+   The optimisation is kept anyway (25% less input, 3 bytes per pixel instead of
+   4 on every opaque export) and asserted as an **equality**, which is what makes
+   it a test rather than a hope. `format::tests::the_packed_rgb_path_is_used_for_opaque_pictures_and_matches_the_rgba_path_byte_for_byte`
+   also asserts the fixture is genuinely opaque, because `exif::strip` returns an
+   `ImageRgba8` unconditionally and a `has_alpha()` test would have taken the
+   four-channel path on every export forever. Handled in `core/src/format.rs`
+   (`is_opaque`, `encode_webp_lossy_rgb`).
+6. **`webp` 0.3 is the only published line and it is not a maintained crate**
+   (last release 2019). `cargo add webp@1` fails with "could not be found in
+   registry index". It is recorded in `deny.toml` rather than hidden, and it is
+   still the right pick because it is the only binding to the *reference*
+   encoder — the output every browser and CDN is tested against. Handled in
+   `core/Cargo.toml` (`[dependencies.webp]`).
 4. **`image::imageops::resize` returns an `ImageBuffer`, not a `DynamicImage`.**
    It is generic over the concrete buffer, so the result has to be normalised
    back with `DynamicImage::from` at exactly one place. Handled in

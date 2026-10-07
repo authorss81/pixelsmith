@@ -31,6 +31,22 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `Capabilities::jpeg_progressive` and `Capabilities::jpeg_chroma_subsampling`,
   derived from the same predicates the UI reads per format rather than written
   as constants, so the list cannot describe a build that no longer exists.
+- **Lossy WebP, on by default.** The `webp-lossy` feature is in `default`, writing
+  through `webp` (libwebp, the reference encoder). Until now WebP output was
+  lossless, which meant no quality setting and no byte ceiling: 101,656 bytes
+  against 2,638 at q80 on the 600×400 `format::tests::photo` fixture, 39×. The
+  `web-hero`, `web-card` and `web-thumb` presets were exporting with their byte
+  ceilings dropped by `to_pipeline`; they are kept now, and
+  `format::tests::webp_byte_ceilings_are_reachable` proves the search meets them.
+  What it costs is a C toolchain — `libwebp-sys` compiles 159 vendored `.c` files
+  with `cc`, about 39 s on a cold release build, and no new compiler. The
+  per-target matrix that checks it is
+  `workspace/phase-08/build-webp-lossy-matrix.patch` — Linux x64, Windows x64 and
+  arm64, macOS x64 and arm64, Android arm64 and x86_64, and iOS arm64 — and it is
+  **not applied yet**, because this pipeline cannot push to `.github/workflows/`.
+  Until it is, lossy WebP is claimed for Linux x64 only, which is the one target
+  the gate really builds and runs it on. The lossless fallback is kept and
+  `is_lossless()` reports the truth for a build without the feature.
 
 ### Changed
 
@@ -50,12 +66,31 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rather than returning an oversized file with `target_met: true`. A *quality*
   value on the same format is still ignored: one global slider sits above the
   format picker, and refusing every PNG export because of it would be absurd.
+- **WebP encodes through libwebp on an opaque picture.** `from_rgb` is used rather
+  than `from_rgba` when no pixel is less than fully opaque — 25% less input handed
+  to the encoder. The *file* is byte-identical either way, because libwebp drops a
+  constant alpha plane itself; `format::tests` asserts the equality rather than the
+  smaller-than claim the phase prompt asked for, with the measurement attached.
+- **A picture over 16383 px a side is refused for WebP.** `validate::Limits` allows
+  30000 and libwebp stops at 16383, so an 18000×100 panorama passed every limit,
+  decoded and resized, and then died inside `webp::Encoder::encode`, which unwraps
+  internally. `encode_simple` returns the error instead and `check_webp_dimensions`
+  refuses first, naming the limit and a format that can do it.
 
 ### Known limitations
 
 - **AVIF cannot be read back.** Recognised on input by brand bytes, refused by
   name on decode, and reported as `avif_decode: false`. AV1 decode is a second
   codec and is not in this tree.
+- **HEIC cannot be decoded in the default build.** Recognised by `ftyp` brand bytes
+  without any feature, bounded from the `ispe` property before the codec allocates,
+  and reported as `heic_decode: false`. The `heic` feature is off because nothing
+  has cross-compiled it for the shipped targets, and the `webp-lossy-matrix` job
+  does not build it.
+- **WebP has no chroma setting.** Not an unwired knob: libwebp's `WebPConfig` has
+  29 fields and none is a chroma sampling factor, because VP8 always stores 4:2:0.
+  `supports_chroma_subsampling()` reports `false` rather than offering a slider
+  that cannot move.
 
 ## [0.1.0]
 

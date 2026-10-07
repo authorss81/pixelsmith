@@ -28,7 +28,9 @@ and then writes the next set of phases from a self-audit.
 ## What the engine does today
 
 - Decode JPEG, PNG, WebP, GIF, TIFF, BMP, ICO.
-- Encode JPEG, PNG, WebP, GIF, TIFF, BMP, ICO.
+- Encode JPEG, PNG, WebP, GIF, TIFF, BMP, ICO — plus AVIF, and **lossy WebP
+  through libwebp** in the default build, so a byte ceiling and a quality slider
+  both work for WebP.
 - Resize with five resampling kernels, five fit modes, one resampling pass.
 - **Target-size mode**: give it a byte ceiling and it binary-searches quality to
   land just under it, returning the highest quality that fits. Converges in about
@@ -41,8 +43,8 @@ and then writes the next set of phases from a self-audit.
 - Never trust a filename. Format comes from magic bytes; output names are
   sanitised against path traversal.
 
-Not yet: HEIC decode, lossy WebP, colour management, animation preservation,
-AVIF decode. Each has a phase.
+Not yet: HEIC decode, colour management, animation preservation, AVIF decode.
+Each has a phase.
 
 ## Running it
 

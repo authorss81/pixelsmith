@@ -778,6 +778,45 @@ mod tests {
     }
 
     #[test]
+    fn the_web_presets_keep_their_ceilings_because_this_build_can_enforce_them() {
+        // What phase-08 bought. `to_pipeline` drops a ceiling from a format with
+        // no quality setting, and WebP had no quality setting while
+        // `webp-lossy` was off — so `web-hero`, `web-card` and `web-thumb` were
+        // exporting with the ceiling silently absent, which means the UI showed
+        // a number the engine was not trying to meet.
+        //
+        // Asserted by name as well as by rule, because the rule alone would
+        // still pass on a build where WebP went back to being lossless: the
+        // per-preset half is what turns "the encoder exists" into "these three
+        // exports have their ceiling".
+        for id in ["web-hero", "web-card", "web-thumb"] {
+            let p = find_preset(id).unwrap_or_else(|| panic!("no such preset: {id}"));
+            assert_eq!(p.format, OutputFormat::WebP, "{id} is not a WebP preset");
+            assert!(p.max_bytes.is_some(), "{id} lost its ceiling");
+            assert!(
+                p.format.supports_byte_target(),
+                "{id} keeps a ceiling, but this build cannot enforce one — \
+                 is webp-lossy still in the default feature set?"
+            );
+            let (_, _, _, max_bytes) = to_pipeline(p);
+            assert_eq!(
+                max_bytes, p.max_bytes,
+                "{id}'s ceiling is being dropped on the way to the pipeline"
+            );
+        }
+
+        // The other WebP presets carry no ceiling at all, and must keep it that
+        // way rather than acquiring one from this list.
+        for p in PRESETS
+            .iter()
+            .filter(|p| p.format == OutputFormat::WebP && p.max_bytes.is_none())
+        {
+            let (_, _, _, max_bytes) = to_pipeline(p);
+            assert_eq!(max_bytes, None, "{} invented a ceiling", p.id);
+        }
+    }
+
+    #[test]
     fn byte_ceilings_are_plausible() {
         for p in PRESETS {
             if let Some(limit) = p.max_bytes {
