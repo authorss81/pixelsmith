@@ -9,28 +9,37 @@
 //!
 //! * [`resample_reference`] is `image`'s pure-Rust implementation. It is the
 //!   default, it is never deleted, and it is the correctness oracle.
-//! * `simd::try_resample` is `fast_image_resize`, behind the `simd` feature. It
-//!   is opt-in because a second kernel is a permanent maintenance cost and the
-//!   measurement that would justify making it the default does not exist yet
-//!   (docs/BENCHMARKS.md).
+//! * [`try_resample_simd`] is `fast_image_resize`, behind the `simd` feature. It
+//!   is opt-in because a second kernel is a permanent maintenance cost, and the
+//!   measurement is in docs/BENCHMARKS.md.
 //!
 //! The SIMD path falls back to the reference whenever it cannot serve a
 //! request, including when it returns an error. That is deliberate: an opt-in
 //! optimisation must not be able to fail a resize the default build performs.
 //! It cannot add a resampling pass either — the fallback *is* the pass.
+//!
+//! All three functions are public, and that is for the benchmark rather than
+//! for callers: `docs/BENCHMARKS.md` is only meaningful if the numbers came
+//! from the same entry points production uses, and `resample_reference` in
+//! particular has to be callable without the `simd` feature for the two columns
+//! to be produced by one build.
 
 use image::DynamicImage;
 use image::imageops::FilterType;
 
 /// Perform the one resampling pass, through whichever kernel this build has.
-pub(crate) fn resample(
+///
+/// This is the function `pipeline::resize_to` calls, and the only resampling
+/// call in the crate. It is public so a benchmark or a caller that wants to
+/// measure this build's kernel has the same entry point production uses.
+pub fn resample(
     img: &DynamicImage,
     width: u32,
     height: u32,
     filter: FilterType,
 ) -> DynamicImage {
     #[cfg(feature = "simd")]
-    if let Some(out) = simd::try_resample(img, width, height, filter) {
+    if let Some(out) = try_resample_simd(img, width, height, filter) {
         return out;
     }
     resample_reference(img, width, height, filter)
@@ -45,7 +54,7 @@ pub(crate) fn resample(
 /// `Pixel = Rgba<u8>`. `reference_output_is_always_rgba8` pins that, because
 /// the SIMD kernel below relies on it: normalising to RGBA8 there costs nothing
 /// that is not already being paid here.
-pub(crate) fn resample_reference(
+pub fn resample_reference(
     img: &DynamicImage,
     width: u32,
     height: u32,
@@ -54,102 +63,99 @@ pub(crate) fn resample_reference(
     DynamicImage::from(image::imageops::resize(img, width, height, filter))
 }
 
-/// The SIMD kernel. Behind `simd`, and never the default until docs/BENCHMARKS.md
-/// says otherwise.
+/// The SIMD kernel, or `None` to mean "use the reference kernel instead".
+///
+/// `None` covers a filter this crate deliberately does not take (`Nearest`; see
+/// `algorithm_for`) and an error out of the resizer. There is no `unwrap` on
+/// either: the buffers are built from widths and heights this crate has already
+/// resolved, but they still come from a caller, and hard rule 3 is about
+/// callers.
+///
+/// Public because [`resample`] falls back on `None` and a benchmark has to be
+/// able to time the SIMD kernel on its own — otherwise the two columns in
+/// docs/BENCHMARKS.md would be "SIMD" and "SIMD, sometimes", which is not a
+/// comparison.
 #[cfg(feature = "simd")]
-mod simd {
-    use super::{DynamicImage, FilterType};
+pub fn try_resample_simd(
+    img: &DynamicImage,
+    width: u32,
+    height: u32,
+    filter: FilterType,
+) -> Option<DynamicImage> {
     use fast_image_resize::images::{Image as FirImage, ImageRef};
-    use fast_image_resize::{
-        FilterType as FirFilter, PixelType, ResizeAlg, ResizeOptions, Resizer,
+    use fast_image_resize::{PixelType, Resizer};
+
+    let options = simd_options(filter)?;
+    // Normalise to RGBA8 once, here, rather than in a match over buffer types
+    // per call. See `resample_reference`: the reference kernel already returns
+    // RGBA8 for every input type, so this is not a narrowing of what the
+    // pipeline can handle — it is the same conversion, done once and in one
+    // place instead of per branch.
+    let src = img.to_rgba8();
+    let src_view = ImageRef::new(src.width(), src.height(), src.as_raw(), PixelType::U8x4).ok()?;
+    let mut dst = FirImage::new(width, height, PixelType::U8x4);
+    Resizer::new().resize(&src_view, &mut dst, &options).ok()?;
+    let buffer = dst.into_vec();
+    Some(DynamicImage::ImageRgba8(image::RgbaImage::from_raw(
+        width, height, buffer,
+    )?))
+}
+
+/// Options for one filter, or `None` to mean "the reference kernel handles this
+/// one".
+///
+/// Straight alpha, to match the reference. `image`'s kernel filters the four
+/// channels independently and never premultiplies; this crate defaults to
+/// premultiplying. Premultiplied alpha is the better answer for a transparent
+/// PNG, but changing how transparency is resampled is a decision rather than an
+/// optimisation, and it would make this flag a behaviour change instead of a
+/// speed one. It belongs in the colour-management phase, applied to both
+/// kernels.
+#[cfg(feature = "simd")]
+fn simd_options(filter: FilterType) -> Option<fast_image_resize::ResizeOptions> {
+    simd_algorithm_for(filter)
+        .map(|alg| fast_image_resize::ResizeOptions::new().resize_alg(alg).use_alpha(false))
+}
+
+/// `image`'s five filters onto this crate's kernels.
+///
+/// `image::imageops::FilterType` is not `#[non_exhaustive]`, so this match is
+/// exhaustive and adding a variant upstream is a compile error here rather than
+/// a filter that silently keeps using the reference.
+///
+/// **`Nearest` returns `None`, and it is not because the kernel is missing.**
+/// Both crates implement nearest-neighbour; they disagree about *which* source
+/// pixel a destination pixel takes when the destination sample lands exactly
+/// halfway between two source pixels, and there is no tolerance that covers
+/// that, because the difference is a whole source pixel rather than a rounding
+/// step.
+///
+/// `image` computes the source position directly as `(y + 0.5) * ratio`
+/// (`imageops::sample::vertical_sample`). `fast_image_resize` walks the rows by
+/// accumulating `y += step` (`images::typed_image::iter_rows_with_step`) and
+/// truncating, so accumulated `f64` error decides the tie instead of the exact
+/// value. Measured on a 4x4 row-ramp upscaled to 6x6, `image` picks source rows
+/// `[0, 1, 1, 2, 3, 3]` and `fast_image_resize` picks `[0, 1, 1, 2, 2, 3]` — the
+/// row where `(3 + 0.5) * (4/6)` is exactly `3.0` and the accumulated
+/// `0.3333… + 3 × 0.6666…` is `2.9999999999999996`.
+///
+/// That matters more than a blur would. `ResampleFilter::Nearest` is documented
+/// for pixel art and icons, where a pixel that moves is a visible defect rather
+/// than a soft edge. Routing it to the reference keeps this flag a speed
+/// change: the four convolution filters get the SIMD kernel, and pixel art gets
+/// exactly the pixels it got before. Reinstating it needs a `fast_image_resize`
+/// fix, not a tolerance.
+#[cfg(feature = "simd")]
+fn simd_algorithm_for(filter: FilterType) -> Option<fast_image_resize::ResizeAlg> {
+    use fast_image_resize::{FilterType as FirFilter, ResizeAlg};
+    let algorithm = match filter {
+        FilterType::Nearest => return None,
+        FilterType::Triangle => ResizeAlg::Convolution(FirFilter::Bilinear),
+        FilterType::CatmullRom => ResizeAlg::Convolution(FirFilter::CatmullRom),
+        FilterType::Gaussian => ResizeAlg::Convolution(FirFilter::Gaussian),
+        FilterType::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
     };
-    use image::RgbaImage;
-
-    /// Resample through `fast_image_resize`, or return `None` to mean "use the
-    /// reference kernel instead".
-    ///
-    /// `None` covers a filter this crate deliberately does not take (`Nearest`;
-    /// see `algorithm_for`) and an error out of the resizer. There is no
-    /// `unwrap` on either: the buffers are built from widths and heights this
-    /// crate has already resolved, but they still come from a caller, and hard
-    /// rule 3 is about callers.
-    pub(super) fn try_resample(
-        img: &DynamicImage,
-        width: u32,
-        height: u32,
-        filter: FilterType,
-    ) -> Option<DynamicImage> {
-        let options = options_for(filter)?;
-        // Normalise to RGBA8 once, here, rather than in a match over buffer
-        // types per call. See `resample_reference`: the reference kernel already
-        // returns RGBA8 for every input type, so this is not a narrowing of
-        // what the pipeline can handle — it is the same conversion, done once
-        // and in one place instead of per branch.
-        let src = img.to_rgba8();
-        let src_view =
-            ImageRef::new(src.width(), src.height(), src.as_raw(), PixelType::U8x4).ok()?;
-        let mut dst = FirImage::new(width, height, PixelType::U8x4);
-        Resizer::new().resize(&src_view, &mut dst, &options).ok()?;
-        let buffer = dst.into_vec();
-        Some(DynamicImage::ImageRgba8(RgbaImage::from_raw(
-            width, height, buffer,
-        )?))
-    }
-
-    /// Options for one filter, or `None` to mean "the reference kernel handles
-    /// this one".
-    ///
-    /// Straight alpha, to match the reference. `image`'s kernel filters the four
-    /// channels independently and never premultiplies; this crate defaults to
-    /// premultiplying. Premultiplied alpha is the better answer for a
-    /// transparent PNG, but changing how transparency is resampled is a decision
-    /// rather than an optimisation, and it would make this flag a behaviour
-    /// change instead of a speed one. It belongs in the colour-management phase,
-    /// applied to both kernels.
-    fn options_for(filter: FilterType) -> Option<ResizeOptions> {
-        algorithm_for(filter).map(|alg| ResizeOptions::new().resize_alg(alg).use_alpha(false))
-    }
-
-    /// `image`'s five filters onto this crate's kernels.
-    ///
-    /// `image::imageops::FilterType` is not `#[non_exhaustive]`, so this match
-    /// is exhaustive and adding a variant upstream is a compile error here
-    /// rather than a filter that silently keeps using the reference.
-    ///
-    /// **`Nearest` returns `None`, and it is not because the kernel is missing.**
-    /// Both crates implement nearest-neighbour; they disagree about *which*
-    /// source pixel a destination pixel takes when the destination sample lands
-    /// exactly halfway between two source pixels, and there is no tolerance that
-    /// covers that, because the difference is a whole source pixel rather than a
-    /// rounding step.
-    ///
-    /// `image` computes the source position directly as `(y + 0.5) * ratio`
-    /// (`imageops::sample::vertical_sample`). `fast_image_resize` walks the rows
-    /// by accumulating `y += step` (`images::typed_image::iter_rows_with_step`)
-    /// and truncating, so accumulated `f64` error decides the tie instead of the
-    /// exact value. Measured on a 4x4 row-ramp upscaled to 6x6, `image` picks
-    /// source rows `[0, 1, 1, 2, 3, 3]` and `fast_image_resize` picks
-    /// `[0, 1, 1, 2, 2, 3]` — the row where `(3 + 0.5) * (4/6)` is exactly `3.0`
-    /// and the accumulated `0.3333… + 3 × 0.6666…` is `2.9999999999999996`.
-    ///
-    /// That matters more than a blur would. `ResampleFilter::Nearest` is
-    /// documented for pixel art and icons, where a pixel that moves is a
-    /// visible defect rather than a soft edge, and on a 300x200 to 450x300
-    /// upscale the two disagree on **19% of destination pixels**. Routing
-    /// `Nearest` to the reference keeps this flag a speed change: the four
-    /// convolution filters get the SIMD kernel, and pixel art gets exactly the
-    /// pixels it got before. Reinstating it needs a `fast_image_resize` fix, not
-    /// a tolerance.
-    fn algorithm_for(filter: FilterType) -> Option<ResizeAlg> {
-        let algorithm = match filter {
-            FilterType::Nearest => return None,
-            FilterType::Triangle => ResizeAlg::Convolution(FirFilter::Bilinear),
-            FilterType::CatmullRom => ResizeAlg::Convolution(FirFilter::CatmullRom),
-            FilterType::Gaussian => ResizeAlg::Convolution(FirFilter::Gaussian),
-            FilterType::Lanczos3 => ResizeAlg::Convolution(FirFilter::Lanczos3),
-        };
-        Some(algorithm)
-    }
+    Some(algorithm)
 }
 
 #[cfg(test)]
