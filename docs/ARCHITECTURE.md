@@ -9,8 +9,8 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Twelve modules, no submodules, no circular references. Dependencies point downward:
-`lib.rs` → `worker.rs` / `pipeline.rs` → `validate.rs` / `heic.rs` → `error.rs`.
+Thirteen modules, one submodule, no circular references. Dependencies point downward:
+`lib.rs` → `worker.rs` / `pipeline.rs` → `resize.rs` → `validate.rs` / `heic.rs` → `error.rs`.
 Nothing below `error.rs` knows anything exists above it.
 
 | Module | Owns | Key types |
@@ -21,6 +21,7 @@ Nothing below `error.rs` knows anything exists above it.
 | `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
 | `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
+| `core/src/resize.rs` | The single resampling pass and the two kernels that can perform it: `image`'s reference implementation (the default, and the oracle) and `fast_image_resize` behind the `simd` feature. Exists so hard rule 5 has exactly one call site and a benchmark times the same entry point production uses. | `resample()`, `resample_reference()`, `simd::try_resample()` |
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
 | `core/src/presets.rs` | The preset catalogue, grouped by intent and carrying a `category` so the UI can present tabs. Custom values are always allowed. | `Preset`, `PRESETS`, `all_presets()`, `find_preset()`, `to_pipeline()` |
@@ -41,6 +42,8 @@ bytes off disk
                               (heic::header for HEIF, image header otherwise)
   → lib::decode_bounded        decoder limits applied, then decode, then re-check
   → pipeline::Pipeline::apply  crop → orient → resize (one resampling pass)
+  → resize::resample           the one resampling pass: reference kernel, or
+                              fast_image_resize when `simd` is on
   → exif::strip                re-encode from raw samples (drops EXIF for real)
   → target / format::encode    byte-target search, or a fixed-quality encode
   → format::append_exif        only if metadata was explicitly kept, JPEG only
@@ -242,7 +245,34 @@ that function and `apply` ever disagree, the preview is lying.
 
 `resize_to` also drops to a `Triangle` filter for extreme reductions (target
 side below a third of the source's long side), because any convolution kernel
-aliases badly when decimating that hard.
+aliases badly when decimating that hard. That filter choice is made *above* the
+kernel choice, so both implementations get the same `Triangle` for a 10000 → 50
+downscale and cannot disagree about which filter a hard reduction uses.
+
+### One pass, two kernels
+
+`resize::resample` is the single call site of hard rule 5. It picks between two
+implementations of the *same* filter, so there is never a question of which filter
+ran — only of which code did it.
+
+| | `resample_reference` | `simd::try_resample` |
+| --- | --- | --- |
+| Implementation | `image::imageops::resize` | `fast_image_resize`, behind `simd` |
+| Default | yes | no |
+| Arithmetic | `f32` coefficients, `f32` accumulation, one `round()` at the end | coefficients quantised to `i16` scaled by `1 << precision`, `i32` accumulation, clipped by an arithmetic right shift |
+
+`try_resample` returns `Option`, and `None` means "the reference kernel handles
+this one". That is not only an error path: `Nearest` deliberately returns `None`
+(see gotcha 21), because the two crates disagree about which source pixel a
+destination sample takes on an exact tie and no tolerance covers a whole-pixel
+difference. So the flag is a speed change for four of the five filters and a
+no-op for the fifth — which is what "the SIMD kernel is faster" has to mean if it
+is to be true of a pixel-art export.
+
+`resample_reference` is public and stays public. It is the oracle the tests check
+the SIMD kernel against and the second column of `docs/BENCHMARKS.md`, so it
+cannot be private, and it is never on a schedule for deletion: with `simd` on by
+default it becomes the fallback, and with `simd` off it is the only kernel.
 
 ## Limits: where they are enforced
 
@@ -375,10 +405,14 @@ Buffer ownership, in full:
 | --- | --- | --- |
 | `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codec below was off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
 | `webp-lossy` | **on** | Lossy WebP *write*, through the `webp` crate (libwebp, the reference encoder). On since phase-08: without it WebP is lossless, so there is no quality control and no byte ceiling — measured on the 600×400 `format::tests::photo` fixture, 101,656 bytes lossless against 2,638 at q80, which is 39× and the difference between a resizer whose WebP export is worth choosing and one where it is an also-ran. What it costs is a C toolchain: `libwebp-sys` compiles 159 vendored `.c` files with `cc`, about 39 s on a cold release build of this crate — no CMake, no nasm, no code generator, and `cc` is the same compiler already building the Rust. The per-target matrix that checks it is `workspace/phase-08/build-webp-lossy-matrix.patch`, not yet applied; see the WebP section above. With the feature off, WebP output is lossless again and `is_lossless()` says so. |
+| `simd` | off | The resize *kernel*, not a format: `pipeline::resize_to` calls `resize::resample`, which uses `image`'s implementation unless this is on, in which case `fast_image_resize` performs the same pass. Pure Rust with runtime CPU detection — no C toolchain, no nasm, no code generation — which is why it costs 10 s on a cold release build where `webp-lossy` costs 39 s. Measured 2.6× to 19.9× on the reference kernel's own workload, agreeing to within one least-significant bit per channel on photographic content (`docs/BENCHMARKS.md`). Off by default because every one of those numbers is x86-64 AVX2 and the crate dispatches on runtime CPU features, so the speedup on the ARM phone this ships to is unmeasured; flipping the default is phase-10's call with an ARM machine in the room. With it off, every byte this engine produces is identical — `image`'s kernel is still the only kernel compiled in, and it is still the oracle the SIMD path is checked against. |
 | `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default, and the reason is now stated rather than deferred: phase-08 was the phase this flag waited for, and what it actually did was turn on `webp-lossy` instead — the reason recorded here was "an opt-in feature that has never been cross-compiled is a promise nobody has checked", and that check still has not happened for `heic`, because the `webp-lossy-matrix` job does not build it. Enabling it would put the flag in front of a target matrix nothing has run against. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
-`default = ["avif", "webp-lossy"]`. `lib::capabilities()` is generated from
-these flags, so adding a codec means adding a flag *and* a field there — a
+`default = ["avif", "webp-lossy"]`. `simd` is deliberately not in it, and it
+is also deliberately not in `lib::capabilities()`: it changes no format's
+readability or writability, so a field there would be a capability the UI has
+nothing to do with. `lib::capabilities()` is generated from the format flags,
+so adding a codec means adding a flag *and* a field there — a
 capability the UI cannot see is a capability the UI will offer and then fail at
 export time. The HEIC flag is `heic_decode`, deliberately not an encode flag: the
 engine can read HEIC and cannot write it, and one boolean cannot honestly say
@@ -552,7 +586,38 @@ named so you can check the handling rather than re-derive it.
     is ~0.5 s in the same build, which is fast enough not to matter. Neither is a
     regression, but a `cargo test` that takes minutes rather than seconds is
     worth recognising as normal before someone tries to speed the codecs up.
-
+21. **Two nearest-neighbour samplers disagree about which pixel to take, and no
+    tolerance covers it.** `image` computes the source position directly as
+    `(y + 0.5) * ratio`; `fast_image_resize` accumulates `y += step` in `f64` and
+    truncates, so accumulated rounding decides an exact tie. Measured on a 4×4
+    row-ramp upscaled to 6×6: `image` takes source rows `[0, 1, 1, 2, 3, 3]`,
+    `fast_image_resize` takes `[0, 1, 1, 2, 2, 3]` — the row where
+    `(3 + 0.5) × (4/6)` is exactly `3.0` and the accumulated sum is
+    `2.9999999999999996`. That is a whole source pixel, not a rounding step, so
+    the SIMD kernel returns `None` for `Nearest` and the reference handles it.
+    `ResampleFilter::Nearest` is documented for pixel art, where a pixel that
+    moves is a visible defect. Handled in `core/src/resize.rs`
+    (`simd::algorithm_for`), pinned by
+    `resize::tests::simd_agreement::the_two_nearest_implementations_really_do_disagree`,
+    which fails the moment either crate changes.
+22. **The SIMD kernel's per-channel tolerance (29) is barely below the wrong
+    kernel's (31), so the maximum alone cannot detect a mis-mapped filter.** Both
+    figures are measured, on `resize::tests`'s deliberately hard fixture, which
+    puts a 2-pixel checkerboard in a quarter of the frame — and Lanczos3's four
+    negative lobes turn that edge into the overshoot where a coefficient
+    quantised to `i16` has the most leverage. The mean separates cleanly (0.48
+    against 1.17), so the cross-check asserts *both*, per filter, from a table
+    whose worst-case floors are themselves measured in the suite
+    (`a_wrong_kernel_always_lands_outside_the_tolerance`). Handled in
+    `core/src/resize.rs` (`simd_agreement::TOLERANCES`).
+23. **`fast_image_resize` dispatches at runtime, so its speedup is a property of
+    the CPU, not of the crate.** `cpu_extensions.rs` picks AVX2, else SSE4.1,
+    else scalar. Every number in `docs/BENCHMARKS.md` is x86-64 AVX2 on a CI
+    runner, and the crate does not expose which path it took, so the benchmark
+    harness reproduces that decision by reading `/proc/cpuinfo`. A number from
+    this file quoted as "the SIMD resize kernel is 8× faster" without the ISA is
+    a claim about a runner, not about the phone this engine ships to. Handled in
+    `core/examples/resize_bench.rs` (`machine()`).
 
 ## Verification
 

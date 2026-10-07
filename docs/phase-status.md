@@ -20,7 +20,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-06 | HEIC/HEIF decode | DONE | (this commit) | See [phase-06 notes](#phase-06-notes) below. The `app/` half is a patch, as in phase-05. |
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | `d815024` | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
 | phase-08 | Lossy WebP via libwebp, verified on every target | DONE | `374e6ed` | See [phase-08 notes](#phase-08-notes) below. The two prior attempts failed on a pre-existing gate defect, not on their work. |
-| phase-09 | SIMD resize path behind a feature flag | PENDING | | |
+| phase-09 | SIMD resize path behind a feature flag | DONE | (this commit) | See [phase-09 notes](#phase-09-notes) below. |
 | phase-10 | Benchmarks and a performance regression gate | PENDING | | |
 | phase-11 | Low-peak-memory decode for very large images | PENDING | | |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
@@ -708,6 +708,84 @@ Dart. The flag's *value* changes from `false` to `true`; its name does not.
 - **`heic` is still off by default**, which was the phase prompt's own fallback
   plan. The `webp-lossy-matrix` job does not build it, so the "nothing is opt-in
   and uncross-compiled" claim does not yet hold for HEIC.
+
+## phase-09 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with `--all-features`.
+
+**What was added.** `core/src/resize.rs`, holding the single resampling pass and
+the two kernels that can perform it: `image`'s `imageops::resize` as the default
+and the oracle, and `fast_image_resize` behind a new `simd` feature that is **off**
+by default. `pipeline::resize_to` now calls `resize::resample` instead of reaching
+for `imageops::resize` directly, so hard rule 5 has exactly one call site and a
+benchmark times the same entry point production uses.
+
+**Measured, and it is a big win — on the wrong CPU.** On an x86-64 AVX2 CI runner,
+against a photographic fixture, the SIMD kernel is 2.6x faster on a 4000-to-400
+thumbnail, 4.5x on a 24 MP-to-400 downscale, 7.1x on a 24 MP-to-1920 export and
+19.9x on an upscale, agreeing to within one least-significant bit per channel on
+every one of those cases. It also costs 10 s on a cold release build against the 39 s
+`webp-lossy` costs, because it is pure Rust with runtime CPU detection and no C
+toolchain. `docs/BENCHMARKS.md` has the table, the machine and the command.
+
+**The reason it is off anyway is the ISA.** `fast_image_resize` dispatches on
+runtime CPU features, so a phone on ARM runs a different kernel and the speedup
+there is unmeasured. Turning the default on from an x86 runner is turning it on from
+the wrong machine. Flipping it is phase-10's call with an ARM box in the room.
+
+**`Nearest` is refused outright, not approximated.** The two crates disagree about
+which source pixel a destination sample takes when it lands exactly halfway between
+two, because `image` computes `(y + 0.5) * ratio` while `fast_image_resize`
+accumulates `y += step` in `f64` and truncates. Measured on a 4x4 row-ramp upscaled
+to 6x6: `image` takes rows `[0, 1, 1, 2, 3, 3]`, the SIMD crate takes
+`[0, 1, 1, 2, 2, 3]`. That is a whole source pixel, not a rounding step, so no
+tolerance covers it — and `ResampleFilter::Nearest` is documented for pixel art,
+where a moved pixel is a visible defect. So the flag is a speed change for four of
+the five filters and a bit-for-bit no-op for the fifth.
+
+**The tolerance table was the hard part, and the first numbers were wrong.** An
+earlier attempt in this phase recorded a worst-case per-channel difference of 9.
+Re-measured across all four convolution filters and eight size pairs it is **29**,
+on `Lanczos3` at a 1.5:1 upscale — not at a downscale, and not on a hard
+checkerboard edge as the earlier comment claimed. The upscale is where the two
+kernels part company because that is where Lanczos3's four negative lobes ring, and
+that is where a coefficient quantised to `i16` has the most leverage.
+
+The more interesting finding is that **29 is barely below 31**, which is what the
+nearest *wrong* kernel produces on the same fixture (`Triangle` against `Gaussian`).
+So a per-channel maximum cannot, on this fixture, tell "same kernel, different
+arithmetic" apart from "adjacent filter", and no tolerance value fixes that — it is
+a property of the fixture, which puts a 2-pixel checkerboard in a quarter of the
+frame on purpose. The mean separates cleanly (0.48 against 1.17), so the cross-check
+asserts **both**, per filter, and
+`a_wrong_kernel_always_lands_outside_the_tolerance` measures the wrong-kernel floors
+inside the suite so the table cannot rot under a future `image` release.
+
+**What was not done, deliberately.**
+
+- The default kernel is unchanged, as the phase prompt required.
+- `libvips` was not pulled in. It would have vectorised more, and would have paid a
+  C library with a real build script on all four shipped targets to accelerate one
+  operation in a chain that is mostly decode and encode.
+- No second resampling pass was introduced anywhere, and the extreme-reduction
+  `Triangle` fallback stays above the kernel choice so both kernels get the same
+  filter for a 10000-to-50 downscale. That case has its own test
+  (`an_extreme_reduction_agrees_on_its_own_tolerance`).
+- `simd` was deliberately **not** added to `lib::capabilities()`. It changes no
+  format's readability or writability, so a field there would be a capability the
+  UI has nothing to do with.
+
+**Known limits of this phase's own claims.**
+
+- The build-time figure is one CI runner and the resize figures are one x86-64 AVX2
+  runner; neither has been reproduced anywhere else.
+- The two kernels agree to 1 LSB on *photographic* content. On the adversarial
+  fixture they do not agree to 1 LSB, and the table above is the honest account of
+  by how much. The `maxdiff` column in `docs/BENCHMARKS.md` is the realistic one;
+  the tolerance table is the adversarial one.
+- Alpha is filtered straight by both kernels, not premultiplied. That is a
+  deliberate match, not an oversight, and it belongs to phase-12's colour management
+  applied to both.
 
 ## Status values
 
