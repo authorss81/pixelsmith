@@ -44,6 +44,13 @@ pub enum Error {
     #[error("the JPEG encoder rejected these pixels: {0}")]
     Jpeg(#[source] jpeg_encoder::EncodingError),
 
+    /// The WebP encoder refused these pixels, carrying a reason written for a
+    /// person rather than libwebp's numeric code. Separate from `Encode` because
+    /// the encoder is not `image`, and because `webp`'s errors arrive as bare C
+    /// enum constants that say nothing about what to do next.
+    #[error("this image cannot be written as WebP because {0}")]
+    Webp(&'static str),
+
     #[error("output could not be written: {0}")]
     Io(#[source] io::Error),
 

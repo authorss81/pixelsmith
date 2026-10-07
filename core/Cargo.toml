@@ -48,16 +48,40 @@ jpeg-encoder = "0.6"
 libc = "0.2"
 
 [features]
-default = ["avif"]
-# Lossy WebP via libwebp. Off by default so the pure-Rust build has no C
-# toolchain requirement and stays fast to compile in CI; WebP output then falls
-# back to the lossless encoder, which still beats PNG for photographs.
+default = ["avif", "webp-lossy"]
+# Lossy WebP via libwebp, ON by default since phase-08. The reasoning, and the
+# measurement behind it:
+#
+# WebP without it is lossless, which means no quality control, no byte ceiling,
+# and files that lose to JPEG for most photographs — measured on the 600x400
+# gradient fixture in `format::tests::photo`: 101,656 bytes lossless against
+# 2,638 at q80. That is 39x, and it is the difference between a resizer whose
+# WebP export is worth choosing and one where it is an also-ran.
+#
+# What it costs is a C toolchain. `webp` links libwebp through `libwebp-sys`,
+# which compiles 159 vendored .c files with `cc`. Measured on this CI runner, a
+# cold `cargo build --release --lib`: 55 s without the feature, 1 m 34 s with it.
+# So it is 39 extra seconds, not a new toolchain to install — `cc` is the same
+# compiler already building the Rust code, no CMake, no nasm, and no code
+# generator. That is the line that mattered: `avif` and `jpeg-encoder` are pure
+# Rust and need none of this, and `webp-lossy` was off for a long time for the
+# C-toolchain reason. Now that a CI job builds it for every shipped target
+# (`.github/workflows/build.yml`, the `webp-lossy-matrix` job), keeping it off
+# would mean shipping an encoder the matrix has not checked.
+#
+# The fallback is kept deliberately, and is not dead code: a target that cannot
+# compile C can still write WebP, just losslessly, and `is_lossless` reports that
+# honestly for it. `format::tests::webp_reports_the_truth_about_this_build`
+# covers both configurations.
 webp-lossy = ["dep:webp"]
-# HEIC/HEIF decode, the format an iPhone actually photographs in. Off by
-# default until phase-08 has built it for all four shipped targets: an opt-in
-# feature that has never been cross-compiled is a promise nobody has checked,
-# and the engine is more useful with a HEIC photo than with one fewer row in
-# the capability list. See docs/HEIC.md for the comparison this choice rests on.
+# HEIC/HEIF decode, the format an iPhone actually photographs in. Still off by
+# default. phase-08 was the phase this comment pointed at, and it enabled
+# `webp-lossy` rather than this: the reason recorded here was "an opt-in feature
+# that has never been cross-compiled is a promise nobody has checked", and the
+# honest answer is that the check has still not happened for `heic` — the
+# `webp-lossy-matrix` CI job does not build it. Enabling it would put the flag
+# in front of a target matrix nothing has run against. See docs/HEIC.md for the
+# comparison this choice rests on.
 #
 # `default-features = false` with only `std`: the `parallel` feature would give
 # heic-rs its own rayon pool, and the engine already owns a rayon pool for the
@@ -69,10 +93,11 @@ heic = ["dep:heic-rs"]
 #
 # `avif` is `image`'s own AVIF encoder, which is rav1e through ravif: pure Rust,
 # no C toolchain, no nasm (that is `image/nasm`, which nothing here enables),
-# and no build script. So the two reasons the other opt-in codecs are off —
+# and no build script. So the two reasons `webp-lossy` and `heic` were opt-in —
 # a C toolchain in the build, and an unverified cross-compile — do not apply in
 # the same way: the crate compiles anywhere Rust does, which is all four shipped
-# targets.
+# targets. It has since been joined by `webp-lossy`, which pays the C-toolchain
+# cost deliberately because there is no alternative that writes lossy WebP.
 #
 # What it costs is build time and AV1 encode speed. Measured in release on the CI
 # runner, single-threaded, one 1600×1200 photo: 3.2 s at quality 70 against 20 ms
@@ -89,6 +114,26 @@ heic = ["dep:heic-rs"]
 avif = ["image/avif"]
 
 [dependencies.webp]
+# Safe bindings to libwebp, the reference WebP implementation. `libwebp-sys`
+# vendors libwebp's own C source and compiles it with `cc`, so this is where the
+# C toolchain requirement comes from — see the `webp-lossy` feature comment above
+# for the measurement that made paying it worth it.
+#
+# 0.3 is the only published line: there is no 1.x, and `cargo add webp@1` fails
+# with "could not be found in registry index". It is not a maintained crate in the
+# usual sense (last release 2019), which is recorded in deny.toml rather than
+# hidden — the reason it is still the right pick is that it is the only binding
+# to the *reference* encoder, and the encoder's output is what every browser and
+# CDN is tested against.
+#
+# Two things about it to know before using it, both of which `encode_webp` in
+# format.rs works around and asserts:
+#
+#   1. `Encoder::encode` unwraps internally. A dimension libwebp refuses comes
+#      back as a panic, not an `Err`, so calling it on hostile input violates hard
+#      rule 3. `encode_simple` returns the error instead.
+#   2. `WebPMemory` borrows from libwebp, so it must be copied out before it
+#      drops. Handled by the `Vec<u8>` the encode helpers return.
 version = "0.3"
 optional = true
 

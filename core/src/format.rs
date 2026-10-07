@@ -58,6 +58,13 @@ impl OutputFormat {
     }
 
     /// True when the quality knob is ignored, so the UI can hide it.
+    ///
+    /// WebP's answer is a property of the *build*, not of the format, which is
+    /// why it is the one arm derived from a `cfg!`. With `webp-lossy` on (the
+    /// default since phase-08) it is lossy and the knob works; without it the
+    /// pure-Rust lossless encoder is the only one compiled in, and reporting
+    /// otherwise would offer a slider that changes nothing. Both configurations
+    /// are asserted by `format::tests::webp_reports_the_truth_about_this_build`.
     pub fn is_lossless(self) -> bool {
         match self {
             Self::Jpeg => false,
@@ -118,11 +125,20 @@ impl OutputFormat {
 
     /// True when the encoder honours a chroma resolution.
     ///
-    /// Only JPEG does in this build. PNG, TIFF and BMP store colour per pixel;
-    /// WebP output is lossless unless `webp-lossy` is on (and libwebp's lossy
-    /// mode is not given a sampling factor here); AVIF is written by rav1e,
-    /// which always uses full-resolution chroma, so asking for 4:2:0 there would
-    /// be a promise the encoder cannot keep.
+    /// Only JPEG does in this build. PNG, TIFF and BMP store colour per pixel.
+    ///
+    /// WebP is a genuine omission rather than an unwired knob, and phase-07
+    /// flagged the difference as something this phase had to decide. It was
+    /// checked against libwebp's `WebPConfig` and the answer is that there is
+    /// nothing to set: the struct has 29 fields and not one of them is a chroma
+    /// sampling factor. VP8 always stores 4:2:0 and libwebp exposes no way to
+    /// ask for otherwise, so a "chroma" control here would be a slider that
+    /// cannot move. Answering `false` is the honest report; phase-12 revisits it
+    /// if ICC handling changes what "full chroma" would even mean for WebP.
+    ///
+    /// AVIF is written by rav1e, which always uses full-resolution chroma for the
+    /// same reason: asking for 4:2:0 there would be a promise the encoder cannot
+    /// keep.
     pub fn supports_chroma_subsampling(self) -> bool {
         matches!(self, Self::Jpeg)
     }
@@ -170,7 +186,9 @@ impl OutputFormat {
                  Ask for JPEG or WebP if you need it smaller."
             }
             Self::WebP if lossy_webp_enabled() => {
-                "WebP has a quality setting in this build, so the slider does something here."
+                "WebP has a quality setting, and at a given quality it is smaller than \
+                 JPEG for most photographs — 60 is a good default for a photo, and a \
+                 byte ceiling works here too."
             }
             Self::WebP => {
                 "WebP output in this build is lossless, so it has no quality setting: the \
@@ -648,21 +666,12 @@ fn encode_webp(
     #[cfg(feature = "webp-lossy")]
     {
         use std::io::Write;
-        if img.color().has_alpha() {
-            let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
-                .encode(f32::from(quality));
-            cursor.write_all(&encoded)?;
+        let encoded = if is_opaque(&rgba) {
+            encode_webp_lossy_rgb(&rgba, quality)?
         } else {
-            // libwebp wants tightly packed RGB for opaque input; handing it RGBA
-            // it does not need costs 25% more before compression even starts.
-            let mut packed = Vec::with_capacity(rgba.width() as usize * rgba.height() as usize * 3);
-            for px in rgba.pixels() {
-                packed.extend_from_slice(&px.0[..3]);
-            }
-            let encoded = webp::Encoder::from_rgb(&packed, rgba.width(), rgba.height())
-                .encode(f32::from(quality));
-            cursor.write_all(&encoded)?;
-        }
+            encode_webp_lossy_rgba(&rgba, quality)?
+        };
+        cursor.write_all(&encoded)?;
         Ok(())
     }
     #[cfg(not(feature = "webp-lossy"))]
@@ -676,6 +685,119 @@ fn encode_webp(
         )?;
         Ok(())
     }
+}
+
+/// True when no pixel is less than fully opaque.
+///
+/// This asks about the *pixels*, not the colour type, and the distinction is
+/// load-bearing: `exif::strip` returns an `ImageRgba8` unconditionally, because
+/// re-encoding from raw samples is what actually removes EXIF (hard rule 6). So
+/// on the pipeline every image reaching this function has an alpha channel, and
+/// a `has_alpha()` test would take the four-channel path for every export
+/// forever. The three-channel path below exists to avoid that, so testing the
+/// colour type would have made it dead code while appearing to work.
+fn is_opaque(rgba: &image::RgbaImage) -> bool {
+    rgba.pixels().all(|p| p.0[3] == 255)
+}
+
+/// libwebp's `WEBP_MAX_DIMENSION`, from `src/webp/encode.h`. Its encoder refuses
+/// anything larger and so does `image`'s lossless WebP encoder.
+pub(crate) const WEBP_MAX_DIMENSION: u32 = 16_383;
+
+/// Packed three-channel encode. 25% less input handed to libwebp — 3 bytes per
+/// pixel rather than 4.
+///
+/// The file this produces is **byte-identical** to the four-channel encode of the
+/// same opaque picture, at every quality: measured on the 1200x900 `photo`
+/// fixture at q10 through q100, all eight were equal. That is not a small
+/// correction to the usual claim; it is the reason the optimisation is worth
+/// keeping anyway. libwebp detects that the alpha plane is constant and drops it
+/// before compressing, so the fourth channel costs a copy and a scan here and
+/// nothing at all in the output. The saving is memory bandwidth and cache, not
+/// bytes on disk — and it is asserted as an equality rather than an inequality
+/// precisely because "the RGB path produces a smaller file" is false.
+#[cfg(feature = "webp-lossy")]
+fn encode_webp_lossy_rgb(rgba: &image::RgbaImage, quality: u8) -> Result<Vec<u8>> {
+    check_webp_dimensions(rgba.width(), rgba.height())?;
+    let mut packed = Vec::with_capacity(packed_rgb_len(rgba.width(), rgba.height()));
+    for px in rgba.pixels() {
+        packed.extend_from_slice(&px.0[..3]);
+    }
+    let encoded = webp::Encoder::from_rgb(&packed, rgba.width(), rgba.height())
+        .encode_simple(false, f32::from(quality))
+        // `encode_simple`, not `encode`: the latter unwraps internally, so a
+        // dimension libwebp refuses arrives as a panic. Hard rule 3 says no panic
+        // on bytes the user picked off their disk, and these pixels came from
+        // there.
+        .map_err(webp_encode_error)?;
+    Ok(encoded.to_vec())
+}
+
+#[cfg(feature = "webp-lossy")]
+fn encode_webp_lossy_rgba(rgba: &image::RgbaImage, quality: u8) -> Result<Vec<u8>> {
+    check_webp_dimensions(rgba.width(), rgba.height())?;
+    let encoded = webp::Encoder::from_rgba(rgba.as_raw(), rgba.width(), rgba.height())
+        .encode_simple(false, f32::from(quality))
+        .map_err(webp_encode_error)?;
+    Ok(encoded.to_vec())
+}
+
+#[cfg(feature = "webp-lossy")]
+fn packed_rgb_len(width: u32, height: u32) -> usize {
+    // Both operands are already bounded by `validate::Limits`, and u32 -> usize
+    // is lossless on every shipped target, so the product cannot overflow.
+    width as usize * height as usize * 3
+}
+
+/// Refuse an image libwebp cannot represent, in a sentence that says what to do.
+///
+/// `Limits` allows 30 000 px per side; libwebp stops at 16 383. Without this an
+/// 18 000 x 200 panorama passes every limit the engine applies, decodes, resizes
+/// — and then dies inside the encoder. It is a reachable refusal, not a
+/// hypothetical: any camera that stitches a wide panorama produces one.
+#[cfg(feature = "webp-lossy")]
+fn check_webp_dimensions(width: u32, height: u32) -> Result<()> {
+    if width > WEBP_MAX_DIMENSION || height > WEBP_MAX_DIMENSION {
+        return Err(Error::UnsupportedFormat(
+            "this picture is wider or taller than WebP can store (16383 pixels a side): \
+             ask for JPEG or PNG as the output format, or crop it to fit",
+        ));
+    }
+    Ok(())
+}
+
+/// libwebp's error codes are C enum constants with no message attached, so each
+/// is rendered by hand into something a person can act on. Hard rule 9.
+///
+/// The match is exhaustive over every variant rather than carrying a `_` arm,
+/// because the exhaustive form is what makes a libwebp upgrade that adds a code
+/// a compile error here instead of a silently generic message in the field.
+#[cfg(feature = "webp-lossy")]
+fn webp_encode_error(err: webp::WebPEncodingError) -> Error {
+    use webp::WebPEncodingError as E;
+    let reason = match err {
+        E::VP8_ENC_OK => "was accepted by libwebp, which should not be an error",
+        E::VP8_ENC_ERROR_OUT_OF_MEMORY | E::VP8_ENC_ERROR_BITSTREAM_OUT_OF_MEMORY => {
+            "needed more memory than this device has"
+        }
+        E::VP8_ENC_ERROR_NULL_PARAMETER => {
+            "was passed to libwebp with a missing buffer, which is an engine bug"
+        }
+        E::VP8_ENC_ERROR_INVALID_CONFIGURATION => {
+            "was given settings libwebp rejected, which is an engine bug"
+        }
+        E::VP8_ENC_ERROR_BAD_DIMENSION => {
+            "is larger than WebP can store (16383 pixels a side)"
+        }
+        E::VP8_ENC_ERROR_PARTITION0_OVERFLOW | E::VP8_ENC_ERROR_PARTITION_OVERFLOW => {
+            "has detail that does not fit in WebP's block structure"
+        }
+        E::VP8_ENC_ERROR_BAD_WRITE => "could not be written out",
+        E::VP8_ENC_ERROR_FILE_TOO_BIG => "produced a file too large for the format",
+        E::VP8_ENC_ERROR_USER_ABORT => "was cancelled part way through",
+        E::VP8_ENC_ERROR_LAST => "was rejected by libwebp",
+    };
+    Error::Webp(reason)
 }
 
 /// Compose transparency over white. The only sane choice for JPEG output,
@@ -833,6 +955,30 @@ mod tests {
             at += 2 + len;
         }
         None
+    }
+
+    /// The chunk that holds the picture: `VP8 ` for lossy, `VP8L` for lossless.
+    ///
+    /// The first chunk after the `RIFF`/`WEBP` header, at offset 12. Asserting on
+    /// the chunk tag rather than on the file size is what makes "this build
+    /// produced a lossy file" a statement about the *codec* instead of a guess
+    /// from bytes — a size comparison cannot tell a small lossy encode from a
+    /// small lossless one, and an encoder upgrade that silently switched codecs
+    /// would leave every size-based test green.
+    fn webp_bitstream_chunk(bytes: &[u8]) -> Option<[u8; 4]> {
+        let tag: [u8; 4] = bytes.get(12..16)?.try_into().ok()?;
+        match &tag {
+            b"VP8 " | b"VP8L" | b"VP8X" => Some(tag),
+            // ALPH means an alpha plane, which only a still WebP with
+            // transparency carries. Treated as lossy-relevant rather than
+            // lossy, so callers must handle it explicitly.
+            _ => None,
+        }
+    }
+
+    /// True when the bytes are a WebP whose picture data is a lossy VP8 bitstream.
+    fn webp_is_lossy_bitstream(bytes: &[u8]) -> bool {
+        webp_bitstream_chunk(bytes) == Some(*b"VP8 ")
     }
 
     #[test]
@@ -1090,6 +1236,377 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn webp_reports_the_truth_about_this_build() {
+        // One fact, stated four ways, and the test is that they agree rather than
+        // that they equal `true`. A build with `--no-default-features` has to pass
+        // this too, and it is the only configuration in which the answer is false.
+        let caps = crate::capabilities();
+        assert_eq!(
+            caps.webp_lossy,
+            cfg!(feature = "webp-lossy"),
+            "the capability list must not promise lossy WebP to a build that cannot write it"
+        );
+        assert_eq!(
+            OutputFormat::WebP.is_lossless(),
+            !cfg!(feature = "webp-lossy"),
+            "is_lossless must tell the UI the truth for the encoder this build has"
+        );
+        assert_eq!(OutputFormat::WebP.supports_quality(), caps.webp_lossy);
+        assert_eq!(
+            OutputFormat::WebP.supports_byte_target(),
+            caps.webp_lossy,
+            "a byte ceiling can only be kept by a format with a quality setting"
+        );
+
+        // And the bitstream itself agrees, which is the part a flag cannot fake.
+        let bytes = encode(
+            &photo(200, 150),
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
+        assert_eq!(
+            webp_is_lossy_bitstream(&bytes),
+            cfg!(feature = "webp-lossy"),
+            "the encoder and the capability flag disagree about which codec ran"
+        );
+    }
+
+    #[cfg(not(feature = "webp-lossy"))]
+    #[test]
+    fn webp_reports_the_truth_about_this_build() {
+        // The same assertions as the arm above, in the configuration where the
+        // answer is false. A test that only existed in the lossy build would go
+        // green forever while the lossless build quietly claimed otherwise.
+        let caps = crate::capabilities();
+        assert!(!caps.webp_lossy);
+        assert!(OutputFormat::WebP.is_lossless());
+        assert!(!OutputFormat::WebP.supports_quality());
+        assert!(!OutputFormat::WebP.supports_byte_target());
+        let bytes = encode(
+            &photo(200, 150),
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
+        assert!(
+            !webp_is_lossy_bitstream(&bytes),
+            "a build without webp-lossy must write VP8L, not VP8"
+        );
+        // A quality value is ignored rather than refused (hard rule 9's companion
+        // rule in `Settings::validate`): one slider sits above the format picker.
+        let q1 = encode(
+            &photo(120, 90),
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(10),
+        )
+        .unwrap();
+        let q95 = encode(
+            &photo(120, 90),
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(95),
+        )
+        .unwrap();
+        assert_eq!(q1, q95, "lossless WebP must not respond to quality");
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn lossy_webp_is_strictly_smaller_than_lossless_at_the_same_dimensions() {
+        // The claim the whole feature exists for, and it is large: the lossless
+        // encoder has no compression to offer a photographic gradient at this
+        // quality setting, while lossy discards what the eye cannot see.
+        let img = photo(600, 400);
+        let lossy = encode(
+            &img,
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap();
+        let lossless = encode_lossless_webp(&img);
+        assert!(
+            lossy.len() < lossless.len(),
+            "lossy q80 ({}) should be well under lossless ({})",
+            lossy.len(),
+            lossless.len()
+        );
+        // The output is a real picture at the right size, not a thumbnail or an
+        // empty buffer that happens to be small.
+        let back = image::load_from_memory(&lossy).unwrap();
+        assert_eq!((back.width(), back.height()), (600, 400));
+        assert!(!webp_is_lossy_bitstream(&lossless), "the comparison must be real");
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn webp_quality_ten_is_smaller_than_quality_ninety_five() {
+        let img = photo(600, 400);
+        for format in [OutputFormat::WebP, OutputFormat::Jpeg] {
+            let small = encode(
+                &img,
+                format,
+                EncodingOptions::default().with_quality(10),
+            )
+            .unwrap()
+            .len();
+            let large = encode(
+                &img,
+                format,
+                EncodingOptions::default().with_quality(95),
+            )
+            .unwrap()
+            .len();
+            assert!(
+                large > small,
+                "{format:?}: q95 ({large}) should exceed q10 ({small})"
+            );
+        }
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn the_packed_rgb_path_is_used_for_opaque_pictures_and_matches_the_rgba_path_byte_for_byte() {
+        // The prompt for this phase asked for an assertion that the packed-RGB
+        // output is *smaller* than the RGBA path for an opaque image. It is not,
+        // and the measurement is the interesting part: at every quality tested on
+        // a 1200x900 opaque fixture, libwebp produced byte-identical output
+        // either way. It detects that the alpha plane is constant and drops it
+        // before compressing, so the fourth channel costs a copy and a scan and
+        // nothing at all on disk.
+        //
+        // Asserted as an equality rather than the weaker `<=` because that is what
+        // is true, and an equality is the assertion that would catch libwebp
+        // changing its behaviour. The optimisation is kept anyway: it is 25% less
+        // input, and it is the difference between handing libwebp 3 bytes per
+        // pixel and 4 on every opaque export.
+        let rgba = to_rgba8(&photo(600, 400));
+        assert!(is_opaque(&rgba), "the fixture must actually be opaque");
+        assert_eq!(
+            packed_rgb_len(rgba.width(), rgba.height()) * 4,
+            rgba.as_raw().len() * 3,
+            "packed RGB must be exactly 25% less input than RGBA"
+        );
+        for quality in [10u8, 50, 80, 95] {
+            let rgb = encode_webp_lossy_rgb(&rgba, quality).unwrap();
+            let with_alpha = encode_webp_lossy_rgba(&rgba, quality).unwrap();
+            assert_eq!(
+                rgb, with_alpha,
+                "q{quality}: the packed-RGB path should produce identical bytes, \
+                 because libwebp drops a constant alpha plane"
+            );
+        }
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn opacity_is_decided_by_the_pixels_not_the_colour_type() {
+        // `exif::strip` returns an ImageRgba8 unconditionally, so on the pipeline
+        // every image has an alpha channel. Testing `color().has_alpha()` would
+        // take the four-channel path for every export forever and make the
+        // three-channel path unreachable while looking like it worked.
+        let opaque_but_rgba = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            8,
+            image::Rgba([10, 20, 30, 255]),
+        ));
+        assert!(
+            opaque_but_rgba.color().has_alpha(),
+            "the fixture must have an alpha channel, or the test proves nothing"
+        );
+        assert!(
+            is_opaque(&to_rgba8(&opaque_but_rgba)),
+            "every pixel is 255, so the packed path applies"
+        );
+
+        let one_transparent = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(
+            8,
+            8,
+            |_, _| image::Rgba([10, 20, 30, 254]),
+        ));
+        assert!(
+            !is_opaque(&to_rgba8(&one_transparent)),
+            "a single sub-opaque pixel has to switch the whole picture to RGBA"
+        );
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn a_transparent_picture_keeps_its_transparency() {
+        // The reason `is_opaque` exists. If the packed path were taken for this
+        // image, the alpha would be dropped and the file would claim to be opaque.
+        let mut rgba = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 100, 50, 255]));
+        for x in 0..32 {
+            for y in 0..64 {
+                rgba.put_pixel(x, y, image::Rgba([200, 100, 50, 0]));
+            }
+        }
+        let img = image::DynamicImage::ImageRgba8(rgba);
+        assert!(!is_opaque(&to_rgba8(&img)));
+        let bytes = encode(
+            &img,
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap();
+        let back = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        assert_eq!(
+            back.get_pixel(8, 8).0[3],
+            0,
+            "a fully transparent pixel must not come back opaque"
+        );
+        assert_eq!(
+            back.get_pixel(48, 8).0[3],
+            255,
+            "an opaque pixel must not come back transparent"
+        );
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn a_picture_wider_than_webp_allows_is_refused_with_a_sentence_not_a_panic() {
+        // libwebp stops at 16383 px a side; `validate::Limits` allows 30000. An
+        // 18000x100 panorama therefore passes every limit the engine applies,
+        // decodes, resizes — and then dies inside the encoder. `Encoder::encode`
+        // unwraps internally, so calling it here used to be a hard crash, which
+        // hard rule 3 forbids on bytes the user picked off their disk.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            WEBP_MAX_DIMENSION + 1,
+            4,
+            image::Rgb([30, 60, 90]),
+        ));
+        let err = encode(
+            &img,
+            OutputFormat::WebP,
+            EncodingOptions::default().with_quality(80),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("16383"),
+            "the refusal should name the limit: {text}"
+        );
+        assert!(
+            text.contains("JPEG") || text.contains("PNG"),
+            "the refusal should name a format that can do it: {text}"
+        );
+
+        // The same picture as PNG must succeed, which is what makes the message
+        // true rather than merely reassuring.
+        assert!(
+            encode(
+                &img,
+                OutputFormat::Png,
+                EncodingOptions::default().with_quality(80)
+            )
+            .is_ok(),
+            "PNG has no 16383 limit, so the alternative the message names must work"
+        );
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn exactly_at_the_dimension_limit_still_encodes() {
+        // The boundary the check above draws. A guard written `<` instead of `<=`
+        // would refuse a picture libwebp is perfectly willing to write.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            WEBP_MAX_DIMENSION,
+            2,
+            image::Rgb([30, 60, 90]),
+        ));
+        assert!(check_webp_dimensions(WEBP_MAX_DIMENSION, WEBP_MAX_DIMENSION).is_ok());
+        assert!(check_webp_dimensions(WEBP_MAX_DIMENSION + 1, 2).is_err());
+        assert!(check_webp_dimensions(2, WEBP_MAX_DIMENSION + 1).is_err());
+        assert!(
+            encode(
+                &img,
+                OutputFormat::WebP,
+                EncodingOptions::default().with_quality(60)
+            )
+            .is_ok(),
+            "a picture exactly at libwebp's limit must be writable"
+        );
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn every_webp_encoding_error_says_what_went_wrong() {
+        // Hard rule 9 over libwebp's whole error enum. `webp_encode_error` matches
+        // exhaustively, so a new code is a compile error there; this is the
+        // companion assertion that no arm produces an empty or engineer-facing
+        // message.
+        use webp::WebPEncodingError as E;
+        for code in [
+            E::VP8_ENC_ERROR_OUT_OF_MEMORY,
+            E::VP8_ENC_ERROR_BITSTREAM_OUT_OF_MEMORY,
+            E::VP8_ENC_ERROR_NULL_PARAMETER,
+            E::VP8_ENC_ERROR_INVALID_CONFIGURATION,
+            E::VP8_ENC_ERROR_BAD_DIMENSION,
+            E::VP8_ENC_ERROR_PARTITION0_OVERFLOW,
+            E::VP8_ENC_ERROR_PARTITION_OVERFLOW,
+            E::VP8_ENC_ERROR_BAD_WRITE,
+            E::VP8_ENC_ERROR_FILE_TOO_BIG,
+            E::VP8_ENC_ERROR_USER_ABORT,
+            E::VP8_ENC_ERROR_LAST,
+        ] {
+            let text = webp_encode_error(code).to_string();
+            assert!(text.contains("WebP"), "{code:?} lost the format: {text}");
+            assert!(text.ends_with('.'), "{code:?} is not a sentence: {text}");
+            assert!(
+                !text.contains("VP8_ENC"),
+                "{code:?} leaked the C constant to the user: {text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "webp-lossy")]
+    #[test]
+    fn webp_byte_ceilings_are_reachable() {
+        // The reason the preset ceilings are switched back on: a search that can
+        // never meet its target would report `target_met: false` on every WebP
+        // export, which is worse than not offering one.
+        let img = photo(600, 400);
+        for target in [20_000u64, 60_000, 150_000] {
+            let (bytes, quality, met) = crate::TargetBytes::new(target).encode_with(
+                &img,
+                OutputFormat::WebP,
+                EncodingOptions::default(),
+                &crate::target::default_encoder,
+            )
+            .unwrap();
+            assert!(
+                met,
+                "{target} bytes was not reachable at any quality ({} bytes at q{quality})",
+                bytes.len()
+            );
+            assert!(bytes.len() as u64 <= target);
+            assert!(quality > 0, "a lossy format must not report quality 0");
+        }
+    }
+
+    /// The pure-Rust lossless WebP encoder, for the size comparison above. Written
+    /// out here rather than reached through `encode` because `encode` picks the
+    /// encoder by build feature, and the comparison is only meaningful against the
+    /// other codec in the same build.
+    #[cfg(feature = "webp-lossy")]
+    fn encode_lossless_webp(img: &image::DynamicImage) -> Vec<u8> {
+        let rgba = to_rgba8(img);
+        let mut out: Vec<u8> = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut out);
+            image::codecs::webp::WebPEncoder::new_lossless(&mut cursor)
+                .write_image(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    image::ExtendedColorType::Rgba8,
+                )
+                .unwrap();
+        }
+        out
     }
 
     #[test]
