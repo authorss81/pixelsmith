@@ -1,0 +1,354 @@
+diff --git a/.github/workflows/build.yml b/.github/workflows/build.yml
+index 614a8ac..25c1411 100644
+--- a/.github/workflows/build.yml
++++ b/.github/workflows/build.yml
+@@ -160,6 +160,26 @@ jobs:
+             flutter build apk --debug
+           fi
+ 
++      # An SBOM for every release build, not one per repository. The supply-chain
++      # workflow produces one per push; a user installing *this* APK is getting
++      # this build, and the bill of materials that describes it should travel with
++      # it. Same action, same format, attached to the release artefact rather than
++      # uploaded separately, because an SBOM in a different artefact than the
++      # binary it describes is one nobody pairs back up.
++      - name: SBOM for this APK
++        uses: anchore/sbom-action@v0
++        with:
++          path: core
++          format: cyclonedx-json
++          output-file: pixelsmith-apk-sbom.cdx.json
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: pixelsmith-apk-sbom
++          path: pixelsmith-apk-sbom.cdx.json
++          if-no-files-found: error
++          retention-days: 30
++
+       - name: Upload APK
+         uses: actions/upload-artifact@v4
+         with:
+@@ -253,6 +273,21 @@ jobs:
+         working-directory: app
+         run: flutter build windows --release
+ 
++      # Same reasoning as the APK: an SBOM per release build, attached to it.
++      - name: SBOM for this EXE
++        uses: anchore/sbom-action@v0
++        with:
++          path: core
++          format: cyclonedx-json
++          output-file: pixelsmith-exe-sbom.cdx.json
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: pixelsmith-exe-sbom
++          path: pixelsmith-exe-sbom.cdx.json
++          if-no-files-found: error
++          retention-days: 30
++
+       - name: Upload EXE
+         uses: actions/upload-artifact@v4
+         with:
+@@ -397,4 +432,101 @@ jobs:
+             core/target/${{ matrix.target }}/release/*.dylib
+             core/target/${{ matrix.target }}/release/*.a
+           if-no-files-found: warn
+-          retention-days: 14
+\ No newline at end of file
++          retention-days: 14
++
++  # ---------------------------------------------------------------------------
++  # Reproducible builds.
++  #
++  # "Build it twice and compare hashes" in its obvious form cannot fail: two
++  # builds in the same directory agree with each other whether or not the binary
++  # would match one built anywhere else. The two things that actually break
++  # byte-identity are the build path (rustc bakes it into panic locations) and the
++  # toolchain version, and neither shows up in a same-directory double build.
++  #
++  # So this job builds each target the way scripts/build-release.sh does --
++  # --remap-path-prefix, SOURCE_DATE_EPOCH pinned, incremental off, --locked --
++  # and compares the hash against the row already committed for that target in
++  # scripts/BUILD-SHA256.txt. That row was written by an earlier run, on an
++  # earlier runner, which is what makes this a two-runner comparison rather than
++  # a self-consistency check.
++  #
++  # A row reading "not measured" is not a mismatch and must not be reported as
++  # one: the job publishes the hash it got, and filling the table in is a commit.
++  reproducible-build:
++    name: reproducible build ${{ matrix.target }}
++    runs-on: ${{ matrix.os }}
++    timeout-minutes: 40
++    strategy:
++      fail-fast: false
++      matrix:
++        include:
++          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
++          - { target: x86_64-pc-windows-msvc, os: windows-latest }
++          - { target: x86_64-apple-darwin, os: macos-latest }
++          - { target: aarch64-apple-darwin, os: macos-latest }
++          - { target: aarch64-linux-android, os: ubuntu-latest }
++          - { target: aarch64-apple-ios, os: macos-latest }
++    steps:
++      - uses: actions/checkout@v5
++
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          targets: ${{ matrix.target }}
++
++      # Android needs the NDK's linker; a plain --target fails at link time.
++      - name: Install cargo-ndk
++        if: contains(matrix.target, 'android')
++        run: cargo install cargo-ndk
++
++      - name: Build the release engine reproducibly
++        shell: bash
++        run: |
++          if [[ "${{ matrix.target }}" == *android* ]]; then
++            # cargo-ndk owns both the linker and the target-dir layout, so the
++            # reproducibility flags have to ride on RUSTFLAGS and the artefact
++            # copied out of wherever ndk put it.
++            export RUSTFLAGS="--remap-path-prefix=$PWD=."
++            export SOURCE_DATE_EPOCH=0 CARGO_INCREMENTAL=0 CARGO_NET_OFFLINE=true
++            cargo ndk -t arm64-v8a -o /tmp/px-repro build --release --lib
++            find /tmp/px-repro -name 'libpixelsmith_core.so' -exec cp {} /tmp/libpixelsmith_core.so \;
++          else
++            bash scripts/build-release.sh --target "${{ matrix.target }}" \
++              --record /tmp/BUILD-SHA256.txt | tee /tmp/build.log
++            mkdir -p /tmp/art
++            cp core/target/"${{ matrix.target }}"/release/libpixelsmith_core.* /tmp/art/ 2>/dev/null || true
++          fi
++
++      - name: Compare against the committed hash
++        shell: bash
++        run: |
++          set -uo pipefail
++          TARGET="${{ matrix.target }}"
++          ART=$(ls /tmp/art/libpixelsmith_core.* /tmp/libpixelsmith_core.so 2>/dev/null | head -n1)
++          [ -n "${ART}" ] || { echo "::error::no release artefact produced for ${TARGET}"; exit 1; }
++
++          GOT=$(sha256sum "${ART}" | awk '{print $1}')
++          echo "### reproducible build ${TARGET}" >> "$GITHUB_STEP_SUMMARY"
++          echo '```' >> "$GITHUB_STEP_SUMMARY"
++          echo "${TARGET}  ${GOT}  $(basename "${ART}")" >> "$GITHUB_STEP_SUMMARY"
++          echo '```' >> "$GITHUB_STEP_SUMMARY"
++
++          # A row is "<target> <hash> ...". If the second field is not 64 hex
++          # characters the row says "not measured", which is not a mismatch.
++          ROW=$(grep -E "^${TARGET}[[:space:]]" scripts/BUILD-SHA256.txt 2>/dev/null | head -n1 || true)
++          EXPECTED=$(printf '%s' "${ROW}" | awk '{print $2}' || true)
++
++          if ! printf '%s' "${EXPECTED}" | grep -Eq '^[0-9a-f]{64}$'; then
++            echo "::notice::${TARGET} has no committed hash yet (scripts/BUILD-SHA256.txt)."
++            echo "  Above is the hash to record. Not a failure on the first run."
++            exit 0
++          fi
++
++          if [ "${EXPECTED}" != "${GOT}" ]; then
++            echo "::error::${TARGET} did not reproduce."
++            echo "  committed: ${EXPECTED}"
++            echo "  this run:  ${GOT}"
++            echo "  Either the toolchain moved or the build is not reproducible;"
++            echo "  docs/SUPPLY-CHAIN.md says which."
++            exit 1
++          fi
++          echo "OK: ${TARGET} reproduced ${EXPECTED}"
+\ No newline at end of file
+diff --git a/.github/workflows/supply-chain.yml b/.github/workflows/supply-chain.yml
+index 06f715d..6a8a6c2 100644
+--- a/.github/workflows/supply-chain.yml
++++ b/.github/workflows/supply-chain.yml
+@@ -37,6 +37,84 @@ jobs:
+           manifest-path: core/Cargo.toml
+           command: check advisories licenses bans sources
+ 
++      # ---------------------------------------------------------------------
++      # The negative control.
++      #
++      # `cargo deny check` being enabled is a configuration claim. Whether it
++      # would actually reject a GPL dependency or a yanked crate is a different
++      # claim, and only this step tests it: three known violations are injected
++      # into a copy of deny.toml, each must be rejected, and if any is accepted
++      # the job fails. Without it, a silently-misconfigured policy -- a removed
++      # key, a skip list that matched everything -- would sit here reporting
++      # green for as long as nobody added a bad dependency.
++      #
++      # Nothing here touches the real deny.toml, and `git diff --exit-code`
++      # proves it at the end rather than assuming it.
++      - name: Negative control — an injected violation must be rejected
++        run: |
++          set -euo pipefail
++          cargo install cargo-deny --locked
++          cp deny.toml /tmp/deny-injected.toml
++
++          expect_rejected() {
++            local what="$1" check="$2"
++            if cargo deny --config /tmp/deny-injected.toml \
++                 --manifest-path core/Cargo.toml check ${check} >/tmp/deny-out 2>&1; then
++              echo "::error::NEGATIVE CONTROL FAILED: cargo deny accepted ${what}"
++              sed 's/^/    /' /tmp/deny-out
++              exit 1
++            fi
++            echo "ok: rejected ${what}"
++            sed -n '1,6p' /tmp/deny-out | sed 's/^/    /'
++          }
++
++          # 1. A crate that is certainly in the tree, named in [bans].deny.
++          #    `image` is a direct dependency; nothing would remove it.
++          cat >> /tmp/deny-injected.toml <<'EOF'
++
++          [[bans.deny]]
++          name = "image"
++          reason = "NEGATIVE CONTROL — injected by supply-chain.yml, not a real policy decision"
++          EOF
++          expect_rejected "[bans].deny naming a crate that is in the tree" bans
++          cp deny.toml /tmp/deny-injected.toml
++
++          # 2. Every duplicate version un-skipped. The real tree carries six
++          #    duplicated crate names (miniz_oxide, syn, getrandom, itertools,
++          #    quick-error, r-efi), so emptying [bans].skip must be rejected —
++          #    and this is also what proves the skip list is load-bearing rather
++          #    than decorative.
++          sed -i 's/^skip = \[/skip = [ ]\n# [/' /tmp/deny-injected.toml
++          expect_rejected "a duplicate version with no [bans].skip entry" bans
++          cp deny.toml /tmp/deny-injected.toml
++
++          # 3. A wildcard version requirement. Added to a throwaway copy of the
++          #    manifest rather than to the tree, so the committed file is
++          #    untouched.
++          cp core/Cargo.toml /tmp/Cargo.toml.injected
++          cat >> /tmp/Cargo.toml.injected <<'EOF'
++          px-deny-negative-control = { version = "*" }
++          EOF
++          mkdir -p /tmp/nc/core /tmp/nc/src
++          cp /tmp/Cargo.toml.injected /tmp/nc/core/Cargo.toml
++          cp core/Cargo.lock /tmp/nc/core/Cargo.lock
++          cp deny.toml /tmp/nc/deny.toml
++          if cargo deny --manifest-path /tmp/nc/core/Cargo.toml check bans >/tmp/deny-out 2>&1; then
++            echo "::error::NEGATIVE CONTROL FAILED: cargo deny accepted a wildcard requirement"
++            exit 1
++          fi
++          echo "ok: rejected a wildcard version requirement"
++
++          git diff --exit-code -- deny.toml core/Cargo.toml core/Cargo.lock \
++            || { echo "::error::a negative control modified a tracked file"; exit 1; }
++          echo "ok: no tracked file was modified"
++
++      # The offline half of the same policy, plus its own control. Runs on every
++      # push so a contributor without cargo-deny installed still gets a verdict,
++      # and so scripts/deny-check.sh itself cannot rot unnoticed.
++      - name: Offline policy subset, with its own negative control
++        run: bash scripts/deny-check.sh --negative-control
++
+   duplicate-versions:
+     name: no duplicate dependency versions
+     runs-on: ubuntu-latest
+@@ -44,13 +122,50 @@ jobs:
+       - uses: actions/checkout@v5
+       - uses: dtolnay/rust-toolchain@stable
+ 
+-      - name: Report duplicates
++      # This used to print the duplicates and emit a ::warning::, which cannot
++      # fail a job. There are six duplicated crate names in the tree, so a gate
++      # that simply reported them would be red on every run and would teach
++      # everyone to ignore it -- the thing deny.toml's own comment says not to
++      # do. So the gate is the pair: every duplicate must be covered by a
++      # [bans].skip entry with a reason next to it, and any duplicate that is not
++      # fails the build.
++      - name: Every duplicate must be covered by deny.toml [bans].skip
+         run: |
+-          cargo tree --manifest-path core/Cargo.toml --duplicates \
+-            | tee /tmp/dupes.txt
+-          if [ -s /tmp/dupes.txt ]; then
+-            echo "::warning::Duplicate crate versions present. See deny.toml [bans]."
++          set -uo pipefail
++          cargo tree --manifest-path core/Cargo.toml --duplicates | tee /tmp/dupes.txt
++          python3 - <<'PY' | tee /tmp/uncov.txt
++          import re, subprocess, sys, tomllib
++          skip = {e.get("crate") for e in (tomllib.load(open("deny.toml","rb"))["bans"].get("skip") or [])}
++          names = set(re.findall(r"^(\S+) v", open("/tmp/dupes.txt").read(), re.M))
++          for n in sorted(names - skip):
++              print(n)
++          PY
++          if [ -s /tmp/uncov.txt ]; then
++            echo "::error::duplicate crate versions not covered by deny.toml [bans].skip:"
++            sed 's/^/    /' /tmp/uncov.txt
++            exit 1
+           fi
++          echo "ok: every duplicate is covered by deny.toml [bans].skip"
++
++  vet:
++    name: cargo-vet (advisory — no imports.lock yet)
++    # Advisory, deliberately, and named so in the job title. `vet/config.toml`
++    # carries six hand-written audits, but `vet/imports.lock` has never been
++    # generated because cargo vet could not be installed on the machine
++    # phase-15 was written on (no network). Until somebody runs `cargo vet` once
++    # and commits the lock, this job reports rather than gates -- and a blocking
++    # job that cannot go green is a red build nobody reads.
++    #
++    # Flip `continue-on-error` to false in the same commit that adds
++    # vet/imports.lock.
++    runs-on: ubuntu-latest
++    continue-on-error: true
++    steps:
++      - uses: actions/checkout@v5
++      - uses: dtolnay/rust-toolchain@stable
++      - run: cargo install cargo-vet --locked
++      - name: cargo vet
++        run: cargo vet --manifest-path core/Cargo.toml
+ 
+   sbom:
+     name: SBOM (CycloneDX)
+@@ -82,34 +197,18 @@ jobs:
+     steps:
+       - uses: actions/checkout@v5
+       - uses: dtolnay/rust-toolchain@stable
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: core
+ 
+-      - name: Dependency tree
+-        run: |
+-          cargo tree --manifest-path core/Cargo.toml --all-features --prefix none \
+-            | awk '{print $1}' | sort -u > /tmp/crates.txt
+-          BANNED='^(reqwest|hyper|ureq|curl|isahc|surf|attohttpc|tokio|async-std|smol|quinn|http|tungstenite|openssl|native-tls|rustls|webpki|hickory-dns|trust-dns|socket2|mio|dns-lookup)$'
+-          if grep -E "$BANNED" /tmp/crates.txt; then
+-            echo "::error::Network-capable crate found in the engine dependency tree."
+-            exit 1
+-          fi
+-          echo "OK: no network-capable crate in the engine dependency tree"
+-
+-      - name: Source symbols
+-        run: |
+-          if grep -rnE 'std::net|TcpStream|UdpSocket|lookup_host|reqwest|hyper::|curl' \
+-               core/src --include='*.rs'; then
+-            echo "::error::Networking symbol referenced in core/src."
+-            exit 1
+-          fi
+-          echo "OK: no networking symbol in core/src"
+-
+-      - name: Release binary has no TLS/curl in its dynamic imports
+-        run: |
+-          cargo build --manifest-path core/Cargo.toml --release
+-          SO=core/target/release/libpixelsmith_core.so
+-          [ -f "$SO" ] || { echo "::error::no .so produced"; exit 1; }
+-          if ldd "$SO" | grep -Ei 'ssl|crypto|curl'; then
+-            echo "::error::Release binary links a TLS or curl library."
+-            exit 1
+-          fi
+-          echo "OK: release binary links no TLS or curl library"
+\ No newline at end of file
++      # One implementation of the banned list, not three. This job used to carry
++      # its own copy of the crate list and its own greps, and scripts/verify.sh
++      # carries another; a security policy with three copies is a policy where
++      # two of them are wrong within a year. The script is the readable one and
++      # docs/SECURITY.md points a stranger at it, so this job calls it.
++      #
++      # It also checks two things this job did not: the undefined dynamic
++      # symbols of the release library (ldd cannot see a statically linked
++      # socket() call) and the whole transitive closure with --all-features.
++      - name: no-network-report.sh
++        run: bash scripts/no-network-report.sh --build
+\ No newline at end of file

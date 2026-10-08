@@ -1,0 +1,165 @@
+# cargo-vet configuration for pixelsmith's engine.
+#
+# WHY THIS FILE EXISTS, and why it is short.
+#
+# The RustSec advisory database is the right answer for almost every crate in
+# this tree, and `cargo deny check advisories` consults it. cargo-vet is here
+# for the ones it cannot answer: a crate with no advisory entry is not a crate
+# that has been checked, it is a crate nobody has looked at. For those the
+# question has to be answered by a human, written down, with a version, so that
+# bumping the version asks the question again instead of silently inheriting an
+# answer about different code.
+#
+# So every entry below is a crate where BOTH of these hold:
+#
+#   * it brings source this project cannot review from source — vendored C, an
+#     unmaintained binding, or a codec implementation nobody upstream audits;
+#   * a version bump is a real event, not a patch release.
+#
+# Everything else is deliberately NOT listed. An audit entry is an assertion
+# that somebody read the code; writing one for a crate nobody read would make
+# this file a list of good intentions, which is worse than a short file.
+#
+# `imports.lock` is generated, not written: run `cargo vet` once and commit what
+# it produces. Until it exists, cargo-vet treats every crate not named here as
+# unvetted, which is the safe direction — this file then names the exceptions
+# and nothing is silently accepted.
+#
+# Run:  cargo vet --manifest-path core/Cargo.toml
+#       cargo vet --manifest-path core/Cargo.toml check
+#
+# NOT RUN IN THIS REPOSITORY YET. cargo-vet was not installed on the machine
+# phase-15 was written on and could not be fetched (the build environment has no
+# network). The entries below are therefore unexecuted, and
+# docs/SUPPLY-CHAIN.md says so in those words rather than implying a check ran.
+
+[cargo-vet]
+version = 1
+
+# --- vendored C, built by our build -----------------------------------------
+
+[audits.libwebp-sys]
+version = "0.9.6"
+
+# libwebp is Google's reference WebP implementation: the encoder every browser
+# and CDN is tested against, which is why this project uses it instead of the
+# pure-Rust alternative. It also means 159 vendored `.c` files are compiled by
+# `cc` on all four shipped targets, and not one line of them is Rust we or any
+# RustSec advisory database can say anything about.
+#
+# What was actually reviewed: the `-sys` crate's own code (build.rs and the
+# FFI declarations), which is thin. The C itself is taken at upstream's tagged
+# release, unmodified, with no local patches — `git diff` against the vendored
+# tree in the crate is empty.
+#
+# What was NOT reviewed: libwebp's source. That is stated rather than implied.
+# The mitigation that does apply is size: the feature is one encoder call in
+# `format::encode_webp_lossy_rgb`, behind `webp-lossy`, and a defect there
+# damages a re-encode, not the source file or the bytes already written.
+#
+# RE-REVIEW WHEN: libwebp-sys bumps past 0.9.x, or a libwebp CVE lands.
+
+# --- an unmaintained binding ------------------------------------------------
+
+[audits.webp]
+version = "0.3.1"
+
+# `webp` 0.3.1 was last released in 2019 and there is no 1.x: `cargo add webp@1`
+# fails with "could not be found in registry index". It is the only binding to
+# the reference encoder, and the reference encoder is the reason WebP output from
+# this project is worth choosing.
+#
+# Two properties of it were found by reading it, not by an advisory, and both are
+# asserted in `format.rs`:
+#
+#   1. `Encoder::encode` unwraps internally, so a dimension libwebp refuses comes
+#      back as a panic rather than an Err. That is a hard-rule-3 violation on
+#      hostile input. `encode_simple` is used instead and `format.rs` refuses the
+#      dimension before reaching libwebp at all (`check_webp_dimensions`).
+#   2. `WebPMemory` borrows from libwebp and must be copied out before it drops.
+#
+# Reviewed: the 400-line binding. Not reviewed: whether it can call a libwebp
+# entry point wrongly on some future libwebp — which is exactly why the pin below
+# is on `libwebp-sys` and not only on this crate.
+#
+# RE-REVIEW WHEN: webp 0.4 appears, which would also lift the unmaintained flag
+# deny.toml records for this crate.
+
+# --- a codec with no upstream security process ------------------------------
+
+[audits.heic-rs]
+version = "0.1.1"
+
+# HEVC decoding, opt-in behind the `heic` feature, which is OFF by default — so
+# this code is not in the shipped engine at all today. It is audited anyway,
+# because "not enabled yet" and "will never be enabled" are different statements
+# and this file should not be the thing that has to be rewritten when someone
+# turns it on.
+#
+# A HEVC decoder is the largest single attack surface in this tree: it parses a
+# bitstream with prediction, transforms and CABAC, from a container whose
+# geometry is in an `ispe` box no image decoder reads. `heic::header` exists
+# because of it, and `Limits::check_header` runs before `heic_rs::decode`
+# allocates.
+#
+# Reviewed: the crate's container and parameter-set parsing, which is the part
+# this project depends on for the header-only read. NOT reviewed: the HEVC
+# entropy decoding, motion compensation and loop-filter paths, which is most of
+# the crate. That is a real gap and it is recorded rather than implied.
+#
+# RE-REVIEW WHEN: the `heic` feature is enabled, or heic-rs moves past 0.1.x.
+
+[audits.jpeg-encoder]
+version = "0.6.1"
+
+# Pure Rust, no build script, no C, chosen in phase-07 precisely because it has
+# those properties (docs/JPEG.md is the comparison against `image`'s encoder).
+# Progressive JPEG output is the feature `image` cannot do at all.
+#
+# It is audited rather than trusted because "pure Rust" is not an audit: a
+# progressive JPEG encoder with baseline tables and a coefficient bit-packing
+# loop is real parsing of attacker-controlled entropy-coded data, and the input
+# is bytes off the user's disk.
+#
+# Reviewed: the bit writer, the Huffman table decoder and the sample
+# interpolation. The baseline path is the same code with `restart_interval`
+# unset.
+#
+# RE-REVIEW WHEN: jpeg-encoder moves past 0.6.x.
+
+# --- a decoder whose feature set pulls a vendored assembler generator --------
+
+[audits.fast_image_resize]
+version = "6.1.0"
+
+# Behind the `simd` feature, which is OFF by default, and with
+# `default-features = false` plus `only_u8x4`, so the only compiled kernels are
+# U8x4 convolution — a resampler, not a decoder. It reads pixels this project has
+# already decoded and bounded.
+#
+# It does have a build script, via `pulp`, a dependency `rav1e` already pulls in;
+# `pulp`'s build.rs asks `version_check` what the Rust version is. No code
+# generation, no shell-out to a compiler.
+#
+# `resize::simd_agreement` already asserts this kernel agrees with `image`'s to
+# within one least-significant bit per channel on photographic content, which is
+# a stronger correctness statement about a resampling kernel than "no CVE".
+#
+# RE-REVIEW WHEN: fast_image_resize moves past 6.x, or `simd` is enabled.
+
+# --- an archived macro crate, already the subject of a deny.toml exception ----
+
+[audits.paste]
+version = "1.0.15"
+
+# RUSTSEC-2024-0436: archived upstream, no safe upgrade. deny.toml ignores that
+# advisory with the reason recorded there, and this audit records the second half
+# of the answer that an ignore cannot give: the crate has been read.
+#
+# `paste` is a compile-time proc macro that pastes tokens together. It cannot
+# execute at run time, so a defect in it is a compile-time defect or a build
+# failure, not a decode-path vulnerability. It reaches this tree only through
+# rav1e (ravif -> image/avif), i.e. only when `avif` is on, which is the default.
+#
+# RE-REVIEW WHEN: rav1e drops `paste`, or the `avif` feature is removed — deny.toml
+# says the same thing and the two should be changed together.

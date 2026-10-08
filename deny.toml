@@ -9,15 +9,17 @@
 #   2. No unmaintained or yanked crate, and no duplicate version of the same
 #      crate, because both are how supply-chain compromises get in.
 #
-# There are currently ZERO advisories ignored and ZERO duplicate versions skipped.
-# That is not an accident and it should stay that way — and note that it does not
-# mean `cargo deny check bans` is green. It is not; see the note under [bans] for
-# the two duplicates that are left failing on purpose. Both an ignore list and a
-# skip list grew out of the `avif` feature, which was written against the ravif
-# 0.13 API while Cargo.toml resolved 0.11. It never compiled, which meant
-# scripts/verify.sh failed on every run, and it dragged in rav1e -> nasm, an
-# unmaintained `paste`, and four duplicated crates. The feature was deleted
-# rather than excepted.
+# There are currently ONE advisory ignored and SIX crate names skipped for a
+# duplicate version. Neither is an accident and both are explained where they
+# are; note that "one ignored advisory" does not mean `cargo deny check` is
+# green for free — it means the green is bought with a documented, dated
+# decision rather than a blanket suppression.
+#
+# Both an ignore list and a skip list grew out of the `avif` feature, which was
+# written against the ravif 0.13 API while Cargo.toml resolved 0.11. It never
+# compiled, which meant scripts/verify.sh failed on every run, and it dragged in
+# rav1e -> nasm, an unmaintained `paste`, and duplicated crates. The feature was
+# deleted rather than excepted.
 #
 # If you add a dependency that forces you to add a line below, weigh it against
 # the value it brings. An exception nobody re-reads is how a supply-chain policy
@@ -27,7 +29,13 @@
 # The manifest path is not optional: run from the repository root without it and
 # cargo-deny reports "the directory ... doesn't contain a Cargo.toml file" and
 # exits 1, which looks like a policy failure and is not one.
-# Enforced in CI via .github/workflows/supply-chain.yml.
+#
+# Run with: bash scripts/deny-check.sh
+# Same policy, plus an offline subset for a machine without cargo-deny installed
+# and a negative control that proves each check rejects an injected violation.
+# Enforced in CI via .github/workflows/supply-chain.yml, which also injects the
+# violations into its own copy of cargo-deny so the real tool is proved able to
+# fail rather than merely enabled.
 
 [graph]
 all-features = true
@@ -94,32 +102,60 @@ allow = [
   # Linux ships: permissive, commercial use allowed, acknowledgement required.
   # FSF classifies it as free. Valid SPDX identifier.
   "IJG",
+  # NCSA, carried by `libfuzzer-sys` 0.4.13, which is a *normal* dependency of
+  # `rav1e` under `cfg(fuzzing)` — a cfg no shipped build sets, but one
+  # `--filter-platform` cannot switch off and cargo-deny does not exclude, so the
+  # crate is in the graph the gate walks and its licence has to be permitted for
+  # `cargo deny check licenses` to pass. The licence itself is the
+  # University of Illinois/NCSA Open Source License: permissive, attribution
+  # only, OSI-approved, and the same terms libjpeg and ncurses carry.
+  #
+  # Not added speculatively: phase-15 found this by running the policy against the
+  # real graph rather than by reading it, which is the argument for running the
+  # policy at all.
+  "NCSA",
 ]
 confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
-# Two duplicates are skipped, each with its reason inline. Both pairs are
-# different MAJOR versions coexisting, which is normal Rust practice rather than
-# a compromise vector — the risk `multiple-versions` guards against is two
-# different minor versions of the same major line, where one may carry a
-# vulnerability the other fixed. New duplicates outside this list still fail.
+# Six duplicate crate names are skipped, each with its real reason in the comment
+# above. Every pair is two different MAJOR versions coexisting, which is normal
+# Rust practice rather than a compromise vector — the risk `multiple-versions`
+# guards against is two different minor versions of the same major line, where one
+# may carry a vulnerability the other fixed. Any new duplicate outside this list
+# fails the build, and the `duplicate-versions` job in
+# .github/workflows/supply-chain.yml re-derives this list from `cargo tree` so a
+# skip entry that no longer corresponds to a duplicate is visible.
 #
-# An earlier revision of this file left these red on purpose, arguing that a
-# skip weakens the policy. That argument was weighed and rejected: a check that
-# is red on every run trains everyone to ignore it, which enforces nothing. A
-# green check with documented exceptions still fails on anything new, which is
-# the actual enforcement. phase-15 may revisit this; the reasoning to beat is
-# in this comment.
+# The parents below were read out of `cargo metadata`, not remembered. None of
+# them can be collapsed without an upstream version bump: every one of these
+# duplicates is two crates' requirements of the same dependency disagreeing, and
+# this project is a leaf consumer of both sides.
 #
-#   miniz_oxide 0.8 (via png 0.18)  +  0.9 (via flate2, from zip and tiff)
-#   syn         2.0 (via zerocopy-derive <- half <- tiff)
-#                            +  3.0 (via serde_derive, thiserror-impl)
+#   miniz_oxide 0.8.9  <- png 0.18.1, exr 1.74.2
+#                  0.9.1  <- flate2 1.1.10 (via zip, and directly for colour.rs's iCCP)
 #
-# Both pairs are pinned by upstream version requirements inside `image` and its
-# own dependency set, so collapsing them needs a dependency change rather than a
-# policy change.
+#   syn          2.0.119 <- zerocopy-derive 0.8.59 (via half <- tiff),
+#                          plus proptest's derive chain
+#                  3.0.6  <- serde_derive 1.0.229, thiserror-impl 2.0.21
+#
+#   getrandom    0.3.4  <- rand_core 0.9.5 (via proptest)
+#                  0.4.3  <- tempfile 3.27.0 (a dev-dependency), jobserver 0.1.35
+#               and therefore also:
+#   r-efi        5.3.0  <- getrandom 0.3.4
+#                  6.0.0  <- getrandom 0.4.3
+#               r-efi only exists on the UEFI/wasi targets of getrandom, so it is
+#               not in any shipped binary. It is listed because cargo-deny
+#               resolves every cfg target and sees both.
+#
+#   itertools    0.13.0 <- criterion 0.7.0 and criterion-plot 0.6.0 (dev)
+#                  0.14.0 <- rav1e 0.8.1 (via ravif <- image/avif)
+#
+#   quick-error  1.2.3  <- rusty-fork 0.3.1 (proptest's process-forking support)
+#                  2.0.1  <- image-webp 0.2.4, tiff 0.11.3, ravif 0.13.0
+#
 # NOTE on schema: `skip` entries here carry only `crate`. A `reason` key would
 # document each entry inline, but unknown keys are a hard config-parse error in
 # the pinned cargo-deny, so the reasons live in the comment block above instead
@@ -127,6 +163,10 @@ wildcards = "deny"
 skip = [
   { crate = "miniz_oxide" },
   { crate = "syn" },
+  { crate = "getrandom" },
+  { crate = "r-efi" },
+  { crate = "itertools" },
+  { crate = "quick-error" },
 ]
 # NOTE: `deny` must be a single array of tables. An earlier version of this file
 # also had a separate `[[bans.deny]]` section, which cargo-deny rejects with

@@ -14,7 +14,9 @@ use crate::animation::{self, AnimationOutcome, AnimationPolicy};
 use crate::colour::ColourOutcome;
 use crate::error::{Error, Result};
 use crate::format::{EncodingOptions, OutputFormat};
-use crate::pipeline::{Orientation, Pipeline};
+#[cfg(feature = "streaming")]
+use crate::pipeline::Orientation;
+use crate::pipeline::Pipeline;
 use crate::target::{TargetBytes, default_encoder};
 use crate::validate::Limits;
 use rayon::prelude::*;

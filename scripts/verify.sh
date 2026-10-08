@@ -331,7 +331,49 @@ if [ -f app/lib/rust/bindings.dart ] && command -v cargo >/dev/null 2>&1; then
 fi
 
 # -----------------------------------------------------------------------------
-head1 "4. Repository hygiene"
+# Supply-chain policy, behind PX_DENY=1.
+#
+# Not part of the default gate, and the reason is a wall clock rather than a
+# value judgement: `cargo deny check advisories` fetches the RustSec advisory
+# database, which is minutes on a cold cache and is a network call in a
+# repository whose whole thesis is that it needs no network. Everything else in
+# this gate is offline and fast, and the gate runs on every phase.
+#
+# It is not optional in CI: .github/workflows/supply-chain.yml runs cargo-deny on
+# every push, every pull request and weekly. This section is the same policy made
+# runnable by a contributor, so that "CI would catch it" is a thing they can
+# check rather than a thing they are told.
+#
+# PX_DENY=1 also runs --negative-control, which injects one violation at a time
+# into copies of the real policy and asserts each is rejected. A gate that has
+# never been observed to fail is not known to work.
+head1 "4. Supply-chain policy (PX_DENY)"
+if [ "${PX_DENY:-0}" = "1" ]; then
+  DENY_LOG=$( bash scripts/deny-check.sh --negative-control 2>&1 )
+  DENY_RC=$?
+  if [ ${DENY_RC} -eq 0 ]; then
+    # `PASS (offline subset only)` is a different claim from `PASS`, and saying
+    # "ok:" for it would be the gate reporting more than it checked.
+    if printf '%s' "${DENY_LOG}" | grep -q "RESULT: PASS (offline subset only"; then
+      say "  note: cargo-deny is not installed, so advisories and licence"
+      say "        confidence were NOT checked. The offline subset was:"
+      printf '%s\n' "${DENY_LOG}" | grep -E '^\s+ok: |^PXDENY|controls fired' | sed 's/^/        /'
+      say "        cargo install cargo-deny --locked, or rely on the CI job."
+    else
+      pass "cargo deny check, and 5 injected violations all rejected"
+    fi
+  else
+    fail "supply-chain policy (exit ${DENY_RC}):"
+    printf '%s\n' "${DENY_LOG}" | grep -vE '^\s*$' | tail -n 30 | sed 's/^/        /'
+  fi
+else
+  say "  skip: PX_DENY=1 not set (CI runs cargo-deny unconditionally; see"
+  say "        .github/workflows/supply-chain.yml). Run it with:"
+  say "          PX_DENY=1 bash scripts/verify.sh"
+fi
+
+# -----------------------------------------------------------------------------
+head1 "5. Repository hygiene"
 check "no .done marker committed by an agent" \
   "grep -rq '^done\|touch .*\.done' workspace/*/PROMPT.md 2>/dev/null && exit 1 || exit 0"
 
@@ -346,8 +388,23 @@ check "ROADMAP.md exists" "[ -f ROADMAP.md ]"
 check "docs/phase-status.md exists" "[ -f docs/phase-status.md ]"
 check "opencode.json declares the model" "grep -q '\"model\"' opencode.json"
 
+# The supply-chain deliverables have to exist. They are cheap to delete by
+# accident during a refactor and impossible to notice afterwards, because nothing
+# in the build depends on a policy document.
+check "docs/SECURITY.md and root SECURITY.md both exist" \
+  "[ -f docs/SECURITY.md ] && [ -f SECURITY.md ] && grep -q 'docs/SECURITY.md' SECURITY.md"
+
+check "docs/SUPPLY-CHAIN.md states a verdict per target" \
+  "[ -f docs/SUPPLY-CHAIN.md ] && [ \"\$(grep -cE '^\\| \`?[a-z0-9_]+-[a-z0-9_]+' docs/SUPPLY-CHAIN.md)\" -ge 6 ]"
+
+check "scripts/BUILD-SHA256.txt has a row per target" \
+  "[ -f scripts/BUILD-SHA256.txt ] && [ \"\$(grep -cE '^[a-z0-9_]+-[a-z0-9_]+[[:space:]]' scripts/BUILD-SHA256.txt)\" -ge 6 ]"
+
+check "vet/ audits present for the crates the advisory DB cannot answer for" \
+  "[ -f vet/config.toml ] && grep -q 'libwebp-sys' vet/config.toml && grep -q 'heic-rs' vet/config.toml"
+
 # -----------------------------------------------------------------------------
-head1 "5. Result"
+head1 "6. Result"
 say "  checks run: ${CHECKS}"
 say "  failures:   ${FAILURES}"
 if [ "${FAILURES}" -eq 0 ]; then
