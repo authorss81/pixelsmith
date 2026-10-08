@@ -165,6 +165,75 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Every feature configuration compiles.
+#
+# Section 2 runs `--all-features`, which is ONE of the nine configurations this
+# crate has. That hid a real defect for the whole of the project's life:
+#
+#   error[E0433]: cannot find `stream` in `pixelsmith_core`   (tests/streaming_peak.rs)
+#   error[E0601]: `main` function not found in crate `resize_bench`
+#
+# so `cd core && cargo test` — the command README.md tells a contributor to run —
+# did not compile, and `--no-default-features` had never been compiled at all.
+# docs/AUDIT.md finding 2; closed in phase-19.
+#
+# The check is `cargo check` over the target set `cargo test` compiles, because
+# compiling is what catches this class and the gate already spends five minutes
+# running the suite. What it buys is stated rather than implied: in the
+# configurations other than `--all-features`, this proves the tests *compile*, not
+# that they pass. See scripts/feature-matrix.sh for the configuration list and
+# docs/phase-status.md under phase-19 for the wall clock.
+head1 "2b. Feature matrix — every configuration compiles"
+if [ -f core/Cargo.toml ]; then
+  say "--- scripts/feature-matrix.sh ---"
+  # Exit status first, summary line only for the reader. A check that printed the
+  # summary line as its condition could report "9 configurations checked" over a
+  # run that failed — the `cmd | head` defect phase-01 fixed twice in this file.
+  MATRIX=$( bash scripts/feature-matrix.sh 2>&1 )
+  MRC=$?
+  if [ ${MRC} -eq 0 ]; then
+    pass "$(printf '%s' "${MATRIX}" | grep -E '^MATRIX:' | tail -n 1)"
+  else
+    fail "a feature configuration does not compile:"
+    # The per-configuration lines are indented by two spaces, so the filter has to
+    # allow for that: a red gate that reports three compiler errors without naming
+    # the build that produced them is hard rule 9's failure mode in a gate.
+    printf '%s\n' "${MATRIX}" | grep -E '^(  FAIL|MATRIX|        )' | head -n 30
+  fi
+
+  # Proved able to fail, offline, in both directions — including the check that
+  # fails when a feature is added to core/Cargo.toml without a row for it here.
+  check "scripts/feature-matrix.sh --self-test" \
+    "bash scripts/feature-matrix.sh --self-test"
+
+  say "--- the codec refusal arms, executed without the default features ---"
+  # Compiling is not running, and in one configuration the difference is the whole
+  # point: `--no-default-features` is the only build in which the AVIF and lossy
+  # WebP *refusal* arms are the ones that execute, so it is the configuration in
+  # which `capabilities()` and `format::encode` can be caught disagreeing. phase-07
+  # claimed that arm "was additionally run under --no-default-features"; on the
+  # tree as it stood that run could not have happened, because nothing in that
+  # configuration compiled. This is that run.
+  #
+  # One filter, not the whole lib suite: the suite's wall clock is
+  # `presets::tests` (41 Lanczos3 resamples of a 12 MP image, about four minutes
+  # in this debug profile — docs/ARCHITECTURE.md gotcha 20) and it is the same
+  # arithmetic in every configuration. `format::tests` is 24 tests and 0.6 s, and
+  # it is where the capability/refusal agreement lives.
+  NOTEST=$( cargo test --manifest-path core/Cargo.toml --no-default-features \
+    --lib format::tests --color=never 2>&1 )
+  NRC=$?
+  if [ ${NRC} -eq 0 ]; then
+    pass "$(printf '%s' "${NOTEST}" | grep -E 'test result' | tail -n 1)"
+  else
+    fail "cargo test --no-default-features (format tests) failed:"
+    printf '%s\n' "${NOTEST}" | grep -E 'FAILED|panicked|^error|test result' | head -n 20
+  fi
+else
+  say "  skip: core/Cargo.toml not present yet"
+fi
+
+# -----------------------------------------------------------------------------
 head1 "3. Dart / Flutter"
 if [ -f app/pubspec.yaml ]; then
   if command -v flutter >/dev/null 2>&1; then
@@ -453,12 +522,20 @@ check "scripts/RELEASE-SHA256.txt has a row per release artefact" \
 # The release tooling, proved able to fail.
 #
 # Every check a phase adds into this file gets run with a passing input before
-# it is believed. This repository has five recorded instances of a gate that
-# could not report the truth — phase-01's `check()`, phase-08's `| head -n 40`,
-# phase-10's `--test`, phase-15's target-triple regex and its `spdx_licenses`
-# typo — and two of those cost a phase whose actual work was already complete.
+# it is believed. This repository has seven recorded instances of a check that
+# could not report the truth: phase-01's `check()`, the `dart format … | tail -n 5`
+# exit status, the `cargo fmt … | head -n 40` exit status, and the clippy/rustdoc
+# filter that ANSI colouring defeated; phase-10's `--test`; and phase-15's
+# target-triple regex and its `spdx_licenses` typo. Two of them cost a phase whose
+# actual work was already complete.
+#
 # The three scripts below are the ones phase-16 adds, so each carries its own
 # `--self-test` and each is exercised here rather than trusted.
+#
+# phase-19 adds a fourth: `scripts/feature-matrix.sh`, whose `--self-test` runs a
+# deliberately failing configuration in both directions and fails if a feature is
+# declared in core/Cargo.toml with no row for it. Section 2b runs it in place of
+# section 5b, because that is where the matrix itself runs.
 head1 "5b. Release tooling can report failure"
 for tool in check-version verify-release-artifact release-checksums; do
   check "scripts/${tool}.sh --self-test" "bash scripts/${tool}.sh --self-test"

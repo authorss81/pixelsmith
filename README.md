@@ -88,10 +88,37 @@ images and the engine is tested; no screen calls it yet.
 ```bash
 # The engine, standalone
 cd core
-cargo test
+cargo test                                     # the default features: avif + webp-lossy
 cargo clippy --all-targets --all-features -- -D warnings
 cargo build --release
 ```
+
+**The feature flags are the build, so they are spelled out rather than implied.**
+`default = ["avif", "webp-lossy"]`; `streaming`, `simd` and `heic` are off, and
+each one changes what the crate can do. Every combination below compiles and its
+tests run, and the gate checks nine of them on every push:
+
+```bash
+cd core
+cargo test --no-default-features                 # no optional codec: the AVIF and
+                                                  # lossy-WebP refusal arms
+cargo test --features streaming                  # the low-peak-memory decode path
+cargo test --features simd                       # the fast_image_resize kernel
+cargo test --all-features                        # everything, which is what CI runs
+
+cd .. && bash scripts/feature-matrix.sh          # all nine, in about a minute
+bash scripts/verify.sh                           # the gate: fmt, clippy, tests,
+                                                 # matrix, release build, rustdoc,
+                                                 # the Flutter side, the FFI contract
+```
+
+The two opt-in paths are named in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): `streaming` trades a second decode
+path for 4 MB instead of 613 MB on a 120-megapixel source, and `simd` is 2.8× to
+19.9× on an x86-64 runner with AVX2 — 2.8× to 12.5× on a second one, same lockfile,
+so the number belongs to the CPU — and unmeasured on the ARM phone this ships to.
+Neither is on by default, and neither is turned on by the flag list above — you
+asked for them.
 
 The app is a submodule, so it comes with a clone of this repository:
 

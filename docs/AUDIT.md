@@ -267,6 +267,23 @@ thing that watches. That means:
 
 **Confidence: high.** Both errors reproduced by hand, in this run.
 
+**Fixed in phase-19.** `core/tests/streaming_peak.rs` now carries
+`#![cfg(feature = "streaming")]` at the top of the file — a `--test` target is
+built with libtest's own `main`, so a crate whose items are all gated out is a
+harness that reports `running 0 tests`, and a test that compiles to nothing says
+so rather than being absent from the build. `core/examples/resize_bench.rs` lost
+its `#![cfg(feature = "simd")]` in favour of `required-features = ["simd"]` on
+`[[example]]`: an example is a binary target, so an `#[cfg]` that removes every
+item removes `fn main` with them. `scripts/feature-matrix.sh` is section 2b of
+`scripts/verify.sh` and compiles nine of the thirty-two configurations, and all
+thirty-two were checked by hand. Two further instances of the same shape were
+found while making the gate check: `resize::tests`'s `Difference`, `difference`
+and `reference` helpers are used only by the `simd`-gated module and reported
+three `never used` warnings in every default build. All five configurations in the
+phase prompt now compile, `--no-default-features` among them, and `verify.sh`
+executes `format::tests` in that configuration so phase-07's claim about the AVIF
+refusal arm is now a run rather than a recollection.
+
 ### 3. The app crashes on an iPhone photograph — HIGH
 
 `app/lib/rust/models.dart:21`:

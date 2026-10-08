@@ -21,6 +21,29 @@
 //! megabytes on disk, and a 120 MP fixture in the repository would be a licence
 //! question nobody needs.
 
+// The whole file sits behind the same gate as the module it measures
+// (`#[cfg(feature = "streaming")] pub mod stream`, lib.rs:24). An integration
+// test can only reach the crate's *public* API, and `stream` is not part of that
+// API without the feature, so an ungated file here is
+// `error[E0433]: cannot find 'stream' in pixelsmith_core` in every configuration
+// that does not enable `streaming` — including plain `cargo test`, which is the
+// command README.md's build section tells a contributor to run. That was the
+// first half of audit finding 2, and it was invisible for as long as the gate ran
+// `--all-features` and nothing else.
+//
+// `#![cfg]` and `required-features` are both available here and the difference
+// matters. `required-features` in core/Cargo.toml tells cargo not to build this
+// target at all, so the binary simply does not appear in `cargo test --no-run`'s
+// output; `#![cfg]` builds it and leaves every item removed, which for a target
+// compiled with `--test` means libtest's injected `main` is still there and the
+// result is a harness that reports `running 0 tests`. The second is the honest
+// form for this file: a test that compiles to nothing says so, rather than being
+// absent from a build and looking like a target nobody has written yet.
+//
+// This is the whole of the fix — nothing above is gated and nothing below is
+// weakened. The one test still asserts what phase-11 made it assert.
+#![cfg(feature = "streaming")]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 

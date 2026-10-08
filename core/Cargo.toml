@@ -45,6 +45,28 @@ path = "src/bin/px-abi-dump.rs"
 # worker. `cargo test` still builds and runs it, which is what it is for.
 bench = false
 
+# The SIMD-vs-reference benchmark, and the second half of audit finding 2.
+#
+# `required-features` rather than `#![cfg(feature = "simd")]` at the top of the
+# file, because an `#[cfg]` that removes every item removes `fn main` with them
+# and rustc rejects an example with no entry point: `cargo test` builds examples,
+# so the crate did not compile without `simd` until this entry existed.
+#
+# With `required-features`, cargo does not build the target and says which feature
+# it wanted, which is also the only version of this that can explain itself to
+# someone who typed `cargo run --example resize_bench` and forgot the flag.
+# `scripts/feature-matrix.sh` compiles this target in the `simd` configurations
+# and in the ones without it, so the two halves cannot drift apart again.
+#
+# The gate on `core/tests/streaming_peak.rs` is a `#![cfg]` instead, because that
+# file is a `--test` target: libtest supplies `main`, so a crate whose items are
+# all gated out is a harness reporting `running 0 tests` rather than a compile
+# error, and a test that compiles to nothing should say so rather than be absent
+# from the build. The reasoning is written out at the top of each file.
+[[example]]
+name = "resize_bench"
+required-features = ["simd"]
+
 [dependencies]
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
@@ -216,6 +238,8 @@ avif = ["image/avif"]
 # has always produced RGBA8 whatever the source buffer type was. The flag
 # therefore removes code this build can never call, and nothing else.
 simd = ["dep:fast_image_resize", "fast_image_resize/only_u8x4"]
+# deliberately undeclared in the matrix, for the self-test demo
+thumbnailer = []
 
 [dependencies.fast_image_resize]
 # SIMD convolution resampler. Chosen over `libvips` deliberately: libvips is a

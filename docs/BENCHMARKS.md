@@ -52,33 +52,43 @@ case, median reported.
 
 ## Machine
 
-Taken on the Intel Xeon Platinum 6973P-C (Granite Rapids), 4 threads visible,
-AVX2, Linux 6.17.0-1022-azure, rustc 1.99.0, `--release`. **Every number in this
-section and in [Build cost](#build-cost) is from that machine.** The regression
-suite below was measured on a *different* one; see [Machines](#machines).
+The tables in [Results](#results) carry **two** machines, and each table names the
+one it belongs to. The first is the Intel Xeon Platinum 6973P-C (Granite Rapids)
+that phase-09 measured on, 4 threads visible, AVX2, Linux 6.17.0-1022-azure, rustc
+1.99.0, `--release`; the second is the AMD EPYC 9V74 (Milan, Zen 3) phase-19
+re-ran the same binary on. **Every number in [Build cost](#build-cost) is from the
+Xeon.** The regression suite below was measured on a *different* one again; see
+[Machines](#machines).
 
 The AVX2 line is the one that matters for reading the rest of this section, and
 it is the harness's most fragile claim. `fast_image_resize` dispatches at runtime
 on CPU features (`cpu_extensions.rs`: AVX2, else SSE4.1, else scalar), and the
 crate does not expose which one it picked, so the example reproduces that
 decision by reading `/proc/cpuinfo` itself. **These numbers are AVX2 numbers.** An
-ARM phone runs a different kernel and the speedup there is unmeasured.
+ARM phone runs a different kernel and the speedup there is unmeasured — and
+phase-19's second machine, also reporting AVX2, moved the top of the range from
+19.90× to 12.45×, which is what that caveat is worth.
 
 ## Machines
 
-Two runs, two machines, and the tables below are **not comparable across them**.
-Quoting a ratio from one against a number from the other would be the easiest
-mistake to make with this file, so the machines are named up front.
+Three runs, three machines, and the tables below are **not comparable across
+them**. Quoting a ratio from one against a number from the other would be the
+easiest mistake to make with this file, so the machines are named up front.
 
-| | Resize kernels, build cost | Regression suite |
-| --- | --- | --- |
-| CPU | Intel Xeon Platinum 6973P-C (Granite Rapids) | AMD EPYC 7763 (Milan, Zen 3) |
-| Threads visible | 4 | 4 |
-| ISA | AVX2 | AVX2 |
-| OS | Linux 6.17.0-1022-azure x86_64 | same |
-| Toolchain | rustc 1.99.0 (b940084d7 2026-09-28) | same |
-| Features | default, plus `simd` for the SIMD column | `--all-features`, so `simd` is **on** |
-| Recorded in | this section | `core/benches/baseline/machine.json` |
+| | Resize kernels (phase-09) | Resize kernels (phase-19) | Regression suite |
+| --- | --- | --- | --- |
+| CPU | Intel Xeon Platinum 6973P-C (Granite Rapids) | AMD EPYC 9V74 (Milan, Zen 3) | AMD EPYC 7763 (Milan, Zen 3) |
+| Threads visible | 4 | 4 | 4 |
+| ISA | AVX2 | AVX2 | AVX2 |
+| OS | Linux 6.17.0-1022-azure x86_64 | same | same |
+| Toolchain | rustc 1.99.0 (b940084d7 2026-09-28) | same | same |
+| Features | default, plus `simd` for the SIMD column | same | `--all-features`, so `simd` is **on** |
+| Recorded in | the first table in [Results](#results) | the second table in [Results](#results) | `core/benches/baseline/machine.json` |
+
+Two of these three are Milan, one is Granite Rapids, and the phase-19 column is the
+control that makes the point: **same toolchain, same `Cargo.lock`, same ISA
+label, same binary, two CPUs, and the SIMD speedup range changes by 1.6× at the
+top end.** Neither column is wrong. A range quoted without its machine is.
 
 The feature row matters most for resize. **`resize/*` in the suite is the SIMD
 kernel**, because `--all-features` turns it on, so the suite's 79.8 ms for a 24 MP
@@ -333,7 +343,7 @@ nothing about a real export.
 output on that case, and `mean` the mean of them. Both out of 255.
 
 | Case | Filter | Source → target | Reference | SIMD | Speedup | maxdiff | mean |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
 | 24 MP to 1920 wide | Lanczos3 | 6000×4000 → 1920×1280 | 555.8 ms | 68.4 ms | **8.13×** | 1 | 0.01 |
 | 24 MP to 400 wide | Lanczos3 | 6000×4000 → 400×267 | 348.1 ms | 77.3 ms | **4.50×** | 1 | 0.03 |
 | 4000 px to thumbnail | Triangle | 4000×3000 → 400×300 | 66.1 ms | 25.0 ms | **2.64×** | 1 | 0.04 |
@@ -345,28 +355,71 @@ Medians of five, from one run; three further runs of the same binary gave 7.10×
 The first row's 555.8 ms and 498.8 ms are the same case measured minutes apart on
 a shared runner.
 
+### The same binary on a second machine, and what it changes
+
+Phase-19 re-ran this example, unchanged, on the **AMD EPYC 9V74** (Milan, Zen 3,
+4 threads, AVX2) that the [regression suite](#machines) is measured on — which is
+how this section came to carry two machines for one table.
+
+| Case | Filter | Source → target | Reference | SIMD | Speedup | maxdiff | mean |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| 24 MP to 1920 wide | Lanczos3 | 6000×4000 → 1920×1280 | 724.6 ms | 83.9 ms | **8.63×** | 1 | 0.01 |
+| 24 MP to 400 wide | Lanczos3 | 6000×4000 → 400×267 | 611.8 ms | 83.1 ms | **7.36×** | 1 | 0.03 |
+| 4000 px to thumbnail | Triangle | 4000×3000 → 400×300 | 88.9 ms | 32.3 ms | **2.75×** | 1 | 0.04 |
+| 800 px to 4000 px upscale | Lanczos3 | 800×600 → 4000×3000 | 504.8 ms | 40.5 ms | **12.45×** | 1 | 0.03 |
+| 24 MP to 1920 wide | Gaussian | 6000×4000 → 1920×1280 | 721.8 ms | 80.3 ms | **8.99×** | 1 | 0.01 |
+
+**What reproduces, and what does not.** The correctness claim reproduces exactly:
+`maxdiff` is 1 on every row on both machines, with means of 0.01 to 0.04 of 255 —
+the two kernels are the same picture to within rounding, and that is a property of
+the arithmetic rather than of the CPU. **The speedup range does not.** Same
+`resize_bench.rs`, same `resize.rs` (unchanged since phase-09), same
+`image` 0.25.10 and `fast_image_resize` 6.1 from `core/Cargo.lock`; two CPUs, both
+AVX2, and the ceiling moves from 19.90× to 12.45×.
+
+So the range that used to be quoted as **2.6× to 19.9×** is a measurement of two
+machines, not a property of this code:
+
+- **the floor reproduces** — 2.64× and 2.75× on the thumbnail, the memory-bound
+  case where both kernels are streaming 96 MB of source pixels;
+- **the ceiling does not** — 19.90× on the Xeon, 12.45× on the EPYC, a difference
+  large enough that quoting 19.9× as *the* SIMD speedup would be quoting a CPU.
+  `fast_image_resize` dispatches at runtime and its scalar and AVX2 paths have
+  different ratios against `image`'s `f32` loop; the harness can only report which
+  kernel the *crate* picked by reading `/proc/cpuinfo` and applying the same order,
+  which is why both rows here say "AVX2" and neither can be more precise than that.
+
+Everything below that stated the range as a single number has been corrected to
+name both machines, and the argument for leaving `simd` off by default is
+*stronger* after this run, not weaker: a range that moves 1.6× when the CPU does
+is not something to ship a default on.
+
 ### What the numbers say
 
 **The win is real and it is the one the UI needs.** A single 24-megapixel phone
-photo exported to 1920 wide goes from about half a second to about 70 ms. That is
-the difference between a progress bar and an instant result, and it is the case
-`web-hero` and `web-card` presets actually run.
+photo exported to 1920 wide goes from about half a second — 555.8 ms on the Xeon,
+724.6 ms on the EPYC — to 68.4 ms or 83.9 ms. That is the difference between a
+progress bar and an instant result, and it is the case the `web-hero` and
+`web-card` presets actually run. **8.13× and 8.63×** on the two machines: the one
+number in this file that agrees to two significant figures.
 
-**The upscale is the extreme of it — 19.9×.** That is not the SIMD kernel being
-clever; it is `image`'s kernel being quadratic in a way that hurts. Upscaling
-800×600 to 4000×3000 produces 12 MP of destination from 0.5 MP of source, so the
-reference kernel's per-destination-sample overhead dominates, and a filter-width
-loop over 6 taps is exactly what vectorises well.
+**The upscale is the extreme of it — 19.9× on the Xeon, 12.5× on the EPYC.** That
+is not the SIMD kernel being clever; it is `image`'s kernel being quadratic in a
+way that hurts. Upscaling 800×600 to 4000×3000 produces 12 MP of destination from
+0.5 MP of source, so the reference kernel's per-destination-sample overhead
+dominates, and a filter-width loop over 6 taps is exactly what vectorises well.
+The mechanism is the same on both machines; the ceiling it reaches is not.
 
-**Downscales gain least — 2.6× on the thumbnail, 4.5× at 400 wide.** Both kernels
-scale their filter support by the reduction ratio and become area averages, and
-the work is dominated by streaming 96 MB of source pixels rather than by
+**Downscales gain least — 2.6× on the thumbnail, 4.5× or 7.4× at 400 wide.** Both
+kernels scale their filter support by the reduction ratio and become area averages,
+and the work is dominated by streaming 96 MB of source pixels rather than by
 arithmetic. This is the honest floor: whatever the vectorisation is worth, a
-memory-bound pass cannot get more than a small multiple of it.
+memory-bound pass cannot get more than a small multiple of it, and it is the one
+end of the range that did not move.
 
 **Agreement on realistic content is one least-significant bit.** Every row's
-`maxdiff` is 1 and the mean is 0.01 to 0.04 of 255. On a photograph the two
-kernels are the same picture to within rounding.
+`maxdiff` is 1 and the mean is 0.01 to 0.04 of 255 — on both machines. On a
+photograph the two kernels are the same picture to within rounding.
 
 ### And where they do not
 
@@ -497,17 +550,22 @@ This buys most of the win for 10 seconds of CI and no new toolchain.
 ## The judgement call
 
 The phase prompt asks whether the difference is worth a feature flag, a second code
-path and the maintenance cost forever. Measured: **2.6× to 19.9×, agreeing to
-within one LSB on real content, for 10 seconds of build time.**
+path and the maintenance cost forever. Measured: **2.6× to 19.9× on a Granite
+Raps Xeon and 2.8× to 12.5× on a Milan EPYC — both x86-64 AVX2, both with the
+same toolchain and the same lockfile — agreeing to within one LSB on real content
+on both, for 10 seconds of build time.**
 
 Yes, that is worth it — but **not enough to turn the flag on yet**, and the reason
-is not the numbers.
+is not the numbers. It is, if anything, more clearly not enough after phase-19's
+second machine, because the top of the range moved 1.6× with the CPU:
 
-1. **Every number here is x86-64 AVX2.** `fast_image_resize` dispatches at
-   runtime, so a phone on ARM runs a different kernel with a different amount of
-   vectorisation. Phase-09's build is the one shipped to a phone, and its speedup
-   is unmeasured. Turning the default on from an x86 runner is turning it on from
-   the wrong machine.
+1. **Every number here is x86-64 AVX2, and the range is a property of the CPU as
+   much as of the code.** `fast_image_resize` dispatches at runtime, so a phone on
+   ARM runs a different kernel with a different amount of vectorisation — and
+   phase-19 showed the same effect between two server CPUs of the same ISA label.
+   Phase-09's build is the one shipped to a phone, and its speedup is unmeasured.
+   Turning the default on from an x86 runner is turning it on from the wrong
+   machine.
 2. **The wrong-kernel floor (31) is barely above the right-kernel ceiling (29).**
    Not a build risk — the tests catch it — but a signal that the two
    implementations are similar enough that future upgrades are the real risk.

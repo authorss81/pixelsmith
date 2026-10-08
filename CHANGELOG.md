@@ -123,7 +123,7 @@ from this document:
 | --- | --- |
 | AVIF **decode** | Recognised on input and named in an error message; there is no AV1 decoder in any configuration, so `avif_decode` is `false`. This build can write an AVIF and cannot read one back. |
 | HEIC decode | Off by default. The `heic` feature is not cross-compilation-tested on any shipped target, so enabling it by default would be a promise nobody has checked. |
-| SIMD resize | Behind `simd`, off by default. 2.6×–19.9× on x86-64 AVX2, **unmeasured on the ARM phone this ships to**. |
+| SIMD resize | Behind `simd`, off by default. 2.6×–19.9× on a Granite Rapids Xeon and 2.8×–12.5× on a Milan EPYC — both x86-64 AVX2, same lockfile — **unmeasured on the ARM phone this ships to**. |
 | Low-peak-memory decode | Behind `streaming`, off by default, and only real for PNG: a 120 MP PNG to 1000 px wide is a 4 MB job with it on and a 613 MB one with it off. |
 | Perceptual deduplication | Two lossy re-encodes of one photograph are two files. A missed duplicate appears in the report; a wrong merge would not. |
 | WebP/AVIF progressive and chroma | JPEG-only. libwebp's config has no chroma sampling factor and `avif`'s is unwired. |

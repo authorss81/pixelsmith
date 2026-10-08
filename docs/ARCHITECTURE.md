@@ -797,7 +797,7 @@ line 1 column 33554445"` and hard rule 9 is about the sentence a user reads.
 | --- | --- | --- |
 | `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codec below was off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
 | `webp-lossy` | **on** | Lossy WebP *write*, through the `webp` crate (libwebp, the reference encoder). On since phase-08: without it WebP is lossless, so there is no quality control and no byte ceiling — measured on the 600×400 `format::tests::photo` fixture, 101,656 bytes lossless against 2,638 at q80, which is 39× and the difference between a resizer whose WebP export is worth choosing and one where it is an also-ran. What it costs is a C toolchain: `libwebp-sys` compiles 159 vendored `.c` files with `cc`, about 39 s on a cold release build of this crate — no CMake, no nasm, no code generator, and `cc` is the same compiler already building the Rust. The per-target matrix that checks it is `workspace/phase-08/build-webp-lossy-matrix.patch`, not yet applied; see the WebP section above. With the feature off, WebP output is lossless again and `is_lossless()` says so. |
-| `simd` | off | The resize *kernel*, not a format: `pipeline::resize_to` calls `resize::resample`, which uses `image`'s implementation unless this is on, in which case `fast_image_resize` performs the same pass. Pure Rust with runtime CPU detection — no C toolchain, no nasm, no code generation — which is why it costs 10 s on a cold release build where `webp-lossy` costs 39 s. Measured 2.6× to 19.9× on the reference kernel's own workload, agreeing to within one least-significant bit per channel on photographic content (`docs/BENCHMARKS.md`). Off by default because every one of those numbers is x86-64 AVX2 and the crate dispatches on runtime CPU features, so the speedup on the ARM phone this ships to is unmeasured; flipping the default is phase-10's call with an ARM machine in the room. With it off, every byte this engine produces is identical — `image`'s kernel is still the only kernel compiled in, and it is still the oracle the SIMD path is checked against. |
+| `simd` | off | The resize *kernel*, not a format: `pipeline::resize_to` calls `resize::resample`, which uses `image`'s implementation unless this is on, in which case `fast_image_resize` performs the same pass. Pure Rust with runtime CPU detection — no C toolchain, no nasm, no code generation — which is why it costs 10 s on a cold release build where `webp-lossy` costs 39 s. Measured 2.6× to 19.9× on a Granite Rapids Xeon and 2.8× to 12.5× on a Milan EPYC — same toolchain, same lockfile, same `AVX2` label, so the range is as much a property of the CPU as of the code — agreeing to within one least-significant bit per channel on photographic content on both (`docs/BENCHMARKS.md`). Off by default because every one of those numbers is x86-64 AVX2 and the crate dispatches on runtime CPU features, so the speedup on the ARM phone this ships to is unmeasured; flipping the default is phase-10's call with an ARM machine in the room. With it off, every byte this engine produces is identical — `image`'s kernel is still the only kernel compiled in, and it is still the oracle the SIMD path is checked against. |
 | `streaming` | off | The **decode** path, not a format: `worker::process_one` resizes a row at a time, from the row being decoded into the destination, instead of materialising the source. Off by default for two reasons, both in `docs/BENCHMARKS.md`: it is a second code path whose correctness rests on replicating `image`'s coefficient definition, and the wall-clock comparison that would justify turning it on has not been run on the ARM phone this ships to — the same argument that keeps `simd` off. Measured, at 120 MP to 1000 px wide: **613 MB peak in memory against 4 MB**, and one least-significant bit of difference from the in-memory kernel across five filters and seven size pairs. Behind the flag it is not the default, because "less memory" is only half of what a decode path has to be. Not in `capabilities()`: it changes no format's readability or writability, so a field there would be a capability the UI has nothing to do with — the same reasoning as `simd`. |
 | `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default, and the reason is now stated rather than deferred: phase-08 was the phase this flag waited for, and what it actually did was turn on `webp-lossy` instead — the reason recorded here was "an opt-in feature that has never been cross-compiled is a promise nobody has checked", and that check still has not happened for `heic`, because the `webp-lossy-matrix` job does not build it. Enabling it would put the flag in front of a target matrix nothing has run against. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
@@ -816,6 +816,14 @@ one flag whose value is a *build* property rather than a format property:
 the feature reports the knob as inert rather than offering a slider that changes
 nothing. Both configurations are asserted by
 `format::tests::webp_reports_the_truth_about_this_build`.
+
+**Every combination of these five flags compiles**, and the gate says so: section
+2b runs `scripts/feature-matrix.sh`, which `cargo check`s nine of the thirty-two.
+The flags' *behaviour* is not uniform — `webp_lossy` and `avif_encode` change what
+a build can write, `simd` and `streaming` change how it resizes and decodes, and
+`heic_decode` changes what it can read — so a configuration is not a synonym for a
+feature and a new flag is a new row in that script whether or not it is on by
+default. See [Every feature configuration, not one](#every-feature-configuration-not-one).
 
 ## The second decode path, and what it is not
 
@@ -1354,6 +1362,47 @@ Two things about it worth knowing before you touch it:
 - Checks that shell out filter cargo's output with `grep -E '^(warning|error)'`,
   so cargo runs with `--color=never`. With the default ANSI colouring the escape
   sequences defeat the filter and a failing run reports no reason at all.
+
+### Every feature configuration, not one
+
+`--all-features` is **one** of the thirty-two configurations this crate has, and
+for most of the project's life it was the only one that had ever been compiled.
+That is not a detail: `core/tests/streaming_peak.rs` reached
+`pixelsmith_core::stream` with no gate of its own and `core/examples/resize_bench.rs`
+was `#![cfg(feature = "simd")]`, so `cd core && cargo test` — the command
+`README.md` tells a contributor to run — failed with `E0433` and `E0601`, and
+`--no-default-features` had never been built at all. The green gate was the
+reason nobody saw it. Audit finding 2; closed in phase-19.
+
+Two different mechanisms fix the two different failures, because the two targets
+are built differently:
+
+| | mechanism | why that one |
+| --- | --- | --- |
+| `core/tests/streaming_peak.rs` | `#![cfg(feature = "streaming")]` at the top of the file | an integration test is compiled with `--test`, so libtest supplies `main` and a crate whose items are all gated out is a harness reporting `running 0 tests`. A test that compiles to nothing should *say so* rather than be absent from the build. |
+| `core/examples/resize_bench.rs` | `required-features = ["simd"]` on `[[example]]` in `core/Cargo.toml` | an example is a binary target, so an `#[cfg]` that removes every item removes `fn main` and rustc reports `main function not found`. `required-features` makes cargo decline to build the target and say which feature it wanted, which is the only version of this that can explain itself. |
+
+`scripts/feature-matrix.sh` is in the gate (section 2b) and compiles nine
+configurations with `cargo check --lib --bins --tests --examples`: the three
+canonical builds (`default`, `--no-default-features`, `--all-features`), one row
+per feature, and `streaming` + `simd` together. It compiles rather than runs,
+because a gate, a missing `main` and a missing import are all decided at compile
+time, and the suite already costs five minutes per run. **What that buys is
+stated rather than implied: outside `--all-features`, the matrix proves the tests
+compile, not that they pass.** The one configuration whose *behaviour* differs is
+also the one the gate runs a slice of — `--no-default-features` executes
+`format::tests`, which is where the AVIF and lossy-WebP refusal arms live and the
+only build in which they are the arms that run.
+
+All thirty-two combinations were checked by hand for phase-19 and all thirty-two
+compile; the nine in the gate are the ones a reader expects to be named, plus the
+floor `scripts/feature-matrix.sh --self-test` enforces by counting
+`core/Cargo.toml`'s own `[features]` table — a sixth feature with no row fails
+the self-test and names it. That self-test also runs a deliberately failing
+configuration in both directions, because this repository has seven recorded
+instances of a gate check that could not report the truth — all of them listed in
+`scripts/verify.sh` — and two of them cost a phase whose work was already
+finished.
 
 `cargo deny` is **not** part of the gate; it runs in
 `.github/workflows/supply-chain.yml`. Its `bans` check is currently red on two

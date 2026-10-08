@@ -25,8 +25,22 @@
 //! because it is there to make disagreement visible. Benchmarking the adversarial
 //! fixture would flatter the reference kernel, whose `f32` accumulation is
 //! well-conditioned on the whole plane, and say nothing about a real export.
-
-#![cfg(feature = "simd")]
+//!
+//! ## Why the gate on `simd` is in core/Cargo.toml and not here
+//!
+//! This used to open with `#![cfg(feature = "simd")]`, which is the second half
+//! of audit finding 2 and fails for a reason specific to examples: an `#[cfg]`
+//! that removes every item removes `fn main` as well, and an example is a binary
+//! target, so rustc then reports `error[E0601]: main function not found in crate
+//! resize_bench`. `cargo test` builds examples, so `cargo test` and
+//! `cargo test --features streaming` both failed on a benchmark nobody had asked
+//! for.
+//!
+//! The `[[example]]` entry in core/Cargo.toml carries `required-features =
+//! ["simd"]` instead, so cargo declines to build the target at all and says why
+//! — `target 'resize_bench' ... requires the features: 'simd'` — rather than
+//! handing rustc a crate with no entry point. `required-features` is also the
+//! only one of the two mechanisms that `cargo run --example` can explain.
 
 use std::time::{Duration, Instant};
 

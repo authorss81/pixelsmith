@@ -223,6 +223,16 @@ mod tests {
     /// Largest absolute per-channel difference, the mean of them, and where the
     /// worst one was. Both are reported so a failure says which of the two
     /// "off by one rounding step" or "off by a whole kernel" it is.
+    ///
+    /// This and the two functions below it live in `simd_agreement` rather than
+    /// here, and used to be here. They exist to compare the two kernels, so
+    /// without the `simd` feature nothing calls them, and a default build reported
+    /// three `never used` warnings for them — invisible for as long as the gate
+    /// ran clippy with `--all-features` and nothing else. Which is the same class
+    /// of defect as audit finding 2, one level down: a `cfg` on one side of a
+    /// reference and not the other. `scripts/feature-matrix.sh` now compiles
+    /// every configuration, so the next one of these is caught at the gate.
+    #[cfg(feature = "simd")]
     #[derive(Debug)]
     struct Difference {
         max: u32,
@@ -230,6 +240,7 @@ mod tests {
         at: (u32, u32, usize),
     }
 
+    #[cfg(feature = "simd")]
     fn difference(a: &image::RgbaImage, b: &image::RgbaImage) -> Difference {
         assert_eq!(a.dimensions(), b.dimensions());
         let mut max = 0u32;
@@ -255,6 +266,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "simd")]
     fn reference(
         img: &image::RgbaImage,
         width: u32,
