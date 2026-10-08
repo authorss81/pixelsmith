@@ -12,7 +12,7 @@
 
 use crate::error::{Error, Result};
 use crate::format::{EncodingOptions, OutputFormat};
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Orientation, Pipeline};
 use crate::target::{TargetBytes, default_encoder};
 use crate::validate::Limits;
 use rayon::prelude::*;
@@ -166,10 +166,33 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // file that quietly misses the ceiling they asked for.
     settings.validate()?;
     // Header check first: it rejects a hostile file before we allocate a
-    // pixel buffer for it.
-    crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
-    let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
-    let out = pipeline.apply(&decoded)?;
+    // pixel buffer for it. The streaming path re-reads it rather than trusting
+    // this call, because it is the header check that makes row-at-a-time decoding
+    // safe.
+    let report = crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
+
+    // Behind `streaming`: decode straight into the resized destination instead of
+    // materialising the source first. Chosen here rather than inside the pipeline
+    // because this is the layer that owns the request, and the three conditions
+    // below are about the request rather than about the picture.
+    #[cfg(feature = "streaming")]
+    let out = match streamed_resize(
+        job,
+        pipeline,
+        &settings.limits,
+        (report.width, report.height),
+    )? {
+        Some(img) => img,
+        None => {
+            let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
+            pipeline.apply(&decoded)?
+        }
+    };
+    #[cfg(not(feature = "streaming"))]
+    let out = {
+        let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
+        pipeline.apply(&decoded)?
+    };
 
     // Re-encoding from raw samples is what actually removes EXIF. If the user
     // opted to keep metadata we graft it back, minus anything sensitive.
@@ -233,6 +256,55 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         error: None,
     };
     Ok(Processed { outcome, bytes })
+}
+
+/// Resize while the bytes are still compressed, or `None` to use the in-memory
+/// path.
+///
+/// Three conditions, each of which is a case this does *not* handle rather than a
+/// preference:
+///
+/// * **No crop.** A crop is a sub-rectangle of the source, and reading one row at
+///   a time can honour it — but only after the row reader is inside the crop's
+///   row range, and PNG's filters are sequential so every row above it must be
+///   inflated and unfiltered anyway. Worth doing, and not worth doing quietly
+///   inside a phase whose subject is peak memory.
+/// * **No orientation transform.** A quarter turn needs the source or a transposed
+///   read of it.
+/// * **A resize that changes the size.** Without one there is nothing to stream
+///   for, and the whole-image decode is already the minimum.
+///
+/// The kernel comes from [`crate::pipeline::filter_for`], so this path and
+/// `resize_to` cannot pick different filters for the same request.
+#[cfg(feature = "streaming")]
+fn streamed_resize(
+    job: &Job,
+    pipeline: &Pipeline,
+    limits: &Limits,
+    (src_w, src_h): (u32, u32),
+) -> Result<Option<image::DynamicImage>> {
+    if pipeline.crop.is_some() {
+        return Ok(None);
+    }
+    if pipeline
+        .orientation
+        .is_some_and(Orientation::needs_transform)
+    {
+        return Ok(None);
+    }
+    let Some(spec) = pipeline.resize.as_ref() else {
+        return Ok(None);
+    };
+    if !spec.has_effect(&image::DynamicImage::new_rgba8(src_w, src_h)) {
+        return Ok(None);
+    }
+    let (dst_w, dst_h) = pipeline.output_dimensions(src_w, src_h)?;
+    if (dst_w, dst_h) == (src_w, src_h) {
+        return Ok(None);
+    }
+    let filter = crate::pipeline::filter_for(spec, src_w, src_h);
+    let img = crate::stream::decode_resized(&job.bytes, limits, (dst_w, dst_h), filter)?;
+    Ok(Some(img))
 }
 
 /// Run a batch in parallel. Failures are collected, not propagated.

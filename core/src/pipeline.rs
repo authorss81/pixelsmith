@@ -202,21 +202,31 @@ impl Pipeline {
     }
 
     /// Run the pipeline. At most one resampling pass happens.
+    ///
+    /// The source is borrowed until the first step that has to build a new
+    /// buffer, which is the point of the `Cow`: a straight resize used to clone
+    /// the whole decoded image before resizing it. A 120 MP source therefore cost
+    /// two copies of itself plus the kernel's `f32` intermediate — 480 MB of RGBA
+    /// twice over and 160 MB of intermediate for a 3.3 MB output, about 1.1 GB.
+    /// Dropping the clone is what took the measured figure to 613 MB
+    /// (docs/BENCHMARKS.md), and `into_owned` still copies when no step applied at
+    /// all, because the caller gets an owned value either way.
     pub fn apply(&self, img: &image::DynamicImage) -> Result<image::DynamicImage> {
-        let mut out = img.clone();
+        use std::borrow::Cow;
 
-        if let Some(crop) = self.crop {
-            out = crop_apply(&out, crop)?;
-        }
+        let mut out: Cow<'_, image::DynamicImage> = match self.crop {
+            Some(crop) => Cow::Owned(crop_apply(img, crop)?),
+            None => Cow::Borrowed(img),
+        };
 
         if let Some(o) = self.orientation.filter(|o| o.needs_transform()) {
-            out = o.apply(&out);
+            out = Cow::Owned(o.apply(&out));
         }
 
         if let Some(spec) = self.resize.filter(|s| s.has_effect(&out)) {
-            out = resize_to(&out, spec)?;
+            out = Cow::Owned(resize_to(&out, spec)?);
         }
-        Ok(out)
+        Ok(out.into_owned())
     }
 
     /// Predict the output size without touching pixels, so the UI can show
@@ -322,6 +332,27 @@ impl ResizeSpec {
     }
 }
 
+/// The kernel one resize will use, including the extreme-reduction fallback.
+///
+/// A method rather than an expression at the call site because there are two call
+/// sites now — `resize_to` and, behind the `streaming` feature,
+/// [`crate::stream::decode_resized`] — and a stream that resampled an extreme
+/// reduction with Lanczos3 while the in-memory path used Triangle would be the
+/// exact blur this engine bans.
+pub fn filter_for(spec: &ResizeSpec, src_w: u32, src_h: u32) -> FilterType {
+    let (dst_w, dst_h) = match spec.resolve(src_w, src_h) {
+        Ok(size) => size,
+        Err(_) => return spec.filter.to_imageops(),
+    };
+    // Extreme reductions alias badly with any convolution kernel, so drop to a
+    // cheaper linear kernel, which is the right behaviour for decimation.
+    if f64::from(dst_w.min(dst_h)) < f64::from(src_w.max(src_h)) / 3.0 {
+        FilterType::Triangle
+    } else {
+        spec.filter.to_imageops()
+    }
+}
+
 /// `target = (source * target) / source` without overflow.
 fn scale_axis(source: u32, source_ref: u32, target: u32) -> u32 {
     if source_ref == 0 {
@@ -356,13 +387,7 @@ pub fn resize_to(img: &image::DynamicImage, spec: ResizeSpec) -> Result<image::D
         return Ok(img.clone());
     }
 
-    // Extreme reductions alias badly with any convolution kernel, so drop to a
-    // cheaper linear kernel, which is the right behaviour for decimation.
-    let filter = if f64::from(w.min(h)) < f64::from(img.width().max(img.height())) / 3.0 {
-        FilterType::Triangle
-    } else {
-        spec.filter.to_imageops()
-    };
+    let filter = filter_for(&spec, img.width(), img.height());
 
     // `resize` owns the kernel choice: the reference implementation from
     // `image`, or `fast_image_resize` when the `simd` feature is on. Both are

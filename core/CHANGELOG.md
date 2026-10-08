@@ -9,6 +9,18 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Low-peak-memory decode, behind the off-by-default `streaming` feature.**
+  `stream::decode_resized` decodes a row at a time and resamples it into the
+  destination in the same pass, so peak memory is the output buffer plus one row
+  rather than two copies of the source plus the kernel's `f32` intermediate.
+  Measured at 120 MP resized to 1000 px wide: **613 MB in memory, 4 MB
+  streaming**, agreeing with `resize::resample_reference` to one least-significant
+  bit across five filters and seven size pairs. One resampling pass, not two: the
+  horizontal and vertical passes commute, so the two paths run the same filter in
+  the order that does not need the whole source in memory.
+  `Limits::streamed_pixels_budget()` and `Limits::streaming_memory_budget()` bound
+  it — methods, not fields, so the JSON contract the Dart side mirrors is
+  unchanged and the in-memory path's ceiling is untouched.
 - **AVIF encode, on by default.** The `avif` feature is back and in `default`,
   writing through `image`'s own encoder (rav1e via ravif) rather than the
   hand-written one that never compiled. It is pure Rust with no C toolchain and
@@ -91,6 +103,15 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   29 fields and none is a chroma sampling factor, because VP8 always stores 4:2:0.
   `supports_chroma_subsampling()` reports `false` rather than offering a slider
   that cannot move.
+
+### Fixed
+
+- **`Pipeline::apply` no longer clones the decoded source.** It ran
+  `img.clone()` before every transform, so a straight resize paid for two copies
+  of the whole image: about 1.1 GB for a 120 MP source and a 3.3 MB output, now
+  613 MB. The source is borrowed until the first step that has to build a new
+  buffer.
+
 
 ## [0.1.0]
 

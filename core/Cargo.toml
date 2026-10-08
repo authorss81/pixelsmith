@@ -77,6 +77,23 @@ libc = "0.2"
 
 [features]
 default = ["avif", "webp-lossy"]
+
+# Low-peak-memory decode, OFF by default (phase-11). `stream::decode_resized`
+# decodes an image a row at a time and resamples it into the destination in one
+# pass, so peak memory is the output buffer plus two row scratch buffers instead
+# of two copies of the source.
+#
+# The measurements behind the flag are in docs/BENCHMARKS.md. It stays off
+# because "less memory" is not the only axis: the flag is a second decode path,
+# and it is only correct for a subset of the formats `image` can open (see
+# `stream::Source`). Turning it on is a call for whoever has an ARM phone and a
+# 200-megapixel panorama to hand, not one to make from an x86 runner.
+#
+# `png` is a dependency for the row-at-a-time path and nothing else: `image`
+# 0.25 exposes only whole-image `read_image` for every codec, and `png` 0.18 is
+# the only one in this tree with a row API (`Decoder::next_row`). It is the same
+# version `image` already depends on, so the flag costs no extra compilation.
+streaming = ["dep:png"]
 # Lossy WebP via libwebp, ON by default since phase-08. The reasoning, and the
 # measurement behind it:
 #
@@ -221,6 +238,18 @@ features = ["std"]
 version = "0.3"
 optional = true
 
+[dependencies.png]
+# The row-at-a-time decoder behind the `streaming` feature, and nothing else.
+#
+# It is here because `image` 0.25 exposes no strip or row API for any codec —
+# every one of them implements only whole-image `read_image(self, buf)` — while
+# `png` 0.18 has `Decoder::next_row()`. Pure Rust, no C, no build script, and
+# already in the dependency tree through `image` at the same version, so
+# enabling the flag adds no compilation that is not already paid for.
+version = "0.18"
+optional = true
+default-features = false
+
 [dependencies.heic-rs]
 version = "0.1.1"
 optional = true
@@ -267,6 +296,10 @@ kamadak-exif = "0.6"
 # not unified into a plain `cargo build --release`, so nothing here reaches the
 # shipped library.
 heic-rs = { version = "0.1.1", default-features = false, features = ["std", "bench"] }
+# The streaming feature's own decoder, so an integration test can build a PNG
+# fixture row by row without the crate under test being its own dependency. Same
+# version as the optional dependency it exercises, so nothing extra is compiled.
+png = { version = "0.18", default-features = false }
 
 # One entry per hot path the phase prompt names: decode, resize, encode, the
 # byte-target search, and the two EXIF paths.

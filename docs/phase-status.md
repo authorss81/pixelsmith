@@ -22,7 +22,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-08 | Lossy WebP via libwebp, verified on every target | DONE | `374e6ed` | See [phase-08 notes](#phase-08-notes) below. The two prior attempts failed on a pre-existing gate defect, not on their work. |
 | phase-09 | SIMD resize path behind a feature flag | DONE | `e906fa6` | See [phase-09 notes](#phase-09-notes) below. |
 | phase-10 | Benchmarks and a performance regression gate | DONE | `0ebccdf` | See [phase-10 notes](#phase-10-notes) below. **The CI workflow is delivered as a patch, as in phase-05/06/07/08 — the gate does not run until it is applied.** |
-| phase-11 | Low-peak-memory decode for very large images | PENDING | | |
+| phase-11 | Low-peak-memory decode for very large images | DONE | (this commit) | See [phase-11 notes](#phase-11-notes) below. |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
 | phase-13 | Animated GIF: honest handling | PENDING | | |
 | phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
@@ -890,6 +890,109 @@ in under three minutes on one core.
   the honest statement is that the suite is measured by hand until someone
   applies it with a credential that may write workflows. `scripts/bench-compare.py`
   is what the workflow calls, and it works from a shell today.
+
+## phase-11 notes
+
+`cargo test --features streaming --all-features` passes, and
+`core/tests/streaming_peak.rs` asserts the phase's ceiling: a 120-megapixel
+source resized to 1000 px wide peaks at **4 MB** of live heap, against 613 MB
+through the in-memory path. `docs/BENCHMARKS.md` has the 24/60/120 MP table, how
+to re-measure it, and the quality comparison.
+
+**The premise in the prompt is false for this dependency set, and the phase is
+half as good because of it.** The prompt says "`image`'s decoders expose
+row-at-a-time reading for several formats; use it." `image` 0.25.10 exposes
+`read_image(self, buf: &mut [u8])` and nothing else, for every codec it ships —
+that is an allocation decision, not a traversal one. Below it, `zune-jpeg` 0.5 and
+`image-webp` 0.2 expose no strip or row API either, and neither has a scaled
+decode, so there is no decoder-side decimation to fall back on either.
+
+`png` 0.18 is the only decoder in this tree with `Decoder::next_row()`, so
+`stream::Source` has a row-at-a-time PNG arm and a whole-image arm for everything
+else. **A 120 MP PNG to 1000 px wide is a 4 MB job with the flag on; a 120 MP JPEG
+is a 613 MB one.** The second arm still removes the kernel's `f32` intermediate
+and the pipeline's clone, which is most of the win for the formats phones actually
+photograph in, but it cannot remove the source buffer, and no amount of code in
+this repository changes that without a decoder that streams. Recorded rather than
+rounded up, and `stream::tests::names_the_formats_it_cannot_stream` fails if it
+ever stops being true.
+
+**It is one resampling pass, which took a decision the prompt did not ask about.**
+The obvious way to cut peak memory is to box-average down and resize the small one
+second: two filter applications, banned by hard rule 5. Instead the horizontal and
+vertical passes are interleaved, which is legitimate because separable filters
+commute — every source pixel reaches the destination through exactly one
+horizontal weight and one vertical weight, so `h-then-v` and `v-then-h` are the
+same filter. `image` runs them in the order that needs the whole source in
+memory; this runs them in the order that does not, copying `image`'s coefficient
+arithmetic exactly. The measured difference over five filters and seven size
+pairs: **worst per-channel 1, worst mean 0.0071 of 255, all on upscales and zero
+on every downscale.**
+
+**The box-average question, answered with a number rather than an argument.** The
+prompt asks whether a box-average pre-reduction visibly changes quality. Measured
+against the single pass on the same fixture at 16:1, 8:1 and 4:1: **one
+least-significant bit** (worst channel 1, mean 0.08). So the single pass is here
+for memory and for hard rule 5, *not* because the composite would have been
+visibly worse — a thinner argument than it looks, so the doc says so. What is not
+measured is content with hard colour edges, where a box average and a Lanczos pass
+genuinely part company; that is recorded as unmeasured rather than as fine.
+
+**Two bugs the tests found, both of which were invisible by reading.** The
+accumulator pool drained from the back at end of stream while the loop above it
+drained from the front, so at the bottom edge of an upscale — where three
+destination rows share the last source row — the wrong accumulator was written to
+the wrong row, 6 LSB out and only on rows 69 of 72. And the Catmull-Rom
+coefficients were transcribed wrong for the 1 ≤ |x| < 2 branch (the `b = 0, c = 0.5`
+Mitchell-Netravali cubic is `(-3x³ + 15x² - 24x + 12)/6`, not
+`(-1.5x³ + 4.5x² - 3x)/6`), which the agreement matrix would have caught had it
+run before the first draft was finished.
+
+**`Limits` grew two methods and no fields**, so the JSON contract the Dart side
+mirrors is untouched and `app/` needs no patch for this phase. `streamed_pixels_budget()`
+is `max_pixels × 4` (160 MP mobile, 512 MP desktop) and `streaming_memory_budget()`
+is `max_pixels × 4` bytes. Raising `max_pixels` itself would have been the obvious
+mistake and the wrong one: it would have let the *in-memory* path try to
+materialise 160 MP on a phone, which is exactly what hard rule 4 exists to stop. A
+build without the flag never consults either.
+
+**`Pipeline::apply` no longer clones the source**, which is the other half of the
+memory story and applies to every format whether or not the flag is on. `img.clone()`
+ran before every transform, so a resize paid two copies of the whole decoded image
+plus the kernel's intermediate: about 1.1 GB for a 120 MP source and a 3.3 MB
+output, 613 MB after the change. The 120 MP PNG → 1000 px streaming figure of
+4 MB and the 613 MB in-memory figure are therefore not separable in the table, and
+`docs/BENCHMARKS.md` says so rather than presenting 613 MB as the pre-phase number.
+
+**A bug this phase found in `image`, recorded because the streaming path had to
+choose what to do about it.** `image::imageops::resize` always runs both separable
+passes, so a 800×800 → 800×400 resize runs a Lanczos3 pass with `ratio = 1.0`
+horizontally — a nine-tap blur across the axis that did not move. `stream::Axis`
+reproduces it rather than fixing it, because fixing it would change existing
+exports' pixels and this phase is about memory. The one-axis case in the agreement
+matrix is what stops the two paths from drifting apart about it.
+
+**Not done, and named rather than glossed:**
+
+- **The flag is off by default and the comparison that would turn it on has not
+  been run.** Memory is measured; wall clock is not, in the same table or
+  anywhere else, and "less memory" is only half of what a decode path has to be.
+  A 120 MP streaming decode in a debug build took 83 s, against 141 s for the run
+  including the in-memory comparison, which is not a release number and settles
+  nothing. This is the same argument that keeps `simd` off.
+- **Crop and orientation fall back to the in-memory path.** Both need the source
+  or a transposed read of it, and `worker::process_one` checks for them explicitly
+  rather than quietly producing a wrong picture. A crop is *implementable* here —
+  the row reader can start inside the crop's row range — but PNG's filters are
+  sequential, so every row above the crop still has to be inflated, and doing that
+  is a change to the pipeline's ordering, not a memory optimisation.
+- **A whole-image decode is still 613 MB for a 120 MP JPEG**, and the mobile
+  profile's own ceiling is 256 MB in the sandbox, so that combination is refused
+  rather than attempted. What a real phone does about a 120 MP panorama is the
+  judgement call this phase cannot make from a runner.
+- **The peak test is a debug-build measurement**, which is fine for allocation and
+  says nothing about time. It also takes 83 s, so only the 120 MP row runs by
+  default; `PX_MEASURE_BEFORE=1` produces the whole table.
 
 ## Status values
 

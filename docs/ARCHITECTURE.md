@@ -9,7 +9,7 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Thirteen modules, one submodule, no circular references. Dependencies point downward:
+Fourteen modules, one submodule, no circular references. Dependencies point downward:
 `lib.rs` → `worker.rs` / `pipeline.rs` → `resize.rs` → `validate.rs` / `heic.rs` → `error.rs`.
 Nothing below `error.rs` knows anything exists above it.
 
@@ -21,6 +21,7 @@ Nothing below `error.rs` knows anything exists above it.
 | `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
 | `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
+| `core/src/stream.rs` | The low-peak-memory decode, behind `streaming`: decode a row at a time, resample it into the destination in the same pass. One resampling pass, one output-sized buffer. | `decode_resized()`, `working_set_bytes()`, `Axis` |
 | `core/src/resize.rs` | The single resampling pass and the two kernels that can perform it: `image`'s reference implementation (the default, and the oracle) and `fast_image_resize` behind the `simd` feature. Exists so hard rule 5 has exactly one call site and a benchmark times the same entry point production uses. | `resample()`, `resample_reference()`, `simd::try_resample()` |
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
@@ -406,10 +407,11 @@ Buffer ownership, in full:
 | `avif` | **on** | AVIF *write*, through `image`'s rav1e encoder: pure Rust, no C toolchain, no nasm, no build script, so it compiles for all four shipped targets. On because the reasons the codec below was off do not apply to it; what it costs is measured encode time, in `docs/ARCHITECTURE.md` above. |
 | `webp-lossy` | **on** | Lossy WebP *write*, through the `webp` crate (libwebp, the reference encoder). On since phase-08: without it WebP is lossless, so there is no quality control and no byte ceiling — measured on the 600×400 `format::tests::photo` fixture, 101,656 bytes lossless against 2,638 at q80, which is 39× and the difference between a resizer whose WebP export is worth choosing and one where it is an also-ran. What it costs is a C toolchain: `libwebp-sys` compiles 159 vendored `.c` files with `cc`, about 39 s on a cold release build of this crate — no CMake, no nasm, no code generator, and `cc` is the same compiler already building the Rust. The per-target matrix that checks it is `workspace/phase-08/build-webp-lossy-matrix.patch`, not yet applied; see the WebP section above. With the feature off, WebP output is lossless again and `is_lossless()` says so. |
 | `simd` | off | The resize *kernel*, not a format: `pipeline::resize_to` calls `resize::resample`, which uses `image`'s implementation unless this is on, in which case `fast_image_resize` performs the same pass. Pure Rust with runtime CPU detection — no C toolchain, no nasm, no code generation — which is why it costs 10 s on a cold release build where `webp-lossy` costs 39 s. Measured 2.6× to 19.9× on the reference kernel's own workload, agreeing to within one least-significant bit per channel on photographic content (`docs/BENCHMARKS.md`). Off by default because every one of those numbers is x86-64 AVX2 and the crate dispatches on runtime CPU features, so the speedup on the ARM phone this ships to is unmeasured; flipping the default is phase-10's call with an ARM machine in the room. With it off, every byte this engine produces is identical — `image`'s kernel is still the only kernel compiled in, and it is still the oracle the SIMD path is checked against. |
+| `streaming` | off | The **decode** path, not a format: `worker::process_one` resizes a row at a time, from the row being decoded into the destination, instead of materialising the source. Off by default for two reasons, both in `docs/BENCHMARKS.md`: it is a second code path whose correctness rests on replicating `image`'s coefficient definition, and the wall-clock comparison that would justify turning it on has not been run on the ARM phone this ships to — the same argument that keeps `simd` off. Measured, at 120 MP to 1000 px wide: **613 MB peak in memory against 4 MB**, and one least-significant bit of difference from the in-memory kernel across five filters and seven size pairs. Behind the flag it is not the default, because "less memory" is only half of what a decode path has to be. Not in `capabilities()`: it changes no format's readability or writability, so a field there would be a capability the UI has nothing to do with — the same reasoning as `simd`. |
 | `heic` | off | HEIC/HEIF decode via `heic-rs`: pure Rust, no build script, no C, no new crates in the tree. Off by default, and the reason is now stated rather than deferred: phase-08 was the phase this flag waited for, and what it actually did was turn on `webp-lossy` instead — the reason recorded here was "an opt-in feature that has never been cross-compiled is a promise nobody has checked", and that check still has not happened for `heic`, because the `webp-lossy-matrix` job does not build it. Enabling it would put the flag in front of a target matrix nothing has run against. `docs/HEIC.md` has the comparison behind the choice, including the crate this one is a hard choice *against* (libheif) and the one it beats (AGPL). |
 
-`default = ["avif", "webp-lossy"]`. `simd` is deliberately not in it, and it
-is also deliberately not in `lib::capabilities()`: it changes no format's
+`default = ["avif", "webp-lossy"]`. `simd` and `streaming` are deliberately not in
+it, and are also deliberately not in `lib::capabilities()`: it changes no format's
 readability or writability, so a field there would be a capability the UI has
 nothing to do with. `lib::capabilities()` is generated from the format flags,
 so adding a codec means adding a flag *and* a field there — a
@@ -423,6 +425,76 @@ one flag whose value is a *build* property rather than a format property:
 the feature reports the knob as inert rather than offering a slider that changes
 nothing. Both configurations are asserted by
 `format::tests::webp_reports_the_truth_about_this_build`.
+
+## The second decode path, and what it is not
+
+`stream::decode_resized` is behind `streaming` and is *not* a smaller
+`decode_bounded`. It is a different traversal of the same filter, and the two
+claims in its name are worth separating.
+
+**It is still one resampling pass, and the reason is that separable filters
+commute.** Every source pixel reaches every destination pixel through exactly one
+horizontal weight and one vertical weight, so `h-then-v` and `v-then-h` are the
+same filter and a destination pixel is written once from `f32` accumulators.
+`image` runs the vertical pass into a `src_width x dst_height` `f32` buffer
+because that is the order that lets it start from a whole image; the streaming
+path runs the horizontal pass per row because that is the order that does not need
+one. The arithmetic — `ratio`, `sratio`, the clamped `left`/`right`, the
+normalised weights, one `round()` at the end — is copied from `image` coefficient
+for coefficient, which is why the two agree to one LSB rather than to "close
+enough".
+
+**The pre-filter is the kernel's own scaled support, and no box pass runs first.**
+At a reduction of R each destination pixel integrates `2 * support * R` source
+samples with weights `kernel((i - centre) / R)`. That is the anti-aliasing
+pre-filter, which is why an area-weighted average is the right *shape* for one: a
+box is the simplest kernel guaranteed non-negative and summing to one, where point
+sampling throws away pixels and bilinear smears across boundaries it should have
+averaged. The two-stage design — box down to twice the target, then resize that —
+is measured rather than argued, and it lands within **1 LSB** of the single pass on
+a photographic fixture at 16:1 (`docs/BENCHMARKS.md`). So the single pass is here
+for memory and for hard rule 5, not because the composite would have been visibly
+worse, and the case where that stops being true — hard colour edges — is recorded
+as unmeasured rather than as fine.
+
+**It cannot stream most formats, and that is a property of the dependency set.**
+`image` 0.25.10 gives every codec `read_image(self, buf: &mut [u8])` and nothing
+else; below it `zune-jpeg` 0.5 and `image-webp` 0.2 expose no strip, row or scaled
+decode either. `png` 0.18 is the only decoder in the tree with
+`Decoder::next_row()`. So `Source` has a row-at-a-time PNG arm and a whole-image
+arm for everything else, and the second one still removes the kernel's
+intermediate but not the source buffer — **a 120 MP JPEG to 1000 px wide is
+therefore a 613 MB job with this flag on, not a 4 MB one.** Interlaced, 16-bit,
+palette and animated PNGs also take the whole-image arm, because `png`'s row API
+returns Adam7 rows in pass order rather than display order.
+
+**It only runs for a plain resize**: no crop, no orientation transform, and a
+resize that changes the size. `worker::process_one` checks all three. Both
+exclusions are cases the streaming traversal would need a different ordering for,
+not cases it cannot do, and inventing a third ordering of the pipeline is not
+something this phase does quietly.
+
+### The two memory bounds, and why they are methods
+
+`Limits` grew no fields, so the JSON contract the Dart side mirrors is untouched.
+Two methods instead:
+
+| | `streamed_pixels_budget()` | `streaming_memory_budget()` |
+| --- | --- | --- |
+| Value | `max_pixels * 4` — 160 MP mobile, 512 MP desktop | `max_pixels * 4` — 160 MB mobile, 512 MB desktop |
+| What it is | an input ceiling for a decode that never materialises the picture | a ceiling on the streaming path's own working set |
+| Why that number | a streamed decode's peak is about the *destination*, so the pixel budget stops being a memory ceiling and becomes a CPU one | the profile's existing memory intent, stated once: 4 bytes per pixel is what `apply_to_decoder` already pushes into `image::Limits::max_alloc` |
+
+Raising `max_pixels` itself would have been the obvious mistake: it would have
+let the **in-memory** path try to materialise 160 MP on a phone, which is exactly
+the failure hard rule 4 exists to stop. A build without the `streaming` feature
+never consults either method, so its ceiling is unchanged.
+
+And on a target with no sandbox outside it — Windows, where `setrlimit` has no
+equivalent and [`sandbox`] enforces nothing — these two are the whole defence,
+which is why the second one is derived from the profile rather than being a
+constant: a target states what it can afford in `Limits::mobile()` and gets both
+bounds from it.
 
 ## Gotchas
 
@@ -610,7 +682,33 @@ named so you can check the handling rather than re-derive it.
     whose worst-case floors are themselves measured in the suite
     (`a_wrong_kernel_always_lands_outside_the_tolerance`). Handled in
     `core/src/resize.rs` (`simd_agreement::TOLERANCES`).
-23. **`fast_image_resize` dispatches at runtime, so its speedup is a property of
+23. **Two rows of a picture are not a strip, but they are what "strip decoding"
+    means here.** The phase prompt asked for `image`'s "row-at-a-time reading",
+    and `image` 0.25.10 has none: every codec implements
+    `read_image(self, buf: &mut [u8])`, which hands you the whole image in a buffer
+    you own — an allocation decision, not a traversal one. `png` 0.18 does have
+    `Decoder::next_row()`, which is the only reason `streaming` exists at all, and
+    it is why a 120 MP **PNG** is a 4 MB job with the flag on and a 120 MP **JPEG**
+    is still a 613 MB one. Handled in `core/src/stream.rs` (`Source`), and
+    `stream::tests::names_the_formats_it_cannot_stream` fails if that stops being
+    true.
+24. **`Pipeline::apply` cloned the source, and it was the largest buffer in the
+    engine.** `let mut out = img.clone()` ran before every transform, so a resize
+    cost two copies of the decoded image plus the kernel's intermediate — about
+    1.1 GB for a 120 MP source and a 3.3 MB output. It is a `Cow` now: the source
+    is borrowed until the first step that must build a new buffer. Measured after
+    the change, 613 MB, and the residual is the `f32` intermediate
+    `image::imageops::resize` allocates at `src_width x dst_height` (docs/BENCHMARKS.md).
+25. **`image::imageops::resize` filters an axis it was not asked to change.** It
+    always runs both passes, so a 800x800 → 800x400 resize runs a Lanczos3 pass
+    with `ratio = 1.0` horizontally — a nine-tap blur across the axis that did not
+    move. `stream::Axis` reproduces that rather than fixing it, because fixing it
+    would change existing exports' pixels and this phase is about memory; it is
+    recorded here so the next person to see a soft `FitMode::Height` export knows
+    it is pre-existing. Handled in `core/src/stream.rs` (`Axis::new`), and
+    `it_agrees_with_the_in_memory_kernel`'s one-axis case is what keeps the two
+    paths agreeing about it.
+26. **`fast_image_resize` dispatches at runtime, so its speedup is a property of
     the CPU, not of the crate.** `cpu_extensions.rs` picks AVX2, else SSE4.1,
     else scalar. Every number in `docs/BENCHMARKS.md` is x86-64 AVX2 on a CI
     runner, and the crate does not expose which path it took, so the benchmark

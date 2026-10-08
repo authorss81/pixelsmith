@@ -71,6 +71,24 @@ pub enum Error {
     #[error("archive could not be assembled: {0}")]
     Archive(#[from] zip::result::ZipError),
 
+    /// A streamed decode's own working set did not fit the profile's ceiling.
+    ///
+    /// Separate from [`Error::PixelBudgetExceeded`] because the file is fine and
+    /// the *request* is what this build cannot carry out: the pixels fit the
+    /// header check, and the output does not fit the memory the profile allows.
+    #[error(
+        "this resize would need {needed} bytes of working memory and this device          allows {budget}; choose a smaller output size"
+    )]
+    StreamingBudgetExceeded { budget: u64, needed: u64 },
+
+    /// The row reader ran out of rows before the geometry said it should have.
+    ///
+    /// A truncated or lying stream rather than an arithmetic problem, and the
+    /// reason it is an error rather than a black band is that the alternative is
+    /// writing a half-picture to the user's disk.
+    #[error("this photo's image data ended after {read} of {expected} rows")]
+    TruncatedStream { read: u32, expected: u32 },
+
     #[error("operation was cancelled")]
     Cancelled,
 
@@ -92,6 +110,20 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(value)
+    }
+}
+
+/// `png`'s decode failures become engine failures rather than a second error
+/// type, so the streaming path returns the same [`Error`] every other decode does.
+///
+/// Behind the feature because `png` is behind it. `DecodingError` carries the
+/// codec's own wording ("Not enough image data was provided to be able to decode
+/// the image"), which is what a user can act on; `IoError` is the `image`
+/// variant that takes an arbitrary cause.
+#[cfg(feature = "streaming")]
+impl From<png::DecodingError> for Error {
+    fn from(value: png::DecodingError) -> Self {
+        Error::Decode(image::ImageError::IoError(std::io::Error::other(value)))
     }
 }
 

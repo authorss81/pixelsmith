@@ -17,6 +17,8 @@ pub mod pipeline;
 pub mod presets;
 pub mod resize;
 pub mod sandbox;
+#[cfg(feature = "streaming")]
+pub mod stream;
 pub mod target;
 pub mod validate;
 pub mod worker;

@@ -917,6 +917,7 @@ dependencies = [
  "jpeg-encoder",
  "kamadak-exif",
  "libc",
+ "png",
  "proptest",
  "rayon",
  "serde",

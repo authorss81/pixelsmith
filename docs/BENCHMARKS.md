@@ -396,6 +396,85 @@ the 4×4 filter square keeps its mean under 1.17, and most are above 3.
 `a_wrong_kernel_always_lands_outside_the_tolerance` measures the floors in the
 suite so the table cannot rot.
 
+## Peak memory: a 120-megapixel source, resized to 1000 px wide
+
+Phase-11. The measurement is peak *live heap*, from a counting `GlobalAlloc` in
+`core/tests/streaming_peak.rs`, not a model and not `VmHWM`: the question is what
+the engine allocates, and a counter answers that on every platform the suite runs
+on. Bytes already in memory — the compressed input — are marked out of both
+columns, so the numbers are what the decode and the transform cost.
+
+| Source | Output | In memory | Streaming | What `working_set_bytes` predicts |
+| --- | --- | ---: | ---: | ---: |
+| 24 MP (6000×4000) | 1000×667 | 155 MB | **3 MB** | 2.7 MB |
+| 60 MP (12000×5000) | 1000×417 | 306 MB | **2 MB** | 1.8 MB |
+| 120 MP (12000×10000) | 1000×833 | 613 MB | **4 MB** | 3.5 MB |
+
+```sh
+cd core
+PX_MEASURE_BEFORE=1 cargo test --features streaming --test streaming_peak -- --nocapture
+```
+
+The 120 MP row runs by default (it is what the test asserts a ceiling on); the
+other two rows and the in-memory column are behind `PX_MEASURE_BEFORE`, because a
+120 MP Lanczos3 resize at `opt-level = 0` costs about three minutes and the
+streaming number next to it costs seconds.
+
+**Before this phase the same job needed about 1.1 GB**, and the 613 MB above is
+the figure *after* the clone in `Pipeline::apply` was removed, because the two
+changes are not separable in the table: 480 MB of RGBA twice over plus 160 MB of
+`f32` intermediate is where 1.1 GB came from, and one of those two copies is gone.
+The remaining 613 MB is 480 MB of decoded RGBA8 and 160 MB of
+`image::imageops::resize`'s `src_width x dst_height` intermediate — the buffer
+whose shape is the whole problem, because it scales with the *source* width while
+its contents are destination pixels.
+
+**The 60 MP row is smaller than the 24 MP row.** That is not a mistake in the
+table: the streaming peak is `dst + src_width * 4 + window * dst_width * 16`, and
+the 60 MP source is 12000 px wide against 6000, so it pays more for the decoded
+row and less for the coefficients. It is also why the streaming column is flat in
+the source's pixel count and not in its width: **input size is decoupled from
+output size, and the only thing that still scales with the input is one row of
+it.** A 400 MP panorama would read the same 4 MB.
+
+### What the two paths cost in time
+
+Not measured in a table here, because the memory numbers are what the phase turns
+on and a wall-clock comparison deserves the phase-10 harness rather than a row
+added by hand. What is known: the streaming path is O(source pixels × kernel
+taps per destination pixel) doing exactly the arithmetic `image` does, in a
+different order, and it cannot be free — a debug-build 120 MP run above took
+83 s, against 141 s for the run including the in-memory comparison. **The flag
+stays off by default for that reason as much as the memory one**, and the numbers
+that would settle it are not in this file.
+
+### Quality: one pass, and what the box-first design would have cost
+
+The alternative to this module is the one most resizers use: box-average the
+source down to something small, then resize that. That is two filter
+applications, which hard rule 5 bans, so it was measured rather than argued:
+`stream::tests::one_pass_beats_a_box_pre_reduction` runs both designs on the same
+1200x1200 fixture at 16:1, 8:1 and 4:1.
+
+| Reduction | One pass vs box-then-resize, worst channel | Mean |
+| --- | ---: | ---: |
+| 1200 → 75 (16:1) | 1 | 0.082 |
+| 1200 → 150 (8:1) | 1 | 0.088 |
+| 1200 → 300 (4:1) | 1 | 0.070 |
+
+**One least-significant bit, out of 255.** So the single pass is here for memory
+and for hard rule 5, not because the composite would have been visibly worse — and
+that is a thinner argument than it looks, so it is stated rather than dressed up.
+What this table does *not* cover is content where the subject is colour: saturated
+red on blue is the case that punished 4:2:0 in phase-07, and a box average takes a
+hard edge and a Lanczos pass takes it differently. Nothing here has measured that,
+and `docs/ARCHITECTURE.md` records it as unknown rather than as fine.
+
+The two paths agree with each other, and with `resize::resample_reference`, to the
+same one LSB: worst per-channel 1 and worst mean 0.0071 of 255 over five filters
+and seven size pairs, all of it on an upscale and zero of it on any downscale
+(`stream::tests::it_agrees_with_the_in_memory_kernel`).
+
 ## Build cost
 
 | | Cold `cargo build --release --lib` |

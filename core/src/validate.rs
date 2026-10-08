@@ -91,7 +91,82 @@ impl Limits {
         }
         Ok(())
     }
+
+    /// The pixel budget for a decode that never materialises the image.
+    ///
+    /// A streamed decode's peak is about the *destination*, so the pixel budget
+    /// stops being a memory ceiling and becomes a CPU one: nobody wants to spend
+    /// twenty seconds decoding a picture they cannot use. It is therefore a
+    /// multiple of the materialising budget rather than the same number, and the
+    /// multiple is [`STREAMED_PIXEL_FACTOR`].
+    ///
+    /// Two consequences worth stating, because they are the reason this is a
+    /// method rather than a field:
+    ///
+    /// * A build without the `streaming` feature never consults it, so the
+    ///   in-memory path's ceiling is unchanged and hard rule 4 still holds on that
+    ///   path. Raising `max_pixels` itself would have done the opposite: it would
+    ///   have let the in-memory decode try to materialise 160 MP on a phone.
+    /// * It is derived from the profile, so `Limits::mobile()` stays the one
+    ///   place a target's affordability is expressed. A target with no sandbox
+    ///   outside it — Windows, where `setrlimit` has no equivalent and
+    ///   [`crate::sandbox`] enforces nothing — has this and
+    ///   [`Limits::streaming_memory_budget`] as its whole defence.
+    pub fn streamed_pixels_budget(&self) -> u64 {
+        self.max_pixels.saturating_mul(STREAMED_PIXEL_FACTOR)
+    }
+
+    /// Ceiling on the working memory of one streamed decode, in bytes.
+    ///
+    /// Derived from `max_pixels` because that field already states how much
+    /// memory the profile is prepared to spend on a picture: four bytes per pixel
+    /// is what materialising an RGBA8 buffer costs, which is exactly what
+    /// `Limits::apply_to_decoder` pushes into `image::Limits::max_alloc`. So this
+    /// is the same number the profile would have allowed a decode to spend, held
+    /// to by a path that spends far less of it.
+    ///
+    /// [`crate::stream::decode_resized`] refuses a request whose
+    /// `working_set_bytes` exceeds this, before the first row is read.
+    pub fn streaming_memory_budget(&self) -> u64 {
+        self.max_pixels.saturating_mul(4)
+    }
+
+    /// The header check for a streamed decode.
+    ///
+    /// Same per-side ceiling as [`Limits::check_header`], and a pixel budget of
+    /// [`Limits::streamed_pixels_budget`]. Split out rather than reusing
+    /// `check_header` because the two budgets are different claims about
+    /// different memory models, and a single method taking a flag would let a
+    /// caller pass the wrong one.
+    pub fn check_streamed_header(&self, w: u32, h: u32) -> Result<()> {
+        if w > self.max_dimension || h > self.max_dimension {
+            return Err(Error::SuspiciousDimensions {
+                w,
+                h,
+                mp: megapixels(w, h),
+            });
+        }
+        let pixels = u64::from(w) * u64::from(h);
+        if pixels > self.streamed_pixels_budget() {
+            return Err(Error::PixelBudgetExceeded {
+                limit: self.streamed_pixels_budget(),
+                actual: megapixels(w, h),
+            });
+        }
+        if w == 0 || h == 0 {
+            return Err(Error::ZeroDimension);
+        }
+        Ok(())
+    }
 }
+
+/// How many times the materialising pixel budget a streamed decode may take.
+///
+/// Four, because it is a statement about time rather than memory: `Limits::mobile()`
+/// is 40 MP, so a streamed phone decode accepts a 160 MP input, which decodes in
+/// well under two seconds for JPEG or PNG. See [`Limits::streamed_pixels_budget`]
+/// for why this is a method and not a change to `max_pixels`.
+pub const STREAMED_PIXEL_FACTOR: u64 = 4;
 
 pub fn megapixels(w: u32, h: u32) -> f64 {
     f64::from(w) * f64::from(h) / 1_000_000.0
