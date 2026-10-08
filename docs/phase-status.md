@@ -29,7 +29,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-15 | Supply-chain policy and reproducible builds | DONE | (this commit) | See [phase-15 notes](#phase-15-notes) below. **The CI workflow is a patch, as in phase-05/06/07/08/10 — most of the policy does not run in CI until it is applied.** One of eight targets is measured reproducible; seven are honestly blank. |
 | phase-16 | Release artefacts: the APK and the EXE | DONE | `a332803` | Corrected by phase-17: the row said `PENDING` while `.done` was on disk. **The release workflow is a patch, so `scripts/RELEASE-SHA256.txt` records hashes nothing in this tree produces** — `docs/AUDIT.md` finding 18. |
 | phase-17 | Self-audit and next-phase generation | DONE | (this commit) | See [phase-17 notes](#phase-17-notes) below. Wrote `docs/AUDIT.md` and eleven phases. |
-| phase-18 | Bound every allocation untrusted bytes can reach | DONE | (this commit) | Audit findings 1, 6, 7, 8, all four closed with a test that fails on the code as it stood. See [phase-18 notes](#phase-18-notes) below. **A fifth hole was found and recorded rather than fixed** — audit finding 26, `px_exif` consults no `Limits` at all. |
+| phase-18 | Bound every allocation untrusted bytes can reach | DONE | `5749eb7`, `bf0c564` | Audit findings 1, 6, 7, 8, all four closed with a test that fails on the code as it stood. See [phase-18 notes](#phase-18-notes) below. **A fifth hole was found and recorded rather than fixed** — audit finding 26, `px_exif` consults no `Limits` at all. `bf0c564` is the rustdoc link the first attempt missed, which is what the gate was red on. |
 | phase-19 | Make `cargo test` work in every feature configuration | PENDING | | Audit finding 2. `cargo test` — the README's command — does not compile, and `--all-features` in the gate is the only reason nobody noticed. |
 | phase-20 | The Dart JSON contract, and a check that makes drift fail the gate | PENDING | | Audit findings 3, 4, 5, 13. Five phases of drift, an app that crashes on a HEIC and counts skips as successes, and a leak on every failed call. |
 | phase-21 | The tests that assert nothing, and the module with none | PENDING | | Audit findings 19, 20. Four tests measure nothing, one of them is hard rule 4's only sentinel, and `error.rs` has no test module. |
@@ -107,6 +107,21 @@ and no Dart-mirrored type. `cargo build --release --all-features` succeeds, and
 the one thing the envelope numbers did change is the *behaviour* of three entry
 points for a request larger than 64 MiB — which is a refusal with a sentence, not
 a shape the binary could fail to parse.
+
+**The first attempt failed the gate on one line, and it is worth recording
+because of what it says about the phase's own documentation.** All four findings
+were closed and all 359 tests passed; `cargo doc` with `-D warnings` reported
+`unresolved link to folder::MAX_ENTRIES` and the gate exited 1. `folder` is not
+in scope inside `ffi.rs` — the module imports the items it needs, not the module —
+and rustdoc resolves an intra-doc path against the item's scope rather than the
+crate root, so a link written the way you would write it from `lib.rs` is broken
+when it is written from anywhere else. `bf0c564` writes the path out.
+
+It is the same class as the five recorded instances of a gate that could not
+report the truth, in the other direction: here the gate was true and the work was
+nearly done, and a reader who saw "phase-18: DONE" in the table would have been
+reading a claim the gate had not yet made. The gate is the only thing in this
+project that says a phase works, and it is worth as much as it costs.
 
 ## phase-17 notes
 
