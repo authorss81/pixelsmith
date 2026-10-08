@@ -710,8 +710,11 @@ struct BatchFile {
 /// part of the crate's internal API for no benefit. The construction is what
 /// matters and it is here, in one place, spelling out every field.
 pub(crate) fn sample_batch_file() -> serde_json::Value {
-    serde_json::to_value(BatchFile { name: String::new(), bytes: Vec::new() })
-        .expect("a BatchFile is serialisable")
+    serde_json::to_value(BatchFile {
+        name: String::new(),
+        bytes: Vec::new(),
+    })
+    .expect("a BatchFile is serialisable")
 }
 
 pub(crate) fn sample_process_request() -> serde_json::Value {
@@ -741,7 +744,10 @@ pub(crate) fn sample_batch_request() -> serde_json::Value {
         mobile_limits: false,
         policy: crate::worker::BatchPolicy::default(),
         cancel: None,
-        files: BoundedFiles(vec![BatchFile { name: String::new(), bytes: Vec::new() }]),
+        files: BoundedFiles(vec![BatchFile {
+            name: String::new(),
+            bytes: Vec::new(),
+        }]),
     };
     serde_json::to_value(request).expect("a BatchRequest is serialisable")
 }

@@ -68,20 +68,36 @@ pub fn contract() -> Vec<ContractLine> {
     push_struct(&mut lines, "ValidateReport", &sample_validate_report());
     push_struct(&mut lines, "ExifInfo", &sample_exif_info());
     push_struct(&mut lines, "ExifEntry", &sample_exif_entry());
-    push_struct(&mut lines, "ProcessResponse", &crate::ffi::sample_process_response());
+    push_struct(
+        &mut lines,
+        "ProcessResponse",
+        &crate::ffi::sample_process_response(),
+    );
     push_struct(&mut lines, "Outcome", &sample_outcome());
     push_struct(&mut lines, "BatchReport", &sample_batch_report());
     push_struct(&mut lines, "Capabilities", &crate::capabilities());
     push_struct(&mut lines, "Preset", &sample_preset());
-    push_struct(&mut lines, "StructLayout", &crate::ffi_abi::px_buffer_layout());
+    push_struct(
+        &mut lines,
+        "StructLayout",
+        &crate::ffi_abi::px_buffer_layout(),
+    );
     push_struct(&mut lines, "FieldLayout", &sample_field_layout());
 
     // ---- request envelopes --------------------------------------------
     // Read by the app, so a field the engine honours and the app cannot send is
     // drift in the same direction as a response field it cannot read. Five
     // phases of missing Dart models are five phases of this going unnoticed.
-    push_struct(&mut lines, "ProcessRequest", &crate::ffi::sample_process_request());
-    push_struct(&mut lines, "BatchRequest", &crate::ffi::sample_batch_request());
+    push_struct(
+        &mut lines,
+        "ProcessRequest",
+        &crate::ffi::sample_process_request(),
+    );
+    push_struct(
+        &mut lines,
+        "BatchRequest",
+        &crate::ffi::sample_batch_request(),
+    );
     push_struct(&mut lines, "BatchFile", &crate::ffi::sample_batch_file());
 
     // ---- nested value types, named by where they appear ----------------
@@ -104,51 +120,76 @@ pub fn contract() -> Vec<ContractLine> {
     // Every variant, because the wire names come from `rename_all` and not from
     // the Rust names: `DisplayP3` is `display_p3` and `Luma444` is `luma444`,
     // and an enum the Dart side spells differently is a refusal at the boundary.
-    push_variants(&mut lines, "OutputFormat", &OutputFormat::all().to_vec());
-    push_variants(&mut lines, "ChromaSubsampling", &ChromaSubsampling::ALL.to_vec());
-    push_variants(&mut lines, "AnimationPolicy", &[
-        AnimationPolicy::Keep,
-        AnimationPolicy::FirstFrame,
-    ]);
-    push_variants(&mut lines, "AnimationAction", &[
-        AnimationAction::Unknown,
-        AnimationAction::Still,
-        AnimationAction::Preserved,
-        AnimationAction::Flattened,
-        AnimationAction::Refused,
-    ]);
-    push_variants(&mut lines, "ColourSpace", &[
-        ColourSpace::Untagged,
-        ColourSpace::Srgb,
-        ColourSpace::DisplayP3,
-        ColourSpace::Other,
-    ]);
+    push_variants(&mut lines, "OutputFormat", OutputFormat::all());
+    push_variants(
+        &mut lines,
+        "ChromaSubsampling",
+        ChromaSubsampling::ALL.as_ref(),
+    );
+    push_variants(
+        &mut lines,
+        "AnimationPolicy",
+        &[AnimationPolicy::Keep, AnimationPolicy::FirstFrame],
+    );
+    push_variants(
+        &mut lines,
+        "AnimationAction",
+        &[
+            AnimationAction::Unknown,
+            AnimationAction::Still,
+            AnimationAction::Preserved,
+            AnimationAction::Flattened,
+            AnimationAction::Refused,
+        ],
+    );
+    push_variants(
+        &mut lines,
+        "ColourSpace",
+        &[
+            ColourSpace::Untagged,
+            ColourSpace::Srgb,
+            ColourSpace::DisplayP3,
+            ColourSpace::Other,
+        ],
+    );
     push_variants(&mut lines, "SizeUnit", &[SizeUnit::Bytes, SizeUnit::Pixels]);
     push_variants(&mut lines, "SkipReason", &sample_skip_reasons());
-    push_variants(&mut lines, "FitMode", &[
-        FitMode::Contain,
-        FitMode::Cover,
-        FitMode::Fill,
-        FitMode::Width,
-        FitMode::Height,
-    ]);
-    push_variants(&mut lines, "ResampleFilter", &[
-        ResampleFilter::Lanczos3,
-        ResampleFilter::CatmullRom,
-        ResampleFilter::Triangle,
-        ResampleFilter::Nearest,
-        ResampleFilter::Box,
-    ]);
-    push_variants(&mut lines, "Orientation", &[
-        Orientation::Normal,
-        Orientation::MirrorHorizontal,
-        Orientation::Rotate180,
-        Orientation::MirrorVertical,
-        Orientation::MirrorHorizontalRotate270,
-        Orientation::Rotate90,
-        Orientation::MirrorHorizontalRotate90,
-        Orientation::Rotate270,
-    ]);
+    push_variants(
+        &mut lines,
+        "FitMode",
+        &[
+            FitMode::Contain,
+            FitMode::Cover,
+            FitMode::Fill,
+            FitMode::Width,
+            FitMode::Height,
+        ],
+    );
+    push_variants(
+        &mut lines,
+        "ResampleFilter",
+        &[
+            ResampleFilter::Lanczos3,
+            ResampleFilter::CatmullRom,
+            ResampleFilter::Triangle,
+            ResampleFilter::Nearest,
+            ResampleFilter::Box,
+        ],
+    );
+    push_variants(
+        &mut lines,
+        "Orientation",
+        &[
+            Orientation::Normal,
+            Orientation::MirrorHorizontal,
+            Orientation::Rotate180,
+            Orientation::MirrorVertical,
+            Orientation::MirrorHorizontalRotate270,
+            Orientation::Rotate90,
+            Orientation::MirrorHorizontalRotate90,
+            Orientation::Rotate270,
+        ],
+    );
     push_variants(&mut lines, "Category", &sample_categories());
 
     lines.sort();
@@ -196,7 +237,11 @@ fn push_value(out: &mut Vec<ContractLine>, owner: &str, value: serde_json::Value
 /// An array of objects recurses into its first element without adding a segment,
 /// so `ExifInfo.entries[0].tag` is recorded as `ExifInfo.entries.tag`: a list of
 /// one shape has one set of keys, and the index is not something a caller types.
-fn walk_object(out: &mut Vec<ContractLine>, prefix: &str, map: &serde_json::Map<String, serde_json::Value>) {
+fn walk_object(
+    out: &mut Vec<ContractLine>,
+    prefix: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+) {
     for (key, value) in map {
         let path = format!("{prefix}.{key}");
         out.push(path.clone());
@@ -249,13 +294,16 @@ fn push_skip_reasons(out: &mut Vec<ContractLine>) {
         // serde writes into the `kind` tag. `Debug` is the identity here because
         // it is only ever used to build a key for this module's own output — the
         // wire name comes from `push_variants`, which asks serde.
-        let owner = format!("SkipReason.{}", match &reason {
-            SkipReason::Duplicate { .. } => "Duplicate",
-            SkipReason::Unreadable => "Unreadable",
-            SkipReason::UnsupportedFormat { .. } => "UnsupportedFormat",
-            SkipReason::TooLarge { .. } => "TooLarge",
-            SkipReason::WouldUpscale { .. } => "WouldUpscale",
-        });
+        let owner = format!(
+            "SkipReason.{}",
+            match &reason {
+                SkipReason::Duplicate { .. } => "Duplicate",
+                SkipReason::Unreadable => "Unreadable",
+                SkipReason::UnsupportedFormat { .. } => "UnsupportedFormat",
+                SkipReason::TooLarge { .. } => "TooLarge",
+                SkipReason::WouldUpscale { .. } => "WouldUpscale",
+            }
+        );
         match serde_json::to_value(&reason) {
             Ok(serde_json::Value::Object(map)) => walk_object(out, &owner, &map),
             Ok(other) => panic!("{owner} serialised as {other}, not an object"),
@@ -276,9 +324,18 @@ fn sample_skip_reasons() -> Vec<SkipReason> {
     vec![
         SkipReason::Duplicate { of: String::new() },
         SkipReason::Unreadable,
-        SkipReason::UnsupportedFormat { format: OutputFormat::Heic },
-        SkipReason::TooLarge { limit: 0, actual: 0, unit: SizeUnit::Bytes },
-        SkipReason::WouldUpscale { requested: (0, 0), actual: (0, 0) },
+        SkipReason::UnsupportedFormat {
+            format: OutputFormat::Heic,
+        },
+        SkipReason::TooLarge {
+            limit: 0,
+            actual: 0,
+            unit: SizeUnit::Bytes,
+        },
+        SkipReason::WouldUpscale {
+            requested: (0, 0),
+            actual: (0, 0),
+        },
     ]
 }
 
@@ -286,12 +343,16 @@ fn sample_skip_reasons() -> Vec<SkipReason> {
 // Representative instances
 // ---------------------------------------------------------------------------
 
-/// Every value here exists only to be serialised and read back. They are built
-/// from the type's own constructors rather than by transcribing field names,
-/// so a field added to a struct is a **compile error here** rather than a silent
-/// omission from the contract — which is the failure mode a drift check must not
-/// have, and the reason these are functions with real arguments rather than
-/// `serde_json::json!` literals spelled out by hand.
+// Representative instances
+//
+// Every value below exists only to be serialised and read back. They are built
+// from the type's own constructors rather than by transcribing field names, so
+// a field added to a struct is a **compile error here** rather than a silent
+// omission from the contract — which is the failure mode a drift check must not
+// have, and the reason these are functions with real arguments rather than
+// `serde_json::json!` literals spelled out by hand.
+//
+// ---------------------------------------------------------------------------
 
 fn sample_validate_report() -> ValidateReport {
     ValidateReport {
@@ -323,12 +384,19 @@ fn sample_exif_info() -> crate::exif::ExifInfo {
 }
 
 fn sample_exif_entry() -> crate::exif::ExifEntry {
-    crate::exif::ExifEntry { tag: String::new(), value: String::new() }
+    crate::exif::ExifEntry {
+        tag: String::new(),
+        value: String::new(),
+    }
 }
 
 fn sample_outcome() -> Outcome {
     Outcome::skipped(
-        &crate::worker::Job { id: String::new(), name: String::new(), bytes: Vec::new() },
+        &crate::worker::Job {
+            id: String::new(),
+            name: String::new(),
+            bytes: Vec::new(),
+        },
         // `Unreadable` rather than a real skip: the sample is about the *field
         // names* of `Outcome`, and a skipped outcome reports them all, so no
         // `#[serde(skip_serializing_if)]` on any of them can hide one.
@@ -337,7 +405,10 @@ fn sample_outcome() -> Outcome {
 }
 
 fn sample_batch_report() -> BatchReport {
-    BatchReport { outcomes: vec![sample_outcome()], cancelled: false }
+    BatchReport {
+        outcomes: vec![sample_outcome()],
+        cancelled: false,
+    }
 }
 
 fn sample_preset() -> Preset {
@@ -348,11 +419,20 @@ fn sample_preset() -> Preset {
 }
 
 fn sample_field_layout() -> crate::ffi_abi::FieldLayout {
-    crate::ffi_abi::px_buffer_layout().fields.first().copied().expect("PxBuffer has fields")
+    crate::ffi_abi::px_buffer_layout()
+        .fields
+        .first()
+        .copied()
+        .expect("PxBuffer has fields")
 }
 
 fn sample_crop_spec() -> CropSpec {
-    CropSpec { x: 0, y: 0, width: 1, height: 1 }
+    CropSpec {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    }
 }
 
 fn sample_categories() -> Vec<crate::presets::Category> {
@@ -404,7 +484,13 @@ mod tests {
     #[test]
     fn nested_objects_are_recorded_by_path() {
         let lines = contract();
-        for field in ["icc_present", "source", "declared", "description", "icc_bytes"] {
+        for field in [
+            "icc_present",
+            "source",
+            "declared",
+            "description",
+            "icc_bytes",
+        ] {
             assert!(
                 lines.contains(&format!("ValidateReport.colour.{field}")),
                 "ValidateReport.colour.{field} not recorded"

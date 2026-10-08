@@ -45,16 +45,31 @@ set -uo pipefail
 CONTRACT="${PX_CONTRACT_FILE:-core/contract/json-fields.txt}"
 DART_MODELS="app/lib/rust/models.dart"
 MODE="check"
+CHECK_DART=0
 
-for arg in "$@"; do
+# Indexed rather than `for arg in "$@"`, because `--dart` takes a value and a
+# `for` loop cannot consume the next argument: the first revision parsed
+# `--dart app/lib/rust/models.dart` as two separate flags and answered
+# "unknown flag: app/lib/rust/models.dart", which is a check that cannot be run
+# the way its own header documents it.
+i=1
+while [ ${i} -le $# ]; do
+  arg="${!i}"
   case "${arg}" in
     --write)     MODE="write" ;;
     --self-test) MODE="self-test" ;;
-    --dart)      MODE="check" ;;
-    --dart=*)    DART_MODELS="${arg#--dart=}" ;;
+    --dart)      CHECK_DART=1
+                 i=$((i + 1))
+                 if [ ${i} -gt $# ]; then
+                   echo "error: --dart needs the path to a models.dart" >&2
+                   exit 2
+                 fi
+                 DART_MODELS="${!i}" ;;
+    --dart=*)    CHECK_DART=1; DART_MODELS="${arg#--dart=}" ;;
     -h|--help)   sed -n '2,40p' "$0"; exit 0 ;;
     *)           echo "error: unknown flag: ${arg}" >&2; exit 2 ;;
   esac
+  i=$((i + 1))
 done
 
 if [ ! -f core/Cargo.toml ]; then
@@ -72,28 +87,72 @@ DUMP=(cargo run --quiet --manifest-path core/Cargo.toml --bin px-json-dump --)
 # the submodule and this pipeline cannot land a change to it — so it runs only
 # when the caller asks for it (`--dart`), or inside `--self-test` against a
 # fixture. The landable half is the contract file itself.
+#
+# WHAT IT PROVES, PRECISELY, because the first revision of this function claimed
+# more than it did and was wrong in the direction that hides drift:
+#
+#   It searched for the whole cell — `Capabilities.jpeg` — as a literal string.
+#   Dart source never writes `Class.member` anywhere except inside the body of
+#   the class, so that search reported **264 of 278 symbols absent** against a
+#   models.dart that declares most of them. A check that fails on correct code
+#   is the one failure mode a gate check must not have; the fix is to ask a
+#   question the file can actually answer.
+#
+# So each cell is split at its last dot and both halves are looked for as whole
+# identifiers: the type or class, and the member. What that proves is that both
+# names appear as identifiers in the file. What it does **not** prove is that
+# the member has the right type, that it is on that class rather than another,
+# or that `fromJson` reads it — `Capabilities.canWrite` in particular is a
+# derived predicate, and `grep` cannot tell a field from a getter. Those are
+# review questions, and the contract file is written to be reviewed.
+#
+# The contract file is a *parameter*, not the script-level `CONTRACT`. The first
+# revision read `${CONTRACT}` and the self-test set `PX_CONTRACT_FILE` as a
+# call-prefix — `VAR=x some_function` does set the variable for the duration of
+# the call, but `CONTRACT` was computed from it once at startup and is not
+# recomputed, so the fixture was silently ignored and the assertions passed
+# against the real file. A test that reads a different file than it says it does
+# is the same defect as a gate that cannot report the truth, one level down.
 # ---------------------------------------------------------------------------
 check_dart_symbols() {
-  local models="$1"
+  local contract="$1"
+  local models="$2"
   local rc=0
   local missing=0
   local total=0
-  local symbol
 
   if [ ! -f "${models}" ]; then
     echo "CONTRACT/DART: ${models} not found" >&2
     return 2
   fi
+  if [ ! -f "${contract}" ]; then
+    echo "CONTRACT/DART: ${contract} not found" >&2
+    return 2
+  fi
+
+  # An identifier is a run of [A-Za-z_][A-Za-z0-9_]*, and "is this a whole word"
+  # is the test. Both halves are checked; a cell with no dot is one identifier.
+  declares() {
+    grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" "${models}"
+  }
 
   while IFS=$'\t' read -r path dart rest; do
     case "${path}" in \#*|"") continue ;; esac
     [ -z "${dart}" ] && continue
     total=$((total + 1))
-    if ! grep -qF -- "${dart}" "${models}"; then
+
+    local owner="${dart##*.}"
+    local type="${dart%.*}"
+    [ "${type}" = "${dart}" ] && owner="" # a bare identifier: no type half
+
+    if [ -n "${owner}" ] && ! declares "${owner}"; then
       missing=$((missing + 1))
       echo "  ${path} is recorded as ${dart}, which ${models} does not declare"
+    elif [ -n "${owner}" ] && ! declares "${type}"; then
+      missing=$((missing + 1))
+      echo "  ${path} is recorded as ${dart}, and ${models} has no ${type}"
     fi
-  done < "${CONTRACT}"
+  done < "${contract}"
 
   if [ "${missing}" -ne 0 ]; then
     rc=1
@@ -113,6 +172,11 @@ check_dart_symbols() {
 #
 # Existing rows are never touched: a row is somebody's statement about a Dart
 # symbol, and rewriting it silently would destroy the only record of that.
+#
+# "Does this row already exist" is asked of the first tab-separated field, not
+# with `grep -F` over the whole file: a substring test would treat a new key
+# containing an old one as already recorded and silently skip appending it, which
+# is the one job this mode has.
 # ---------------------------------------------------------------------------
 write_missing() {
   local generated
@@ -122,7 +186,8 @@ write_missing() {
 
   local added=0
   while IFS= read -r key; do
-    if ! grep -qF -- "${key}" "${CONTRACT}"; then
+    if ! awk -F'\t' -v k="${key}" \
+           '$1 == k { found = 1 } END { exit(found ? 0 : 1) }' "${CONTRACT}"; then
       printf '%s\t\n' "${key}" >> "${CONTRACT}"
       added=$((added + 1))
       echo "  added ${key}"
@@ -206,22 +271,42 @@ self_test() {
       || { echo "  FAIL 3: caught, but did not say why"; failures=$((failures + 1)); }
   fi
 
-  # 4. The Dart half: a contract file that is internally perfect against an
-  #    engine, naming a Dart member that does not exist. This is the check that
-  #    catches the *fix* being wrong rather than the engine changing, so it runs
-  #    against a fixture rather than the submodule.
+  # 4. The Dart half, in BOTH directions against one fixture. This is the check
+  #    that catches the *fix* being wrong rather than the engine changing, so it
+  #    runs against a fixture rather than the submodule.
+  #
+  #    Both directions matter here more than anywhere else in this script, and
+  #    the first revision got it wrong in the way that looks like passing: it
+  #    pointed the check at an EMPTY models.dart, where every symbol is absent,
+  #    so "it reported something" proved nothing about the matching. The fixture
+  #    below declares exactly the two symbols the assertions below need — one
+  #    that must pass, one that must be named as missing — so a check that
+  #    reported everything, or nothing, cannot satisfy both.
   cp "${CONTRACT}" "${tmp}/dart.txt"
   printf '# a deliberately wrong Dart member\nOutcome.width\tNoSuchDartMember.width\n' \
     >> "${tmp}/dart.txt"
-  : > "${tmp}/models.dart"
-  if PX_CONTRACT_FILE="${tmp}/dart.txt" check_dart_symbols "${tmp}/models.dart" \
-      > "${tmp}/out4" 2>&1; then
-    echo "  FAIL 4: an absent Dart symbol was NOT caught"
+  {
+    echo '// Self-test fixture: declares exactly the symbols the assertions need.'
+    echo 'class NoSuchDartMember { final int width = 0; }'
+    echo 'class SkipReason { const SkipReason(); String get kind => ""; }'
+  } > "${tmp}/models.dart"
+
+  check_dart_symbols "${tmp}/dart.txt" "${tmp}/models.dart" > "${tmp}/out4" 2>&1
+  DRC4=$?
+  # Positive direction first: the symbol the fixture *does* declare must not be
+  # reported. A check that fails on correct code is the one failure mode a gate
+  # check must not have, and this is the direction that catches it.
+  if grep -q 'NoSuchDartMember' "${tmp}/out4"; then
+    echo "  FAIL 4a: a Dart symbol the fixture declares was reported as absent"
+    failures=$((failures + 1))
+  elif [ ${DRC4} -eq 0 ]; then
+    echo "  FAIL 4b: an absent Dart symbol was NOT caught"
+    failures=$((failures + 1))
+  elif ! grep -q 'BatchOutcome.width' "${tmp}/out4"; then
+    echo "  FAIL 4c: caught, but did not name the missing symbol"
     failures=$((failures + 1))
   else
-    grep -q 'does not declare' "${tmp}/out4" \
-      && echo "  ok 4: an absent Dart symbol is caught" \
-      || { echo "  FAIL 4: caught, but did not say why"; failures=$((failures + 1)); }
+    echo "  ok 4: an absent Dart symbol is caught and a declared one is not"
   fi
 
   # And the positive control: the real file against the real engine must pass.
@@ -255,9 +340,11 @@ rc=0
 "${DUMP[@]}" --check "${CONTRACT}" || rc=1
 
 # The Dart half, when asked for. Not part of the default run because it reads the
-# submodule, which this repository cannot land a change to — see the header.
-if [ "${DART_MODELS}" != "app/lib/rust/models.dart" ]; then
-  check_dart_symbols "${DART_MODELS}" || rc=1
+# submodule, which this repository cannot land a change to — see the header. The
+# condition is the flag rather than the path, so `--dart app/lib/rust/models.dart`
+# does what it says instead of being silently skipped for naming the default.
+if [ "${CHECK_DART}" = "1" ]; then
+  check_dart_symbols "${CONTRACT}" "${DART_MODELS}" || rc=1
 fi
 
 exit ${rc}

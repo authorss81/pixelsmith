@@ -107,9 +107,12 @@ cargo test --features simd                       # the fast_image_resize kernel
 cargo test --all-features                        # everything, which is what CI runs
 
 cd .. && bash scripts/feature-matrix.sh          # all nine, in about a minute
+bash scripts/check-json-contract.sh             # every engine JSON field has a
+                                                 # row naming the Dart member for it
 bash scripts/verify.sh                           # the gate: fmt, clippy, tests,
                                                  # matrix, release build, rustdoc,
-                                                 # the Flutter side, the FFI contract
+                                                 # the JSON contract, the Flutter
+                                                 # side, the FFI contract
 ```
 
 The two opt-in paths are named in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) and

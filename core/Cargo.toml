@@ -307,7 +307,6 @@ default-features = false
 features = ["std"]
 
 [dev-dependencies]
-syn = { version = "3", features = ["full"] }
 proptest = "1"
 tempfile = "3"
 # The performance regression gate's harness. `default-features = false` with

@@ -9,7 +9,7 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Eighteen modules, one submodule, no circular references. Dependencies point downward:
+Nineteen modules, one submodule, no circular references. Dependencies point downward:
 `lib.rs` → `worker.rs` / `folder.rs` / `pipeline.rs` / `colour.rs` / `animation.rs` → `resize.rs`
 → `validate.rs` / `heic.rs` → `error.rs`. Nothing below `error.rs` knows anything
 exists above it. `animation.rs` sits below `worker.rs` and above `validate.rs`
@@ -40,6 +40,7 @@ thing that has both.
 | `core/src/animation.rs` | What happens to an animation: the policy, the decision, the refusal sentence, the outcome type, and the frame-by-frame path through the pipeline. Does not re-implement GIF composition — see `docs/GIF.md`. | `AnimationPolicy`, `AnimationAction`, `AnimationOutcome`, `decide()`, `preserve()`, `refusal_note()` |
 | `core/src/ffi.rs` | The C ABI, where Rust's safety stops protecting the caller. 15 `px_*` entry points, a tagged result struct, and buffer ownership rules. | `PxBuffer`, `PxStatus`, `PxHandle`, `px_*` |
 | `core/src/ffi_abi.rs` | The same ABI as data: one declaration per entry point, proved against `ffi.rs` at compile time and rendered into the Dart declarations `app/lib/rust/bindings.dart` must contain. | `ENTRY_POINTS`, `EntryPoint`, `px_buffer_layout()`, `dart_drift()` |
+| `core/src/ffi_json.rs` | The JSON contract as data, the other half of `ffi_abi.rs`'s job. Every field name and enum variant crossing the FFI is **asked of serde** by serialising a representative instance of each contract type, so `rename_all`, `tag` and `flatten` are applied by the code that applies them on the wire. Compared against `core/contract/json-fields.txt` by `scripts/check-json-contract.sh`, which is a hard gate. | `ContractLine`, `contract()` |
 
 ## Request path
 
@@ -791,6 +792,44 @@ allocation; and a bound refusal is recorded in a thread-local as well as
 returned through serde, because `serde_json` renders every message as `"<text> at
 line 1 column 33554445"` and hard rule 9 is about the sentence a user reads.
 
+### The JSON contract, and why that one is a gate check
+
+The C ABI above is proved at compile time: `ffi_abi.rs` declares each entry point
+once and every declaration expands to a function-pointer assignment that fails to
+compile against a changed signature. The JSON that crosses the same boundary
+cannot be proved that way, because the other end of it is Dart in another
+repository. For five phases the only comparison was `check-dart-bindings.sh`,
+which reports "15 entry points match" and says nothing about a field — and the
+result was an app that crashed on an iPhone photograph and a batch report that
+counted skips as successes (`docs/AUDIT.md` findings 3, 4 and 5).
+
+`ffi_json::contract()` is the JSON counterpart: it serialises a representative
+instance of every contract type and reads the **wire** names out of the result,
+so `rename_all = "lowercase"`, `#[serde(tag = "kind")]` and
+`#[serde(flatten)]` are applied by serde rather than by a second parser that
+would eventually disagree with it. `scripts/check-json-contract.sh` compares that
+list with `core/contract/json-fields.txt`, and three failures are checked in both
+directions:
+
+| Failure | What it means |
+| --- | --- |
+| unrecorded | the engine emits a field no row names — drift arriving |
+| stale | a row names a path the engine no longer emits — a row that has rotted |
+| unmodelled | a row has nothing after the tab — a field nobody wrote a Dart member for |
+
+The third is the one that would have caught every drift in the audit.
+
+**Why this one is a hard gate and the C-ABI check is a note.** Both comparisons
+have an engine side and an app side, and the app side is the `authorss81/shrinkray`
+submodule, which this repository can read and cannot push to. A red gate check
+whose only available fix is a commit nobody here can make stops being read — that
+is what happened to binding drift. So the *committed* side here is
+`core/contract/json-fields.txt`, in this repository: every row names the Dart
+member that carries the field, which is a reviewable statement about drift rather
+than a comparison this pipeline cannot perform. The Dart change itself is still
+delivered as a patch under `workspace/<phase>/`, and the gate goes red on the
+patch not being written yet — which is the behaviour worth having.
+
 ## Feature flags
 
 | Flag | Default | Effect |
@@ -1347,13 +1386,14 @@ counts as done. It enforces hard rule 1 mechanically (no network crate in the
 engine tree, no networking symbol in `core/src`), then runs `cargo fmt --check`,
 `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test
 --all-features`, `cargo build --release` and `cargo doc` with `-D warnings`, then
-repository hygiene, then builds the debug engine, puts it on the loader path,
-runs the Flutter tests against it and **fails if any of them skipped**. That last
-part is the one that matters: the FFI tests skip themselves when the library is
-absent, so for most of the project's life the gate was reporting success while
-executing none of the boundary.
+the feature matrix (2b) and the JSON contract (2c), then repository hygiene, then
+builds the debug engine, puts it on the loader path, runs the Flutter tests
+against it and **fails if any of them skipped**. That last part is the one that
+matters: the FFI tests skip themselves when the library is absent, so for most of
+the project's life the gate was reporting success while executing none of the
+boundary.
 
-Two things about it worth knowing before you touch it:
+Three things about it worth knowing before you touch it:
 
 - `check()` runs its command in a **subshell**. Several hygiene checks are
   written `cmd && exit 1 || exit 0`, and a bare `exit` inside `eval` would
@@ -1362,6 +1402,11 @@ Two things about it worth knowing before you touch it:
 - Checks that shell out filter cargo's output with `grep -E '^(warning|error)'`,
   so cargo runs with `--color=never`. With the default ANSI colouring the escape
   sequences defeat the filter and a failing run reports no reason at all.
+- Section **2c** (`scripts/check-json-contract.sh`) is a failure and section **3b**
+  (`scripts/check-dart-bindings.sh`) is a note, for the same underlying reason and
+  with a different mechanism. The JSON side's committed answer lives in this
+  repository — see *The JSON contract, and why that one is a gate check* above —
+  so a red result has an action attached to it.
 
 ### Every feature configuration, not one
 

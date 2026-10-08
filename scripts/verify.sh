@@ -234,6 +234,50 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# The JSON contract: does the app still model what the engine emits?
+#
+# This is a FAILURE where section 3b's C-ABI check is a note, and the difference
+# is the whole reason it can be. `scripts/check-dart-bindings.sh` compares two
+# things this repository does not own — `ffi.rs` here, `bindings.dart` over
+# there in the `authorss81/shrinkray` submodule — so a red result has no fix
+# available to whoever reads it, and a check like that stops being read.
+#
+# `scripts/check-json-contract.sh` compares the engine's own serde field names,
+# generated at run time, against `core/contract/json-fields.txt` — which is in
+# THIS repository and is therefore landable. So the answer to "has the contract
+# drifted?" is a fact about this repository, a red result means somebody has to
+# add a row and write the Dart member, and five phases of silent drift could not
+# have accumulated behind a check that failed when it should.
+#
+# `docs/AUDIT.md` findings 3, 4 and 5 are the drift this closes: an app that
+# crashed on an iPhone photograph, a batch report that counted skips as
+# successes, and five phases of fields the Dart models had never heard of.
+head1 "2c. JSON contract — every engine field has a row, and every row a Dart member"
+if [ -f core/Cargo.toml ]; then
+  say "--- scripts/check-json-contract.sh ---"
+  # Capture first, test after: `cmd | head` as an `if` condition takes the exit
+  # status of `head`, which is always 0 — the eighth instance of that defect in
+  # this file, and the reason the failure branch prints the script's own words
+  # rather than a bare status.
+  CONTRACT=$( bash scripts/check-json-contract.sh 2>&1 )
+  CRC=$?
+  if [ ${CRC} -eq 0 ]; then
+    pass "$(printf '%s' "${CONTRACT}" | grep -E '^JSON CONTRACT:' | tail -n 1)"
+  else
+    fail "the engine emits JSON the committed contract file does not record:"
+    printf '%s\n' "${CONTRACT}" | head -n 40
+  fi
+
+  # Proved able to fail, in four directions and offline, including the positive
+  # control: a drift check that fails on everything catches drift and also
+  # catches nothing else.
+  check "scripts/check-json-contract.sh --self-test" \
+    "bash scripts/check-json-contract.sh --self-test"
+else
+  say "  skip: core/Cargo.toml not present yet"
+fi
+
+# -----------------------------------------------------------------------------
 head1 "3. Dart / Flutter"
 if [ -f app/pubspec.yaml ]; then
   if command -v flutter >/dev/null 2>&1; then
@@ -386,10 +430,19 @@ fi
 
 # -----------------------------------------------------------------------------
 head1 "3b. Dart bindings versus the engine ABI"
-# Deliberately not a gate check. `app/` is a separate repository and the drift
-# between them is recorded in workspace/phase-05/FINDINGS.md; a gate that is red
-# for a reason the reader cannot act on stops being read. Run it by hand:
+# Deliberately not a gate check, and deliberately kept rather than deleted:
+# `app/` is a separate repository and the drift between them is recorded in
+# workspace/phase-05/FINDINGS.md; a gate that is red for a reason the reader
+# cannot act on stops being read. Run it by hand:
 #   bash scripts/check-dart-bindings.sh
+#
+# The JSON half of the boundary *is* a gate check, and section 2c is where it
+# lives. The difference is not leniency: it is that check-json-contract.sh's
+# committed side (`core/contract/json-fields.txt`) is in this repository, so a
+# red result here has an action available to the person reading it. That is the
+# whole mechanism phase-20 introduced, and it is why the C-ABI note stayed a note
+# while the JSON contract became a failure. Run it by hand for the detail:
+#   bash scripts/check-json-contract.sh
 if [ -f app/lib/rust/bindings.dart ] && command -v cargo >/dev/null 2>&1; then
   if bash scripts/check-dart-bindings.sh >/dev/null 2>&1; then
     pass "app/lib/rust/bindings.dart matches the engine ABI"
