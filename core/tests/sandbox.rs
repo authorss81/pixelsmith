@@ -9,6 +9,7 @@
 //! criteria name separately: that a worker cannot raise its own limit, and that
 //! the in-process path still enforces `Limits` when no sandbox is involved.
 
+use std::io::Cursor;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -905,12 +906,84 @@ fn running_the_worker_directly_is_recognised() {
     assert!(out.status.code().is_some());
 }
 
+/// The compile-time half: the documented entry point exists and has the shape the
+/// binary calls it with.
+///
+/// Renamed rather than rewritten. `docs/AUDIT.md` finding 20 named this one of
+/// four tests that asserted nothing measurable, and its body was
+/// `let _entry: fn() -> ! = run_worker;` under a name that claimed "exits
+/// cleanly". Nothing tested that, because calling `run_worker` here would block
+/// on a stdin read that never comes.
+///
+/// So the name now says what the body does, and the "exits cleanly" half moved
+/// into `a_worker_run_exits_zero_with_a_decodable_response_on_stdout`, which can
+/// actually reach `run_worker` because it has a stdin.
 #[test]
-fn the_worker_entry_point_is_reachable_and_exits_cleanly() {
-    // Calling `run_worker` with no stdin job would block on a read, so instead
-    // assert the symbol exists and is the documented no-argument entry point by
-    // referencing it. A compile error here is the assertion.
+fn the_worker_entry_point_has_the_documented_signature() {
     let _entry: fn() -> ! = run_worker;
+}
+
+/// The half the name used to claim: `run_worker` reads one job, answers it and
+/// exits **0**.
+///
+/// `run_worker` cannot be called in-process — it is `fn() -> !` and it reads the
+/// process's real stdin — so the only honest way to reach it is the way the
+/// sandbox does: spawn the engine binary with `WORKER_FLAG`, which is the branch
+/// `is_worker_invocation` selects. That is the real entry point on the real
+/// process boundary, so a `run_worker` that stopped exiting cleanly, wrote
+/// something unexpected to stdout, or hung after answering would all show up here
+/// rather than in production on the one file that happened to be hostile.
+///
+/// The response is parsed rather than merely counted, because "stdout was not
+/// empty" is the standard the rest of this file used and it is satisfied by a
+/// single byte of panic handler output. The wire format is the parent's own, so a
+/// mismatch here is a mismatch in `decode_sandboxed` too.
+#[test]
+fn a_worker_run_exits_zero_with_a_decodable_response_on_stdout() {
+    let input = photo(24, 18);
+    let run = run_worker_process(
+        &[],
+        &job_bytes(&input, DEFAULT_MEMORY_LIMIT),
+        Some(DEFAULT_MEMORY_LIMIT),
+    );
+    assert!(
+        run.status.success(),
+        "the worker must exit 0 on a successful decode; it exited {:?} with stderr: {}",
+        run.status.code(),
+        run.stderr
+    );
+    assert!(
+        run.stderr.trim().is_empty(),
+        "a clean run wrote to stderr: {}",
+        run.stderr
+    );
+
+    // length-prefixed bytes, then width, then height, then quality_used: the
+    // layout `decode_sandboxed` reads out of the child.
+    let mut out = Cursor::new(run.stdout.as_slice());
+    let len = u64::from_le_bytes(read_u64(&mut out));
+    let body = out
+        .get_ref()
+        .get(8..8 + len as usize)
+        .expect("the worker wrote fewer bytes than its own length prefix claims");
+    assert_eq!(
+        &body[..8],
+        b"\x89PNG\r\n\x1a\n",
+        "the worker must answer with encoded image bytes, not with a length"
+    );
+    let decoded = image::load_from_memory(body).expect("the bytes the worker sent must decode");
+    assert_eq!(
+        (decoded.width(), decoded.height()),
+        (24, 18),
+        "the worker answered with the wrong geometry"
+    );
+}
+
+/// Read one little-endian `u64` and advance the cursor.
+fn read_u64(from: &mut Cursor<&[u8]>) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    std::io::Read::read_exact(from, &mut buf).expect("the worker wrote a truncated prefix");
+    buf
 }
 
 use std::io::Write as _;

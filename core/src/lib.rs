@@ -279,6 +279,15 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (400, 300));
     }
 
+    /// The plain-Rust entry point refuses a file that is not a picture, and says
+    /// what it is.
+    ///
+    /// Was `assert!(!err.to_string().is_empty())`, which is the weakest assertion
+    /// a test can make about an error: `thiserror` guarantees every variant
+    /// renders something, so it could only fail if the type stopped working. It
+    /// is kept as part of the same test rather than replaced, because the message
+    /// *is* the product under hard rule 9 — but it is no longer the only thing
+    /// being said.
     #[test]
     fn process_rejects_a_hostile_input() {
         let err = process(
@@ -289,6 +298,26 @@ mod tests {
             &Limits::default(),
         )
         .unwrap_err();
-        assert!(!err.to_string().is_empty());
+
+        // The variant, not merely the existence of an error. 1024 zero bytes are
+        // not a JPEG, and a refusal that named a decode failure would be telling
+        // the user their file is corrupt when it is a .txt.
+        assert!(
+            matches!(err, Error::UnknownFormat),
+            "all-zero bytes must be refused as an unrecognised image format, got {err:?}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.trim().is_empty(),
+            "hard rule 9: a refusal must render a sentence, not nothing"
+        );
+        assert!(
+            rendered.contains("format"),
+            "the message must name what could not be understood: {rendered}"
+        );
+        assert!(
+            !rendered.contains("   "),
+            "the message must not carry a run of spaces: {rendered:?}"
+        );
     }
 }

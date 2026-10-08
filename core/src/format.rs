@@ -2087,9 +2087,64 @@ mod tests {
         assert!(image::load_from_memory(&jpeg).is_ok());
     }
 
+    /// `append_exif` only splices into a JPEG, and it has to refuse anything else
+    /// *before* writing a byte.
+    ///
+    /// Was `assert!(...is_err())`, which every failure of every cause satisfies.
+    /// The variant is the useful part: this is the "your container is not the one
+    /// I can add tags to" case, which is a different sentence for a user than a
+    /// JPEG whose APP1 payload would not fit, and the two share one function.
     #[test]
     fn exif_append_refuses_non_jpeg() {
-        let mut not_jpeg = b"PNG\r\n\x1a\n".to_vec();
-        assert!(append_exif(&mut not_jpeg, b"x").is_err());
+        // A real PNG: recognised, so refusing it is a decision rather than a
+        // format-detection failure.
+        let mut png = encode(
+            &sample(),
+            OutputFormat::Png,
+            EncodingOptions::default(),
+        )
+        .expect("png fixture");
+        let before = png.clone();
+        assert!(
+            matches!(append_exif(&mut png, b"x"), Err(Error::UnknownFormat)),
+            "splicing an APP1 into a PNG must be refused as an unrecognised \
+             container, not merely refused"
+        );
+        assert_eq!(png, before, "a refused splice must not have written anything");
+
+        // Too short to even carry SOI, which is the boundary the check has.
+        let mut stub = vec![0xFFu8];
+        assert!(matches!(
+            append_exif(&mut stub, b"x"),
+            Err(Error::UnknownFormat)
+        ));
+
+        // A JPEG whose payload cannot fit a 16-bit segment length. Same refusal,
+        // different cause, and it is why the check is a `u16::try_from` rather
+        // than a comparison.
+        let mut big = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(80),
+        )
+        .expect("jpeg fixture");
+        assert!(
+            matches!(
+                append_exif(&mut big, &vec![0u8; 70_000]),
+                Err(Error::UnknownFormat)
+            ),
+            "a 70 KB APP1 payload cannot be length-prefixed in 16 bits and must be \
+             refused rather than truncating the segment"
+        );
+        // The positive control, so the three refusals above are not just this
+        // function refusing everything.
+        let mut ok = encode(
+            &sample(),
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(80),
+        )
+        .expect("jpeg fixture");
+        append_exif(&mut ok, b"II*\0fake").expect("a small payload fits");
+        assert_eq!(&ok[2..4], &[0xFF, 0xE1]);
     }
 }

@@ -590,8 +590,19 @@ fn widen(data: &[u8], channels: usize, out: &mut [u8]) -> Result<()> {
 /// row accessor, and a whole-image `to_rgba8` would be the very buffer this module
 /// exists to avoid.
 fn read_row(img: &DynamicImage, width: u32, y: u32, out: &mut [u8]) {
-    let start = y as usize * width as usize * CHANNELS;
-    let Some(src) = img.as_bytes().get(start..start + out.len()) else {
+    // The source's own stride, not the destination's. `out` is always RGBA8, but
+    // `img` is whatever `image` decoded — and `image` decodes every JPEG to
+    // `ImageRgb8`, whose `as_bytes()` is `width * 3` a row. Walking it with a
+    // 4-channel stride puts row 0 in the right place and every row after it in
+    // the wrong one, which is `docs/AUDIT.md` finding 10: a skewed picture with a
+    // black band, at exactly the right dimensions, from two tests that asserted
+    // nothing but the size.
+    let stride = img.color().bytes_per_pixel() as usize;
+    let start = y as usize * width as usize * stride;
+    let Some(src) = img
+        .as_bytes()
+        .get(start..start + out.len() / CHANNELS * stride)
+    else {
         out.fill(0);
         return;
     };
@@ -856,6 +867,61 @@ mod tests {
         assert!(PngRows::open(&jpeg, 8, 8, &Limits::default()).is_none());
     }
 
+    /// Pixel equality against the in-memory kernel, on the whole-image arm.
+    ///
+    /// `docs/AUDIT.md` finding 10 is a stride bug in `read_row`: it walked the
+    /// source with `CHANNELS` (4) bytes a pixel whatever the buffer's own colour
+    /// type is, and `image` decodes every JPEG to `ImageRgb8`. Both tests on this
+    /// arm asserted only `dimensions()`, which is why the defect survived — the
+    /// picture came out the right size and the wrong shape of data.
+    ///
+    /// So the property is pixels, and the fixture is chosen so a wrong stride is
+    /// unmistakably wrong: `fixture()` is a smooth wave, and a row read from the
+    /// wrong offset lands tens of code values away from its neighbours. A flat
+    /// field would hide it, which is why the comparison is against a real
+    /// gradient and not against a constant.
+    #[track_caller]
+    fn assert_matches_the_in_memory_kernel(bytes: &[u8], dst: (u32, u32), what: &str) {
+        let limits = Limits::default();
+        let got = decode_resized(bytes, &limits, dst, FilterType::Lanczos3)
+            .expect("streamed decode")
+            .to_rgba8();
+
+        // The reference is the *same decoded image* through the kernel production
+        // uses when `streaming` is off. Comparing against the original fixture
+        // instead would be wrong for a JPEG, whose own round trip is lossy, and
+        // would hide the very thing being tested.
+        let decoded = crate::decode_bounded(bytes, &limits).expect("the same bytes in memory");
+        let expected =
+            crate::resize::resample_reference(&decoded, dst.0, dst.1, FilterType::Lanczos3)
+                .to_rgba8();
+
+        assert_eq!(
+            got.dimensions(),
+            (dst.0, dst.1),
+            "{what}: the streamed decode produced the wrong geometry"
+        );
+        let (max, mean) = difference(&got, &expected);
+        // The two traversals differ only in the order the separable passes are
+        // interleaved in, which is an `f32` association difference:
+        // `it_agrees_with_the_in_memory_kernel` measures that at one LSB on a PNG.
+        // A wrong stride on a smooth gradient is an order of magnitude worse than
+        // that, and it is not a rounding question at all.
+        assert!(
+            max <= 1,
+            "{what}: the streamed picture differs from the in-memory kernel by {max} \
+             code values (mean {mean:.3}). The whole-image arm reads rows out of an \
+             already-decoded buffer, and getting a row's offset wrong produces a \
+             skewed image at exactly the right dimensions - which is all the \
+             dimension-only version of this test ever asked for."
+        );
+        assert!(
+            mean < 0.01,
+            "{what}: mean difference {mean:.4} over the whole picture; the two \
+             traversals should agree to about one least-significant bit"
+        );
+    }
+
     #[test]
     fn a_jpeg_goes_through_the_whole_image_arm() {
         // `image` 0.25 has no row API for JPEG, so this arm is the fallback and is
@@ -866,10 +932,31 @@ mod tests {
             EncodingOptions::default().with_quality(95),
         )
         .expect("jpeg fixture");
-        let got = decode_resized(&bytes, &Limits::default(), (100, 67), FilterType::Lanczos3)
-            .expect("streamed decode")
-            .to_rgba8();
-        assert_eq!(got.dimensions(), (100, 67));
+        assert_matches_the_in_memory_kernel(
+            &bytes,
+            (100, 67),
+            "a JPEG on the whole-image arm",
+        );
+    }
+
+    /// The same property at a geometry where a stride error cannot hide.
+    ///
+    /// 97x61 to 40x25 is a reduction on both axes at a non-integer ratio, so
+    /// every destination row averages several source rows and a row read from the
+    /// wrong offset is not merely displaced but mixed with unrelated pixels.
+    #[test]
+    fn a_jpeg_with_a_non_integer_ratio_still_matches_the_in_memory_kernel() {
+        let bytes = crate::encode_fixed(
+            &DynamicImage::ImageRgba8(fixture(97, 61)),
+            crate::format::OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(95),
+        )
+        .expect("jpeg fixture");
+        assert_matches_the_in_memory_kernel(
+            &bytes,
+            (40, 25),
+            "a 97x61 JPEG reduced to 40x25",
+        );
     }
 
     #[test]
@@ -888,10 +975,13 @@ mod tests {
             writer.write_image_data(&data).expect("png data");
         }
         assert!(PngRows::open(&out, 4, 4, &Limits::default()).is_none());
-        // ...and the whole-image arm still produces the right picture.
-        let got = decode_resized(&out, &Limits::default(), (2, 2), FilterType::Triangle)
-            .expect("streamed decode")
-            .to_rgba8();
-        assert_eq!(got.dimensions(), (2, 2));
+        // ...and the whole-image arm still produces the right picture. The name
+        // promised "rather than scrambling" and the body used to check the
+        // dimensions, which a scrambled picture has too.
+        assert_matches_the_in_memory_kernel(
+            &out,
+            (2, 2),
+            "a 16-bit RGBA PNG through the fallback arm",
+        );
     }
 }

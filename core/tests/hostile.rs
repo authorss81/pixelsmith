@@ -21,7 +21,7 @@
 //! ceiling means what it says. `noise()` is used only where the claim is "this
 //! decodes at all", never to measure size.
 
-use image::{ImageFormat, ImageReader};
+use image::{GenericImageView, ImageError, ImageFormat, ImageReader};
 use pixelsmith_core::error::Error;
 use pixelsmith_core::format::OutputFormat;
 use pixelsmith_core::validate::{Limits, ValidateReport};
@@ -655,18 +655,154 @@ fn no_corpus_entry_panics() {
     );
 }
 
-/// `ImageReader` is what `validate` uses internally. Exercised directly so a
-/// decoder limit that `validate` forgets to apply is still visible here.
+/// `ImageReader` is what `validate` uses internally, and `Limits::apply_to_decoder`
+/// is the only thing between `validate` and a decoder with no ceiling at all.
+/// Exercised directly so a limit that `validate` forgets to apply is visible here.
+///
+/// This was finding 20's worst of the four, and the reason it matters more than
+/// its size: the previous version called `no_limits()`, called
+/// `apply_to_decoder()`, and then threw the result away with `let _ =`. Deleting
+/// the body of `apply_to_decoder` left this test green, so the only test standing
+/// between the engine and a 14 GB decode measured nothing at all.
+///
+/// Three shapes, because `apply_to_decoder` sets three things and a test that only
+/// exercised one of them would leave the other two unmeasured:
+///
+/// * `max_image_width` / `max_image_height` — a *valid* PNG that is simply too
+///   wide for the profile. 34_000 pixels is about 100 KB, so the control below
+///   really does decode it, which is what makes the refusal attributable to the
+///   limit rather than to an unreadable fixture.
+/// * `max_alloc` — a header claiming 225 MP, which `check_header` refuses first
+///   on every path that goes through `validate`. The decoder has to refuse it too,
+///   because `validate` is advisory (`validate_bytes_warns_where_decode_bounded_refuses`
+///   is the test that says so) and `decode_bounded` reaches the decoder directly.
+/// * The same `max_alloc` arm at a size small enough to run with the control, so
+///   "the limit fired" is separated from "the file was broken anyway".
 #[test]
-fn a_raw_reader_respects_decoder_limits_on_hostile_input() {
-    let limits = Limits::mobile();
-    let full = photo(64, 64);
-    for cut in [0usize, 4, 12, 33, 64, full.len() - 1] {
-        let mut reader = ImageReader::new(Cursor::new(&full[..cut]));
-        reader.no_limits(); // prove `apply_to_decoder` is what does the limiting
-        limits.apply_to_decoder(&mut reader);
-        // Again: no assertion on success or failure, only that asking with
-        // limits applied cannot abort.
-        let _ = reader.decode();
+fn a_raw_reader_refuses_what_the_profile_ceiling_forbids_and_would_otherwise_open() {
+    use image::error::LimitErrorKind;
+
+    /// A reader that knows the format from the magic bytes, not from a name.
+    ///
+    /// `ImageReader::new` alone leaves the format unset, and `decode()` then
+    /// refuses every file with `Unsupported(Format(Unknown))` — which is exactly
+    /// what the version of this test before phase-21 was doing, silently, for
+    /// every case in it.
+    fn raw_reader(bytes: &[u8]) -> ImageReader<Cursor<&[u8]>> {
+        ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .expect("guessing a format reads sixteen bytes and cannot fail on a fixture")
     }
+
+    /// Decode `bytes` with `limits` pushed into the reader, and require the
+    /// refusal to name the limit that fired.
+    ///
+    /// A strict shape rather than `is_err()`: a decoder that stopped for any
+    /// other reason — a truncated stream, an unsupported colour type, a CRC
+    /// mismatch — would pass `is_err()` and mean nothing.
+    #[track_caller]
+    fn assert_refused_by(
+        bytes: &[u8],
+        limits: &Limits,
+        expected: LimitErrorKind,
+        what: &str,
+    ) {
+        let mut reader = raw_reader(bytes);
+        reader.no_limits(); // so only `apply_to_decoder` can be doing this
+        limits.apply_to_decoder(&mut reader);
+        match reader.decode() {
+            Err(ImageError::Limits(refused)) => assert_eq!(
+                refused.kind(),
+                expected,
+                "{what}: refused by a different limit than the one under test"
+            ),
+            // Display, never Debug: a 225 MP `DynamicImage` formats to megabytes
+            // of numbers, and a failure message that buries its own cause is the
+            // opposite of what a test is for.
+            Err(other) => panic!(
+                "{what}: expected ImageError::Limits({expected:?}), got: {other}\n\
+                 Deleting the body of Limits::apply_to_decoder is what this test exists \
+                 to notice, and this is the assertion that notices it."
+            ),
+            Ok(img) => panic!(
+                "{what}: the decoder opened it, at {}x{}",
+                img.width(),
+                img.height()
+            ),
+        }
+    }
+
+    let mobile = Limits::mobile();
+
+    // 17_000 x 2: inside the 40 MP budget, over the 16_000 per-side ceiling.
+    let too_wide = photo(17_000, 2);
+    // The control. Without this, "it was refused" could mean "this PNG is
+    // malformed", and the fixture would be doing the work the limit should do.
+    let mut control = raw_reader(&too_wide);
+    control.no_limits();
+    let opened = control
+        .decode()
+        .expect("a 17_000x2 PNG is a readable file; if this fails, the fixture is wrong");
+    assert_eq!(
+        (opened.width(), opened.height()),
+        (17_000, 2),
+        "the control must be the picture the fixture claims to be"
+    );
+    assert_refused_by(
+        &too_wide,
+        &mobile,
+        LimitErrorKind::DimensionError,
+        "17_000 pixels is over the mobile per-side ceiling",
+    );
+
+    // 225 MP, under the per-side ceiling and over the pixel budget: the shape a
+    // decompression bomb is, and the one `max_alloc` exists for.
+    //
+    // No control on this one, deliberately. An unlimited decode of a header this
+    // size allocates 225 MP x 3 bytes before it discovers the file has no data,
+    // so running one "for symmetry" would spend 675 MB proving that a bomb is a
+    // bomb. The tight-profile case below covers the same arm for a few kilobytes.
+    let bomb = png_claiming(&photo(32, 32), 15_000, 15_000);
+    assert_refused_by(
+        &bomb,
+        &mobile,
+        LimitErrorKind::InsufficientMemory,
+        "225 MP is over the mobile pixel budget",
+    );
+
+    // The `max_alloc` arm again, where the control costs 12 KB rather than
+    // 675 MB: a real 64x64 PNG against a profile whose budget is 400 pixels.
+    let tight = Limits {
+        max_pixels: 400,
+        ..Limits::default()
+    };
+    let generous = Limits {
+        max_pixels: 100_000,
+        ..Limits::default()
+    };
+    let small = photo(64, 64); // 4_096 pixels against a 400 budget
+    let mut control = raw_reader(&small);
+    control.no_limits();
+    assert_eq!(
+        control.decode().expect("a 64x64 PNG decodes").dimensions(),
+        (64, 64),
+        "the control must be the picture the fixture claims to be"
+    );
+    assert_refused_by(
+        &small,
+        &tight,
+        LimitErrorKind::InsufficientMemory,
+        "4_096 pixels is over a 400-pixel budget",
+    );
+
+    // The negative direction: the same file against a profile that permits it
+    // decodes. Without this the three refusals above would be satisfied by any
+    // profile at all, including one that refuses everything.
+    let mut reader = raw_reader(&small);
+    generous.apply_to_decoder(&mut reader);
+    assert_eq!(
+        reader.decode().expect("4_096 pixels is inside a 100k budget").dimensions(),
+        (64, 64),
+        "a generous budget must not refuse"
+    );
 }

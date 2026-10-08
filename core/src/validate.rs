@@ -532,16 +532,89 @@ mod tests {
         ));
     }
 
+    /// Bytes that are not an image at all, named as such.
+    ///
+    /// Was `assert!(...is_err())`, in a module with eight named variants. That
+    /// assertion is satisfied by `Decode`, by `InputTooLarge`, by a panic caught
+    /// somewhere upstream — anything that ends in an `Err` — and the distinction
+    /// is the whole point of the variant: this file is not a picture, as opposed
+    /// to being a picture we failed to read, and hard rule 9 wants the user told
+    /// which of the two they are holding.
     #[test]
     fn garbage_bytes_are_rejected() {
-        assert!(validate_bytes(b"not an image at all", &Limits::default()).is_err());
+        assert!(
+            matches!(
+                validate_bytes(b"not an image at all", &Limits::default()),
+                Err(Error::UnknownFormat)
+            ),
+            "bytes that are not an image must be refused as unrecognised, not as a \
+             decode failure - a user holding a .txt should not be told the decoder \
+             failed on it"
+        );
+        // And the same for a file that *is* an image with its first bytes
+        // overwritten, which is the near-miss that `UnknownFormat` and `Decode`
+        // must not be confused about.
+        let mut png = crate::encode_fixed(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8)),
+            crate::format::OutputFormat::Png,
+            crate::format::EncodingOptions::default(),
+        )
+        .expect("png fixture");
+        png[1] = b'Z';
+        assert!(
+            matches!(
+                validate_bytes(&png, &Limits::default()),
+                Err(Error::UnknownFormat)
+            ),
+            "a PNG whose signature was overwritten is not a picture this build can \
+             open, whatever its dimensions say"
+        );
     }
 
+    /// A truncated file is refused whole: no report, no partial geometry, no
+    /// half-decoded picture for a caller to write out.
+    ///
+    /// The name made that claim and the body checked `is_err()` — which is
+    /// necessary and nowhere near sufficient, because `Err` is the *only* shape a
+    /// refusal can take. The two halves of "rather than half decoded" are
+    /// therefore asserted separately: the refusal names a variant, and both
+    /// entry points that hand a caller an image agree that there is none.
     #[test]
     fn a_truncated_jpeg_is_rejected_rather_than_half_decoded() {
         let full = jpeg(64, 64);
         let truncated = &full[..full.len() / 3];
-        assert!(validate_bytes(truncated, &Limits::default()).is_err());
+
+        let err = validate_bytes(truncated, &Limits::default())
+            .expect_err("a JPEG with two thirds of its entropy-coded data missing is not a picture");
+        // A strict allow-list rather than `is_err()`: a decoder that started
+        // reporting `Metadata` for a file whose *pixels* are unreadable would
+        // pass `is_err()` and move the blame onto the tags.
+        match &err {
+            Error::Decode(_) | Error::UnknownFormat | Error::Heic(_) => {}
+            other => panic!(
+                "a truncated JPEG must be refused as a decode failure, got {other:?}"
+            ),
+        }
+        // Nothing partial: `validate_bytes` returns either a report or an error,
+        // and the error means there is no report. `inspect` is the function that
+        // would hand a caller both halves, so it is the one that has to agree.
+        assert!(
+            inspect(truncated, &Limits::default()).is_err(),
+            "inspect returned a report for a file validate_bytes refused, which is \
+             the half-decoded picture this test is named after"
+        );
+        assert!(
+            crate::decode_bounded(truncated, &Limits::default()).is_err(),
+            "decode_bounded produced an image from a file that could not be read"
+        );
+        // The positive control: a third of the way is past the header but nowhere
+        // near the end, and the fixture is complete at full length.
+        assert_eq!(
+            validate_bytes(&full, &Limits::default())
+                .expect("the untruncated fixture must validate")
+                .width,
+            64
+        );
     }
 
     #[test]

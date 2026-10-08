@@ -156,7 +156,8 @@ pub enum Error {
     /// the *request* is what this build cannot carry out: the pixels fit the
     /// header check, and the output does not fit the memory the profile allows.
     #[error(
-        "this resize would need {needed} bytes of working memory and this device          allows {budget}; choose a smaller output size"
+        "this resize would need {needed} bytes of working memory and this device allows \
+         {budget}; choose a smaller output size"
     )]
     StreamingBudgetExceeded { budget: u64, needed: u64 },
 
@@ -237,5 +238,508 @@ impl From<image::ImageError> for Error {
     /// mean "these bytes are not a picture we can handle".
     fn from(value: image::ImageError) -> Self {
         Self::Decode(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    /// The sentence `ColourOptions::validate` refuses with, extracted rather than
+    /// retyped: the payload is a `&'static str` living in `colour.rs`, and a copy
+    /// of it here would go stale the moment that one is reworded.
+    fn conflicting_options_note() -> &'static str {
+        let options = crate::colour::ColourOptions {
+            keep_source_pixels: true,
+            embed_profile: true,
+            ..Default::default()
+        };
+        match options.validate() {
+            Err(Error::ConflictingOptions(note)) => note,
+            other => panic!("the two contradictory options must be refused, got {other:?}"),
+        }
+    }
+
+    /// The variant's own name, by an exhaustive match with no wildcard.
+    ///
+    /// This function is the coverage mechanism, and it is here rather than in a
+    /// script because a compiler is the only thing in this repository that cannot
+    /// be talked out of its answer. Adding a variant to [`Error`] makes this fail
+    /// to compile, which points at `cases()` below; a script scanning for a
+    /// message would have to be run, and `docs/AUDIT.md` finding 19 is what
+    /// happens to a module whose tests are only run when somebody thinks to.
+    fn variant_name(error: &Error) -> &'static str {
+        match error {
+            Error::UnknownFormat => "UnknownFormat",
+            Error::UnsupportedFormat(_) => "UnsupportedFormat",
+            Error::NoQualitySetting(_) => "NoQualitySetting",
+            Error::InputTooLarge { .. } => "InputTooLarge",
+            Error::PixelBudgetExceeded { .. } => "PixelBudgetExceeded",
+            Error::SuspiciousDimensions { .. } => "SuspiciousDimensions",
+            Error::ZeroDimension => "ZeroDimension",
+            Error::CropOutOfBounds { .. } => "CropOutOfBounds",
+            Error::Decode(_) => "Decode",
+            Error::Encode(_) => "Encode",
+            Error::Jpeg(_) => "Jpeg",
+            Error::Webp(_) => "Webp",
+            Error::UnsupportedColourSpace(_) => "UnsupportedColourSpace",
+            Error::ConflictingOptions(_) => "ConflictingOptions",
+            Error::ColourProfile(_) => "ColourProfile",
+            Error::AnimationRefused { .. } => "AnimationRefused",
+            Error::Io(_) => "Io",
+            Error::Heic(_) => "Heic",
+            Error::Metadata(_) => "Metadata",
+            Error::Archive(_) => "Archive",
+            Error::StreamingBudgetExceeded { .. } => "StreamingBudgetExceeded",
+            Error::TruncatedStream { .. } => "TruncatedStream",
+            Error::Cancelled => "Cancelled",
+            Error::Duplicate { .. } => "Duplicate",
+            Error::WouldUpscale { .. } => "WouldUpscale",
+            Error::Sandbox(_) => "Sandbox",
+        }
+    }
+
+    /// One case per variant: the error, and the fragments of its message that a
+    /// user needs in order to do something about it.
+    ///
+    /// The payloads are the real ones wherever a function writes them — the PNG
+    /// quality note, the WebP ICC note, the HEIF sentences — rather than strings
+    /// invented here. A fixture invented here would assert that the variant
+    /// renders *its* payload, which is true of every `&'static str` variant and
+    /// is precisely the half of the message nobody has read.
+    ///
+    /// Two of these rows are about the numbers rather than the prose: the audit
+    /// found a message with ten literal spaces in the middle of a sentence
+    /// (`StreamingBudgetExceeded`), and a message that renders `3600` where the
+    /// user needs `3600.0 MP` is the same defect wearing a different hat.
+    fn cases() -> [(&'static str, Error, &'static [&'static str]); 26] {
+        use crate::format::OutputFormat;
+        [
+            (
+                "UnknownFormat",
+                Error::UnknownFormat,
+                &["unrecognised", "image format"],
+            ),
+            (
+                "UnsupportedFormat",
+                // The HEIC sentence, verbatim from the arm that refuses it.
+                Error::UnsupportedFormat(
+                    "this build reads HEIC/HEIF but cannot write it: choose JPEG, PNG or WebP \
+                     as the output format and the photo will be converted",
+                ),
+                &["cannot write", "choose JPEG", "PNG or WebP"],
+            ),
+            (
+                "NoQualitySetting",
+                // The real PNG note. Hard rule 9's test is the second fragment: a
+                // byte ceiling that cannot be honoured has to name a format that
+                // could honour it, or the user is left with nothing to pick.
+                Error::NoQualitySetting(OutputFormat::Png.quality_note()),
+                &["no quality setting", "Ask for JPEG or WebP"],
+            ),
+            (
+                "InputTooLarge",
+                Error::InputTooLarge {
+                    limit: 134_217_728,
+                    actual: 402_653_184,
+                },
+                &["134217728", "402653184", "input limit"],
+            ),
+            (
+                "PixelBudgetExceeded",
+                Error::PixelBudgetExceeded {
+                    limit: 40,
+                    actual: 225.0,
+                },
+                &["40", "225.00", "megapixel budget"],
+            ),
+            (
+                "SuspiciousDimensions",
+                Error::SuspiciousDimensions {
+                    w: 60_000,
+                    h: 60_000,
+                    mp: 3600.0,
+                },
+                &["60000x60000", "3600.0", "MP", "decompression bomb"],
+            ),
+            ("ZeroDimension", Error::ZeroDimension, &["greater than zero"]),
+            (
+                "CropOutOfBounds",
+                Error::CropOutOfBounds {
+                    requested_x: 30,
+                    requested_y: 40,
+                    requested_width: 400,
+                    requested_height: 300,
+                    src_width: 100,
+                    src_height: 80,
+                },
+                &["100x80", "400x300", "(30, 40)", "crop inside the picture"],
+            ),
+            (
+                "Decode",
+                Error::Decode(image::ImageError::IoError(io::Error::other(
+                    "corrupt Huffman table",
+                ))),
+                // The prefix names which half of the work failed; the source names
+                // why. Asserting only the prefix would pass on the one message
+                // hard rule 9 forbids.
+                &["decode failed", "corrupt Huffman table"],
+            ),
+            (
+                "Encode",
+                Error::Encode(image::ImageError::Parameter(
+                    image::error::ParameterError::from_kind(
+                        image::error::ParameterErrorKind::DimensionMismatch,
+                    ),
+                )),
+                &["encode failed", "dimension"],
+            ),
+            (
+                "Jpeg",
+                Error::Jpeg(jpeg_encoder::EncodingError::BadImageData {
+                    length: 10,
+                    required: 20,
+                }),
+                &["JPEG encoder rejected", "at least 20"],
+            ),
+            (
+                "Webp",
+                Error::Webp(
+                    "it is 20000 pixels wide and libwebp stores at most 16383 a side",
+                ),
+                &["WebP", "20000", "16383", "because"],
+            ),
+            (
+                "UnsupportedColourSpace",
+                Error::UnsupportedColourSpace(
+                    "CMYK cannot be converted into sRGB by this build; convert the file to \
+                     RGB first, or ask to keep the original colour values"
+                        .to_string(),
+                ),
+                &["CMYK", "sRGB", "or"],
+            ),
+            (
+                "ConflictingOptions",
+                Error::ConflictingOptions(
+                    conflicting_options_note(),
+                ),
+                &["Pick one"],
+            ),
+            (
+                "ColourProfile",
+                // The real WebP ICC refusal, because "embedding is refused for
+                // WebP" is only useful if the sentence says what to pick.
+                Error::ColourProfile(OutputFormat::WebP.icc_note()),
+                &["WebP", "JPEG or PNG", "turn the option off"],
+            ),
+            (
+                "AnimationRefused",
+                Error::AnimationRefused {
+                    frames: 12,
+                    note: crate::animation::refusal_note(12),
+                },
+                &["12", "frame", "Choose GIF"],
+            ),
+            (
+                "Io",
+                Error::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the destination folder is not writable",
+                )),
+                &["could not be written", "not writable"],
+            ),
+            (
+                "Heic",
+                Error::Heic(crate::heic::HeicError::NotBuilt),
+                &["no HEIC/HEIF decoder", "JPEG or PNG"],
+            ),
+            (
+                "Metadata",
+                Error::Metadata(exif::Error::InvalidFormat(
+                    "exif: the TIFF header is not II or MM",
+                )),
+                &["metadata could not be parsed", "TIFF header"],
+            ),
+            (
+                "Archive",
+                Error::Archive(zip::result::ZipError::InvalidArchive(
+                    "the central directory is not where the file ends".into(),
+                )),
+                &["archive could not be assembled", "central directory"],
+            ),
+            (
+                "StreamingBudgetExceeded",
+                Error::StreamingBudgetExceeded {
+                    budget: 160_000_000,
+                    needed: 402_653_184,
+                },
+                // One space between every word. This row exists because the string
+                // carried ten of them, mid-sentence, in text a user reads; the
+                // general property below is what stops the next one.
+                &["working memory", "402653184", "160000000", "smaller output size"],
+            ),
+            (
+                "TruncatedStream",
+                Error::TruncatedStream {
+                    read: 3,
+                    expected: 100,
+                },
+                &["3 of 100 rows"],
+            ),
+            ("Cancelled", Error::Cancelled, &["cancelled"]),
+            (
+                "Duplicate",
+                Error::Duplicate {
+                    of: "beach-sunset.jpg".to_string(),
+                },
+                &["already exported", "beach-sunset.jpg"],
+            ),
+            (
+                "WouldUpscale",
+                Error::WouldUpscale {
+                    requested_width: 4000,
+                    requested_height: 3000,
+                    actual_width: 64,
+                    actual_height: 64,
+                },
+                &["4000x3000", "64x64", "adds no detail"],
+            ),
+            (
+                "Sandbox",
+                Error::Sandbox(
+                    "this photo needed more memory than the 512 MB ceiling this device allows; \
+                     export it one at a time"
+                        .to_string(),
+                ),
+                &["512 MB", "one at a time"],
+            ),
+        ]
+    }
+
+    /// The claim `AGENTS.md` makes about tests, applied to the one thing hard
+    /// rule 9 says the product is: for every variant, the rendered message must
+    /// contain the specific thing a user needs.
+    #[test]
+    fn every_variant_names_what_a_user_needs() {
+        for (expected_name, error, fragments) in cases() {
+            let name = variant_name(&error);
+            assert_eq!(
+                name, expected_name,
+                "cases() names this variant {expected_name} and the enum calls it {name}"
+            );
+            let rendered = error.to_string();
+            for fragment in fragments {
+                assert!(
+                    rendered.contains(fragment),
+                    "{name} must tell the user {fragment:?}. It renders: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// Two properties every message has, because both are cheap and both have
+    /// caught a real defect in this file.
+    ///
+    /// The second one caught ten literal spaces in the middle of
+    /// `StreamingBudgetExceeded`'s sentence. `assert!(!s.is_empty())` would not
+    /// have: the message was long, and long is exactly what a broken one is.
+    #[test]
+    fn no_message_is_empty_or_riddled_with_whitespace() {
+        for (_, error, _) in cases() {
+            let name = variant_name(&error);
+            let rendered = error.to_string();
+            assert!(
+                !rendered.trim().is_empty(),
+                "{name} renders an empty message, which is the one thing hard rule 9 forbids"
+            );
+            assert!(
+                !rendered.contains("   "),
+                "{name} renders a run of three or more spaces, which a user reads as a \
+                 sentence that stopped halfway through: {rendered:?}"
+            );
+            let last = rendered.chars().next_back().expect("just checked it is not empty");
+            assert!(
+                !matches!(last, ' ' | '\t' | ',' | ';' | ':'),
+                "{name} renders a message ending in {last:?}, so it is a half-sentence: \
+                 {rendered:?}"
+            );
+        }
+    }
+
+    /// The standard `format::tests::every_refusal_says_what_to_choose_instead`
+    /// holds the format refusals to, one level up: every variant that *knows* an
+    /// alternative has to name it.
+    ///
+    /// Listed by variant rather than derived, because "knows an alternative" is
+    /// not a property the type system carries — it is a decision about the
+    /// product, and a decision has to be written down to be reviewed. A variant
+    /// that is not in this list is asserting that there is nothing useful to
+    /// offer, which for `UnknownFormat` (nothing at all) is true and for anything
+    /// else is worth a sentence in the row above.
+    #[test]
+    fn every_refusal_that_knows_an_alternative_names_it() {
+        let alternatives: [(&str, Error, &[&str]); 10] = [
+            (
+                "UnsupportedFormat",
+                Error::UnsupportedFormat(
+                    "this build reads HEIC/HEIF but cannot write it: choose JPEG, PNG or WebP \
+                     as the output format and the photo will be converted",
+                ),
+                &["choose JPEG"],
+            ),
+            (
+                "NoQualitySetting",
+                Error::NoQualitySetting(crate::format::OutputFormat::Png.quality_note()),
+                &["Ask for JPEG or WebP"],
+            ),
+            (
+                "CropOutOfBounds",
+                Error::CropOutOfBounds {
+                    requested_x: 0,
+                    requested_y: 0,
+                    requested_width: 8_192,
+                    requested_height: 8_192,
+                    src_width: 64,
+                    src_height: 64,
+                },
+                &["crop inside the picture"],
+            ),
+            (
+                "UnsupportedColourSpace",
+                Error::UnsupportedColourSpace(
+                    "this file's colour space is CMYK, which this build does not convert. \
+                     Ask to keep the original colour values, or export as JPEG"
+                        .to_string(),
+                ),
+                &["Ask to keep the original colour values"],
+            ),
+            (
+                "ConflictingOptions",
+                Error::ConflictingOptions(
+                    conflicting_options_note(),
+                ),
+                &["Pick one"],
+            ),
+            (
+                "ColourProfile",
+                Error::ColourProfile(crate::format::OutputFormat::WebP.icc_note()),
+                &["Ask for JPEG or PNG"],
+            ),
+            (
+                "AnimationRefused",
+                Error::AnimationRefused {
+                    frames: 7,
+                    note: crate::animation::refusal_note(7),
+                },
+                &["Choose GIF"],
+            ),
+            (
+                "Heic",
+                Error::Heic(crate::heic::HeicError::NotBuilt),
+                &["share the photo as JPEG or PNG"],
+            ),
+            (
+                "StreamingBudgetExceeded",
+                Error::StreamingBudgetExceeded {
+                    budget: 1024,
+                    needed: 4096,
+                },
+                &["choose a smaller output size"],
+            ),
+            (
+                "Duplicate",
+                Error::Duplicate {
+                    of: "one.jpg".to_string(),
+                },
+                &["already exported as one.jpg"],
+            ),
+        ];
+        for (name, error, needles) in alternatives {
+            assert_eq!(
+                variant_name(&error),
+                name,
+                "this list names {name} and the enum calls it something else"
+            );
+            let rendered = error.to_string();
+            for needle in needles {
+                assert!(
+                    rendered.contains(needle),
+                    "{name} knows an alternative and does not name it: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// The three variants that wrap a third-party error, asserted on the seam.
+    ///
+    /// Hard rule 9 says a failure must say what happened *and* what to do about
+    /// it, and in these three the second half is the source's wording. That is a
+    /// deliberate division of labour rather than a gap — `image`'s "corrupt
+    /// Huffman table" and libwebp's numeric codes are the only description of the
+    /// failure anybody has — so the property to assert is that the wrapper does
+    /// not swallow it. A wrapper that rendered only its own prefix would fail
+    /// here, and that is exactly the "Error: decode failed" the rule names.
+    #[test]
+    fn a_wrapped_codec_error_keeps_the_codecs_own_words() {
+        let cases = [
+            (
+                Error::Decode(image::ImageError::IoError(io::Error::other("zlib: bad CRC"))),
+                "zlib: bad CRC",
+            ),
+            (
+                Error::Encode(image::ImageError::IoError(io::Error::other(
+                    "the output buffer is 3 bytes short",
+                ))),
+                "the output buffer is 3 bytes short",
+            ),
+            (
+                Error::Metadata(exif::Error::NotFound("the orientation tag is absent")),
+                "the orientation tag is absent",
+            ),
+        ];
+        for (error, source_words) in cases {
+            let name = variant_name(&error);
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains(source_words),
+                "{name} dropped the source's explanation ({source_words:?}): {rendered}"
+            );
+            assert!(
+                error.source().is_some(),
+                "{name} wraps a cause but does not report one, so nothing can walk to it"
+            );
+        }
+    }
+
+    /// `thiserror`'s `#[from]` conversions are the reason one enum is the whole
+    /// failure surface, and they are the one part of this type with no keyword an
+    /// exhaustive match would catch.
+    #[test]
+    fn the_from_conversions_land_on_the_variant_that_names_them() {
+        let io: Error = io::Error::other("no room left").into();
+        assert!(matches!(io, Error::Io(_)), "io::Error must become Io");
+
+        let image_error: Error =
+            image::ImageError::IoError(io::Error::other("truncated stream")).into();
+        assert!(
+            matches!(image_error, Error::Decode(_)),
+            "a bare image::ImageError must become Decode"
+        );
+
+        let heic: Error = crate::heic::HeicError::UnsupportedCoding.into();
+        assert!(matches!(heic, Error::Heic(_)), "HeicError must become Heic");
+
+        let meta: Error = exif::Error::TooBig("the maker note is 4 MB").into();
+        assert!(
+            matches!(meta, Error::Metadata(_)),
+            "exif::Error must become Metadata"
+        );
+
+        let archive: Error = zip::result::ZipError::FileNotFound.into();
+        assert!(
+            matches!(archive, Error::Archive(_)),
+            "ZipError must become Archive"
+        );
     }
 }
