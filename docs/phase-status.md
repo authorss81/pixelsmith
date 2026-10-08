@@ -13,7 +13,7 @@ ever disagree, the marker wins and the table is a bug.
 | Phase | Title | Status | Commit | Notes |
 | --- | --- | --- | --- | --- |
 | phase-01 | Verification baseline and project scaffolding | DONE | `4cf3df6` | See [phase-01 notes](#phase-01-notes) below |
-| phase-02 | Fuzz harness for every decode path | PENDING | | |
+| phase-02 | Fuzz harness for every decode path | DONE | (pre-phases) | Corrected by phase-17: the row said `PENDING` while `workspace/phase-02/.done` was on disk. See [phase-17 notes](#phase-17-notes). The harness exists — 11 targets, 99 seeds — but **no CI job runs one**, which is finding 16. |
 | phase-03 | Hostile-input corpus and property tests | DONE | `f0a23ff` | See [phase-03 notes](#phase-03-notes) below |
 | phase-04 | Sandboxed decode worker with a hard memory cap | DONE | `40bb083` | See [phase-04 notes](#phase-04-notes) below |
 | phase-05 | Dart FFI binding layer and Flutter app skeleton | DONE | `7813d5a` | See [phase-05 notes](#phase-05-notes) below. **The `app/` half is delivered as an unapplied patch — see the notes before trusting this row.** |
@@ -27,8 +27,104 @@ ever disagree, the marker wins and the table is a bug.
 | phase-13 | Animated GIF: honest handling | DONE | `ce804a9` | See [phase-13 notes](#phase-13-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07. |
 | phase-14 | Content-hash deduplication and a folder pipeline | DONE | `8323a7c` | See [phase-14 notes](#phase-14-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07/13. |
 | phase-15 | Supply-chain policy and reproducible builds | DONE | (this commit) | See [phase-15 notes](#phase-15-notes) below. **The CI workflow is a patch, as in phase-05/06/07/08/10 — most of the policy does not run in CI until it is applied.** One of eight targets is measured reproducible; seven are honestly blank. |
-| phase-16 | Release artefacts: the APK and the EXE | PENDING | | Publishes the installable binaries |
-| phase-17 | Self-audit and next-phase generation | PENDING | | Generates the next phase set |
+| phase-16 | Release artefacts: the APK and the EXE | DONE | `a332803` | Corrected by phase-17: the row said `PENDING` while `.done` was on disk. **The release workflow is a patch, so `scripts/RELEASE-SHA256.txt` records hashes nothing in this tree produces** — `docs/AUDIT.md` finding 18. |
+| phase-17 | Self-audit and next-phase generation | DONE | (this commit) | See [phase-17 notes](#phase-17-notes) below. Wrote `docs/AUDIT.md` and eleven phases. |
+| phase-18 | Bound every allocation untrusted bytes can reach | PENDING | | Audit findings 1, 6, 7, 8. The unbounded PNG `iCCP` inflate, the un-limited FFI JSON envelopes, `CropSpec`'s unchecked `u32` add, and `px_buffer_free`'s trusted length. |
+| phase-19 | Make `cargo test` work in every feature configuration | PENDING | | Audit finding 2. `cargo test` — the README's command — does not compile, and `--all-features` in the gate is the only reason nobody noticed. |
+| phase-20 | The Dart JSON contract, and a check that makes drift fail the gate | PENDING | | Audit findings 3, 4, 5, 13. Five phases of drift, an app that crashes on a HEIC and counts skips as successes, and a leak on every failed call. |
+| phase-21 | The tests that assert nothing, and the module with none | PENDING | | Audit findings 19, 20. Four tests measure nothing, one of them is hard rule 4's only sentinel, and `error.rs` has no test module. |
+| phase-22 | **Track B** — The design system and the shell | PENDING | | All eleven Visual/UI roadmap items are `ABSENT`. This builds the layer the next four UI phases stand on. |
+| phase-23 | **Track B** — The preview canvas and the before/after view | PENDING | | The screen users judge a resizer on. `ROADMAP.md` calls the split slider the centrepiece. |
+| phase-24 | **Track B** — The pipeline editor | PENDING | | Every control the engine exposes, presented so a person who does not know what chroma subsampling is can still choose well. |
+| phase-25 | **Track B** — Live progress, honest cancellation, the batch list | PENDING | | `ROADMAP.md`'s highest-leverage item, and the largest block of missing product: all eight items `ABSENT` or `PARTIAL`. |
+| phase-26 | **Track B** — Export flows and the folder plan | PENDING | | Where files go, and what happens when two are the same photograph. Adds the `px_plan` entry point the folder preview needs. |
+| phase-27 | CI that executes what it compiles | PENDING | | Audit findings 14–18, 23. No job runs a test on any target but Linux x86; four jobs exist only as patches; the fuzzers are never run. |
+| phase-28 | `streaming`: make it correct, then decide whether it ships | PENDING | | Audit findings 10, 11. A stride bug that skews every JPEG the path touches, a 2 GB fallback outside its budget, and the release measurement the default has been waiting on. |
+
+## phase-17 notes
+
+**`docs/AUDIT.md` is the deliverable.** 25 numbered findings, a `DONE` /
+`PARTIAL` / `ABSENT` / `STALE` classification for every roadmap item, and a
+"could not verify" section with ten entries. It is deliberately not flattering:
+the headline finding is that `cargo test` — the command `README.md:91` tells a
+contributor to run — **does not compile**, which `verify.sh`'s `--all-features`
+hides.
+
+**The security claim was re-derived rather than trusted, and it holds.**
+`cargo tree --all-features` over the full closure — 118 crates — contains no
+HTTP, TLS, socket or DNS crate, and `core/src` names no networking symbol. The
+only `std::process` use is `sandbox.rs` re-execing this crate's own binary. That
+matters to record plainly, because it is the claim the project exists to make and
+it is the one thing that must not rot.
+
+**Two rows in this table were wrong and are corrected above.** phase-02 and
+phase-16 both read `PENDING` with a `.done` marker on disk. This file's own
+preamble says the marker wins and the table is a bug, so they were bugs. Both are
+now `DONE`, with the caveats the audit found attached rather than smoothed over.
+
+**`cargo test` does not compile, in two independent ways.** `README.md:91` says
+`cd core && cargo test`. It fails with `error[E0601]: main function not found in
+crate resize_bench` (the example is `#![cfg(feature = "simd")]`) and
+`cannot find stream in pixelsmith_core` (`tests/streaming_peak.rs` is ungated;
+`stream` is not). `verify.sh` runs `--all-features`, so the gate is green and the
+defect is invisible to the only thing watching — which also means
+**`--no-default-features` has never compiled on this tree**, so phase-07's note
+claiming the AVIF refusal arm "was additionally run under
+`--no-default-features`" describes a run that could not have happened. Finding 2,
+phase-19.
+
+**The most serious single defect is an unbounded zlib inflate on the main input
+path.** `colour.rs:709-713` reads a PNG's `iCCP` chunk into a `Vec` with no cap
+on the decompressed size. It is reached from `validate_bytes` → `exif::read` →
+`colour_profile`, so **every** `px_inspect`, `px_exif`, `px_process`, `px_batch`
+and every folder plan touches it for any file whose magic bytes are a PNG. A few
+kilobytes that inflate to gigabytes ends in `handle_alloc_error` and an abort.
+The same module caps `desc_text`, `mluc_text` and `tag_table`; the one inflate
+is the one where the cap was missed. Finding 1, phase-18.
+
+**The app crashes on an iPhone photograph.** `app/lib/rust/models.dart:21` parses
+a wire format with `OutputFormat.values.byName`, which **throws** on a name it
+does not know; the enum stops at `avif`; `heic::detect` reports `"heic"`
+deliberately with no feature gate behind it. `ValidateReport.fromJson` calls it
+at `:202`. And `BatchOutcome.ok` is `error == null` where `worker.rs:289` says
+`error.is_none() && skipped.is_none()`, so a batch of 400 with 30 duplicates
+reports 400 successes. Five phases of contract drift — 06, 07, 12, 13, 14 — with
+four patches written and none landed, and phase-12 has no patch at all.
+Findings 3, 4 and 5, phase-20.
+
+**Four tests assert nothing, and one of them is hard rule 4's only sentinel.**
+`core/tests/hostile.rs:660` calls `apply_to_decoder` and then `let _ =
+reader.decode()`; **deleting the body of `apply_to_decoder` makes it pass.**
+`worker.rs:2185` asserts `current_num_threads() >= 1` under the name
+`rayon_has_more_than_one_thread`. `sandbox.rs:908` claims "exits cleanly" and is
+a compile-time function-pointer assignment. Both `stream.rs` whole-image-arm
+tests assert only dimensions — which is why finding 10, a stride bug that skews
+every JPEG the streaming path touches, has never been seen. And
+`core/src/error.rs` has **no test module at all** despite hard rule 9 making its
+messages the product; it has a live defect of exactly the kind one test would
+catch, at `error.rs:128`: ten literal spaces in a user-facing sentence.
+Findings 19 and 20, phase-21.
+
+**No CI job runs a test on any target but Linux x86.** `engine-matrix` compiles
+test binaries on five targets with `--no-run`, which is compile-only. Four CI
+jobs exist only as patches — `webp-lossy-matrix`, `bench.yml`,
+`reproducible-build`/`vet`, and `release.yml` — and `git apply --check` succeeds
+on all four, so the credential wall is still live rather than the context being
+stale. `docs/ARCHITECTURE.md` currently cites one of those patches as the
+*reason* `heic` is off by default, which is a patch rather than a job and is how
+a documentation file starts lying. The `linux` job has `continue-on-error: true`
+and never builds the engine, so a Linux bundle with no engine is green.
+Findings 14–18 and 23, phase-27.
+
+**The audit admits ten limits rather than guessing past them**, including how the
+APK and AAB hashes in `scripts/RELEASE-SHA256.txt` were produced (I could not
+determine it from the tree), that no test has ever run on Android or Windows, and
+that findings 10 and 11 were read rather than reproduced.
+
+**Eleven phases written**, five Track A and six Track B, ordered by leverage:
+the security bounds first, then the broken `cargo test`, then the contract drift,
+then the tests that assert nothing, then the whole UI. `workspace/PHASES.md` has
+a row for all 28.
 
 ## phase-01 notes
 
