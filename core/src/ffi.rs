@@ -183,8 +183,8 @@ pub const MAX_REQUEST_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// at once is the 1024 live cancel tokens `px_cancel_new` allows; a batch half
 /// that is still two orders of magnitude above what a person exports in one go,
 /// and it is only reachable at all by files far too small to need an envelope —
-/// [`folder::MAX_ENTRIES`]'s 10,000 is the folder *plan*, which is the ceiling
-/// for walking a disk, not for transporting pictures across the FFI.
+/// [`crate::folder::MAX_ENTRIES`]'s 10,000 is the folder *plan*, which is the
+/// ceiling for walking a disk, not for transporting pictures across the FFI.
 pub const MAX_REQUEST_FILES: usize = 512;
 
 /// Most bytes in one request envelope.
