@@ -218,6 +218,13 @@ before the allocation. This is the limit check that is missing.
 **Confidence: high.** Read the code, traced every caller, confirmed the call
 chain is ungated by any feature.
 
+**Fixed in phase-18.** `colour::png_icc` now inflates through a
+`Read::take(MAX_ICC_PROFILE)` — 4 MiB, chosen against the largest profile that
+exists in the wild rather than against taste — and a profile over it is reported
+as untagged rather than allocated. `colour::tests::an_iccp_payload_that_inflates_past_the_cap_is_ignored`
+builds a 60 KB PNG carrying a 4 MiB profile and fails against the code as it
+stood.
+
 ### 2. `cargo test` — the command the README tells a contributor to run — does not compile — HIGH
 
 `README.md:91` says:
@@ -360,6 +367,18 @@ without exception, and this engine has been otherwise exemplary about it.
 **Confidence: high** for the absence; **low** for whether it matters in
 practice, because the input originates from a platform file picker.
 
+**Fixed in phase-18**, with one correction. `ffi.rs` states four envelope
+numbers — `MAX_REQUEST_BYTES` (64 MiB, derived as the payload ceiling times the
+JSON expansion factor), `MAX_REQUEST_FILES` (512), `MAX_REQUEST_FILE_BYTES` (8
+MiB) and `MAX_REQUEST_PAYLOAD_BYTES` (16 MiB). The first is checked before
+`serde_json` sees the document; the other three are enforced in the deserialiser's
+visitor, because a check on the parsed `Vec` is a check after the allocation.
+`px_batch`'s copy of every byte array into a `Job` is **not** a copy — `f.bytes`
+moves the `Vec` — so it was left alone; the prompt's claim that it is a second
+full copy is wrong, and the only allocation there is one `Job` header per file.
+`px_zip` still constructs no `Limits`, which is correct: there is no picture in
+it, so the envelope numbers are the only bounds that mean anything there.
+
 ### 7. `CropSpec` does unchecked `u32` addition on Dart-supplied numbers — MEDIUM
 
 `pipeline.rs:255`, `:257-259`, and the same shape at `:426`, `:428-430`:
@@ -387,6 +406,13 @@ overflow region is never produced.
 **Confidence: high** on the code; **medium** on release behaviour, which depends
 on `image`'s clamping rather than on anything this crate asserts.
 
+**Fixed in phase-18.** Both halves now call one `check_crop`, which compares by
+subtraction (`crop.x < src_w && crop.width <= src_w - crop.x`) and refuses with a
+new `Error::CropOutOfBounds` that names the picture and the rectangle. The
+out-of-bounds crop in a batch therefore reports a **failure** rather than the
+`TooLarge` skip it reported before, which is the honest classification: the file
+is fine and the request does not fit it.
+
 ### 8. `px_buffer_free` trusts the caller's length — MEDIUM
 
 `ffi.rs:54-62` stores the `Vec`'s **capacity** in `CAPACITIES`, keyed by address.
@@ -401,6 +427,12 @@ checked. Storing `(len, cap)` and ignoring the caller's `len` would make it
 impossible.
 
 **Confidence: high** on the mechanism; **low** on exploitability.
+
+**Fixed in phase-18**, and the mechanism is worse than "UB-by-the-standard":
+`RawVec::cap_set` *asserts* `cap >= len`, so a host that corrupted `len` took the
+process down with a non-unwinding panic inside a `no_mangle` free function — an
+abort, on the cleanup path, in the build that ships. The registry stores
+`(len, cap)` now and `px_buffer_free` ignores the caller's `len` entirely.
 
 ### 9. `px_selftest_panic` is an unconditionally exported abort in a shipping library — MEDIUM
 
@@ -713,6 +745,28 @@ So a Linux bundle with no engine in it is a green job.
 
 **Confidence: high** on the code; **low** on severity, since no shipped target
 is 32-bit.
+
+### 26. `px_exif` consults no `Limits` at all — LOW (found while fixing finding 6)
+
+`ffi.rs`'s `px_exif(ptr, len)` calls `crate::exif::read(bytes)` and nothing else.
+Every other entry point that takes a file reaches `validate_bytes`, which checks
+`max_input_bytes` first; this one does not, and neither `Limits::mobile()` nor
+`Limits::default()` is ever constructed on this path.
+
+So every allocation `kamadak-exif` makes while walking a hostile tag tree —
+arrays whose count is stated in the file rather than found in it — is bounded only
+by the buffer Dart already had in memory. It is not a hole of the shape finding 1
+was: the bytes are resident before this function is called, so an input-size check
+would bound nothing by itself. What is missing is the ceiling *inside* the parse,
+which is the same kind of thing `MAX_TAGS` and `MAX_TEXT` are for one module over.
+
+**Not fixed by phase-18**, which was scoped to the four findings it was given;
+recorded here so it is a decision rather than an oversight. It belongs with a
+`Limits` consultation on `px_exif` and a cap inside `exif::read`.
+
+**Confidence: high** on the absence — it is two functions long; **low** on
+exploitability, because the input comes from a file picker and the decoder refuses
+values longer than the buffer it was given.
 
 ---
 

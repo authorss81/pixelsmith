@@ -249,16 +249,7 @@ impl Pipeline {
         let (mut w, mut h) = (src_w, src_h);
 
         if let Some(crop) = self.crop {
-            if crop.width == 0 || crop.height == 0 {
-                return Err(Error::ZeroDimension);
-            }
-            if crop.x + crop.width > w || crop.y + crop.height > h {
-                return Err(Error::SuspiciousDimensions {
-                    w: crop.x + crop.width,
-                    h: crop.y + crop.height,
-                    mp: f64::from(crop.x + crop.width) * f64::from(crop.y + crop.height) / 1e6,
-                });
-            }
+            check_crop(&crop, src_w, src_h)?;
             w = crop.width;
             h = crop.height;
         }
@@ -419,17 +410,46 @@ fn scale_axis(source: u32, source_ref: u32, target: u32) -> u32 {
     scaled.clamp(1, u32::MAX as u64) as u32
 }
 
-fn crop_apply(img: &image::DynamicImage, crop: CropSpec) -> Result<image::DynamicImage> {
+/// Refuse a crop that is empty or does not fit inside the picture.
+///
+/// One function for both callers — [`Pipeline::output_dimensions`] and
+/// [`Pipeline::apply`] — because they were the same three lines written twice,
+/// and a check that exists in one of them is not a check.
+///
+/// The arithmetic is subtraction rather than addition, and that is the whole
+/// point of the fix. `CropSpec` derives `Deserialize` with no range constraint
+/// and reaches `px_process` and `px_batch` from Dart, so `x = 4294967295` with
+/// `width = 1` is a value the caller can send: `x + width` overflows, which
+/// **panics** in an overflow-checked build — `dev` and `test`, so every CI run and
+/// every `cargo test` — and wraps silently in release, where `image` clamps it
+/// into a zero-width buffer that happens to become a clean error by way of a
+/// third party's clamp rather than a check here. `crop.width <= src_w - crop.x`,
+/// guarded by `crop.x < src_w`, is the same comparison with no sum to overflow.
+///
+/// The rectangle is refused rather than clamped to the source: "you asked for a
+/// region that is not there" and "here is the part of your picture that is" are
+/// different answers, and only one of them is what the caller asked for.
+fn check_crop(crop: &CropSpec, src_w: u32, src_h: u32) -> Result<()> {
     if crop.width == 0 || crop.height == 0 {
         return Err(Error::ZeroDimension);
     }
-    if crop.x + crop.width > img.width() || crop.y + crop.height > img.height() {
-        return Err(Error::SuspiciousDimensions {
-            w: crop.x + crop.width,
-            h: crop.y + crop.height,
-            mp: f64::from(crop.x + crop.width) * f64::from(crop.y + crop.height) / 1e6,
+    let inside_x = crop.x < src_w && crop.width <= src_w - crop.x;
+    let inside_y = crop.y < src_h && crop.height <= src_h - crop.y;
+    if !inside_x || !inside_y {
+        return Err(Error::CropOutOfBounds {
+            requested_x: crop.x,
+            requested_y: crop.y,
+            requested_width: crop.width,
+            requested_height: crop.height,
+            src_width: src_w,
+            src_height: src_h,
         });
     }
+    Ok(())
+}
+
+fn crop_apply(img: &image::DynamicImage, crop: CropSpec) -> Result<image::DynamicImage> {
+    check_crop(&crop, img.width(), img.height())?;
     Ok(img.crop_imm(crop.x, crop.y, crop.width, crop.height))
 }
 
@@ -612,6 +632,89 @@ mod tests {
         };
         assert!(p.apply(&img(400, 200)).is_err());
         assert!(p.output_dimensions(400, 200).is_err());
+    }
+
+    /// A crop whose `x + width` is not representable is refused by name, by both
+    /// halves, rather than overflowing while it is being checked.
+    ///
+    /// This is the audit's finding 7. The test profile has `overflow-checks` on,
+    /// so the pre-fix expression `crop.x + crop.width` panicked here — a panic on
+    /// a number the caller chose, from inside a public entry point, which is hard
+    /// rule 3 exactly. Both halves are driven because they were two copies of the
+    /// same three lines and a fix in one of them is not a fix.
+    #[test]
+    fn a_crop_whose_sum_overflows_is_refused_by_name() {
+        let src = img(400, 200);
+        for (x, width) in [
+            (u32::MAX, 1),
+            (u32::MAX - 1, 2),
+            (u32::MAX, u32::MAX),
+            (0, u32::MAX),
+        ] {
+            let p = Pipeline {
+                crop: Some(CropSpec {
+                    x,
+                    y: 0,
+                    width,
+                    height: 1,
+                }),
+                ..Pipeline::new()
+            };
+            for (which, err) in [
+                (
+                    "output_dimensions",
+                    p.output_dimensions(400, 200).unwrap_err(),
+                ),
+                ("apply", p.apply(&src).unwrap_err()),
+            ] {
+                assert!(
+                    matches!(err, Error::CropOutOfBounds { .. }),
+                    "{which}: x={x} width={width} gave {err:?}"
+                );
+                // The sentence has to name both halves of the disagreement, or a
+                // user cannot tell which number to change.
+                let text = err.to_string();
+                assert!(text.contains("400x200"), "{which}: {text}");
+                assert!(text.contains(&format!("{width}x1")), "{which}: {text}");
+                assert!(text.contains("crop"), "{which}: {text}");
+            }
+        }
+    }
+
+    /// A crop that fits is still honoured, right at the top of the range.
+    ///
+    /// The negative case above passes for a function that refuses everything, and
+    /// `x + width == u32::MAX` is the one input where a `checked_add` fix would
+    /// be wrong in the other direction: the sum is representable and the crop is
+    /// legal. Only the prediction is exercised — a four-billion-wide source cannot
+    /// be decoded to check that `apply` agrees, and this is the arithmetic, not the
+    /// pixels.
+    #[test]
+    fn a_crop_whose_sum_is_exactly_u32_max_is_still_accepted() {
+        let crop = |x, width| Pipeline {
+            crop: Some(CropSpec {
+                x,
+                y: 0,
+                width,
+                height: 1,
+            }),
+            ..Pipeline::new()
+        };
+        // The last legal pixel of a `u32::MAX`-wide source.
+        assert_eq!(
+            crop(u32::MAX - 1, 1)
+                .output_dimensions(u32::MAX, 10)
+                .unwrap(),
+            (1, 1)
+        );
+        // One pixel past it: the sum is no longer representable, and a fix that
+        // compared `checked_add` against the source rather than subtracting would
+        // have let this through.
+        assert!(matches!(
+            crop(u32::MAX, 1).output_dimensions(u32::MAX, 10),
+            Err(Error::CropOutOfBounds { .. })
+        ));
+        assert_eq!(crop(1, 2).output_dimensions(u32::MAX, 10).unwrap(), (2, 1));
     }
 
     #[test]

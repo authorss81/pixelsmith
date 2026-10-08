@@ -318,6 +318,8 @@ enforcement points, in the order a file meets them:
 | 7 | `ffi::px_inspect` (`ffi.rs:177`) | Selects `Limits::mobile()` when Dart passes `mobile_limits = true`. |
 | 8 | `pipeline::Pipeline::output_dimensions` | Rejects a crop rectangle that runs past the source edges, before the UI predicts a size for it. |
 | 9 | `validate::Limits::check_animation` (`validate.rs`) | The pixel budget applied to `width × height × frames` rather than per frame, before the first frame of an animation is decoded. Every resized frame is resident at once, so a per-frame check would pass all of them. |
+| 10 | `colour::png_icc`'s `Read::take(MAX_ICC_PROFILE)` (`colour.rs`) | A PNG `iCCP` payload inflating past 4 MiB. This is the one allocation on the untrusted path that is *not* about a picture, and it is reachable from `px_inspect`, `px_exif`, `px_process`, `px_batch` and every folder plan, because `validate_bytes` calls `exif::read` for the report. |
+| 11 | `ffi::check_envelope` (`ffi.rs`) | A Dart JSON request document past `MAX_REQUEST_BYTES`, before `serde_json` sees it — the envelope is not a picture, so `Limits` has nothing to say about it. See the FFI section below. |
 
 Steps 1–4 are cheap and run on a whole folder before the user commits to
 anything; step 5 is the belt to step 3's braces.
@@ -736,12 +738,14 @@ Buffer ownership, in full:
   calls `px_buffer_free` / `px_string_free`. Dart never frees them itself.
 - Buffers are length-prefixed, never NUL-terminated, so JPEG data containing a
   zero byte survives the crossing intact.
-- `px_buffer_free` is idempotent. The pointer's original `Vec` capacity is held
-  in a thread-local map keyed by address (`ffi.rs:59`), out of band so the struct
-  layout stays Dart-stable; the first free removes the entry and rebuilds the
-  `Vec` with the exact capacity, and a second free finds nothing and returns
-  without touching the pointer. Losing that map would mean calling
-  `Vec::from_raw_parts` with the wrong capacity, which is undefined behaviour.
+- `px_buffer_free` is idempotent. The pointer's original `Vec` **length and
+  capacity** are held in a thread-local map keyed by address (`ffi.rs:54`), out of
+  band so the struct layout stays Dart-stable; the first free removes the entry
+  and rebuilds the `Vec` with the exact pair, and a second free finds nothing and
+  returns without touching the pointer. Losing that map would mean calling
+  `Vec::from_raw_parts` with the wrong capacity, which is undefined behaviour,
+  and the `len` it rebuilds with is the *recorded* one rather than the one in the
+  struct Dart passed back — see gotcha 34.
 - Dart-supplied buffers go through `borrow` (`ffi.rs:110`): a null pointer with
   `len == 0` is an empty slice, and a null pointer with a non-zero length is
   `PxStatus::InvalidArgument` — never a dereference.
@@ -750,6 +754,42 @@ Buffer ownership, in full:
   that causes a wild access.
 - `px_batch` always returns a report rather than failing: one unreadable file in
   a folder of 200 must not discard the other 199.
+
+### Envelope limits: what a Dart request may carry
+
+`Limits` bounds a *picture*. It cannot bound the JSON document a caller hands
+over, because by the time `validate_bytes` sees anything the whole document and
+every byte array in it are already in memory. So `ffi.rs` states its own four
+numbers, none of them a `Limits` field (phase-11 grew two *methods* rather than
+fields precisely so the Dart-mirrored contract would not move, and this keeps
+that property).
+
+| Number | Value | What it stops |
+| --- | --- | --- |
+| `MAX_REQUEST_BYTES` | 64 MiB | the document, checked **before** `serde_json::from_slice` on `px_process`, `px_batch` and `px_zip` |
+| `MAX_REQUEST_FILES` | 512 | a 5 MB document of a million empty files becoming a million `Job`s |
+| `MAX_REQUEST_FILE_BYTES` | 8 MiB | one enormous file, named in the refusal |
+| `MAX_REQUEST_PAYLOAD_BYTES` | 16 MiB | the files of a batch added up, with "export them in smaller groups" |
+
+`MAX_REQUEST_BYTES` is derived, not chosen: `MAX_REQUEST_PAYLOAD_BYTES × 4`,
+where 4 is `ENVELOPE_EXPANSION` — a JSON array of byte values costs two
+characters per byte at `0,` and four at `255,`, and the envelope is sized for the
+dearest case. The sparse form is why all four are reachable rather than one
+shadowing another: a `0,` document hits the payload ceiling at half the envelope
+size, a `255,` one hits the envelope first.
+
+`px_batch` is therefore a *small-batch* API — 16 MiB of picture per request, a
+dozen phone photographs — and a folder beyond that is several requests. That is
+already how the engine feeds its own pool: `folder::process_folder` runs a plan's
+entries through `process_all` one file per task rather than one folder per
+request.
+
+Two details worth knowing before changing any of it. The count, per-file and
+total ceilings are enforced **in the deserialiser's visitor**
+(`ffi::BoundedFiles`), because a check on the parsed `Vec` is a check after the
+allocation; and a bound refusal is recorded in a thread-local as well as
+returned through serde, because `serde_json` renders every message as `"<text> at
+line 1 column 33554445"` and hard rule 9 is about the sentence a user reads.
 
 ## Feature flags
 
@@ -1123,6 +1163,44 @@ named so you can check the handling rather than re-derive it.
     now assert, is that the reason names one of the two files and that the file it
     names is the one with bytes written. Handled in `core/src/dedupe.rs` (`claim`)
     and `core/src/worker.rs` (`process_all`).
+33. **A zlib inflate is an allocation until a `Take` says otherwise.**
+    `colour::png_icc` is the only place in this crate that decompresses
+    attacker-chosen bytes, and it did so with `read_to_end` and no ceiling: a PNG
+    of about 4 KiB whose `iCCP` payload expands to gigabytes grew one `Vec` until
+    the allocator refused, and `handle_alloc_error` **aborts** rather than
+    unwinding — which is worse than every error this engine returns. It sat on the
+    main path, not an opt-in one, because `validate_bytes` calls `exif::read` for
+    the report and `exif::read` reads the colour profile. The ceiling is a
+    `Read::take` around the decoder rather than a check on the result, because a
+    post-hoc check arrives after the allocation it was supposed to prevent, and
+    the two neighbours in the same module (`MAX_TEXT`, `MAX_TAGS`) were already
+    right. Handled in `core/src/colour.rs` (`MAX_ICC_PROFILE`, `png_icc`).
+34. **`px_buffer_free` must not believe the struct it is handed.** `PxBuffer` is
+    `#[repr(C)]` and Dart reads and writes it by offset, so `len` is
+    caller-supplied, and `Vec::from_raw_parts` takes the length as an argument:
+    `RawVec::cap_set` asserts `cap >= len`, so a corrupted field turned a cleanup
+    call into a **non-unwinding panic** — an abort inside a `no_mangle` function.
+    The registry therefore stores `(len, cap)` rather than `cap`, and the free
+    ignores the caller's `len` entirely. This is the same class as `borrow`
+    checking a null pointer: every field crossing the boundary is information, not
+    an instruction. Handled in `core/src/ffi.rs` (`CAPACITIES`, `px_buffer_free`).
+35. **`crop.x + crop.width` is not a comparison, it is an addition.** `CropSpec`
+    derives `Deserialize` with no range constraint and reaches `px_process` from
+    Dart, so `x = 4294967295` with `width = 1` is a value the caller can send, and
+    adding it panics in every overflow-checked build — `dev` and `test`, so every
+    CI run — while wrapping silently in release. The fix is subtraction:
+    `crop.x < src_w && crop.width <= src_w - crop.x` has no sum to overflow, and it
+    is *also* right in the case `checked_add` gets wrong, a crop whose sum is
+    exactly `u32::MAX` and which fits. Handled in `core/src/pipeline.rs`
+    (`check_crop`), asserted by `a_crop_whose_sum_overflows_is_refused_by_both_halves`.
+36. **A refusal that goes through serde arrives wearing a column number.**
+    `serde_json` renders a custom error as `"<text> at line 1 column 33554445"`,
+    which is hard rule 9's failure mode rather than an error message. `ffi.rs`
+    records a bound refusal in a thread-local and returns it through
+    `request_failure`, which prefers it to serde's rendering; the slot is cleared
+    at the start of every bounded parse so it cannot carry a stale sentence into a
+    later call. Handled in `core/src/ffi.rs` (`BOUND_REFUSAL`,
+    `BoundedFiles`).
 
 ## Release artefacts
 

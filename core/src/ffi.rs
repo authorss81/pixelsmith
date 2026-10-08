@@ -52,16 +52,25 @@ pub struct PxBuffer {
 }
 
 thread_local! {
-    /// Original `Vec` capacities, keyed by pointer.
+    /// `(len, cap)` of every buffer handed to the caller and not yet freed,
+    /// keyed by pointer.
     ///
     /// Tracked out of band so `PxBuffer` keeps a layout Dart can rely on. If
     /// this is ever lost, the next `px_buffer_free` for that pointer would
     /// rebuild a `Vec` with the wrong capacity, which is undefined behaviour.
-    static CAPACITIES: std::cell::RefCell<std::collections::HashMap<usize, usize>> =
+    ///
+    /// The **length** is stored as well as the capacity, and
+    /// [`px_buffer_free`] ignores the length in the `PxBuffer` it is handed.
+    /// `PxBuffer` is `#[repr(C)]` and Dart reads and writes it by offset, so
+    /// `len` is caller-supplied; `Vec::from_raw_parts` takes the length as an
+    /// argument and `RawVec::cap_set` asserts `cap >= len`, so a host bug that
+    /// corrupted the field took the process down with a panic from inside a
+    /// `no_mangle` free function.
+    static CAPACITIES: std::cell::RefCell<std::collections::HashMap<usize, (usize, usize)>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Move a `Vec` into a raw pointer, remembering its capacity.
+/// Move a `Vec` into a raw pointer, remembering its length and capacity.
 ///
 /// Uses `Vec::into_raw_parts` so the caller can `Vec::from_raw_parts(ptr, len,
 /// cap)` exactly, with no sentinel and no double-free hazard.
@@ -70,7 +79,7 @@ fn into_raw(mut v: Vec<u8>) -> PxBuffer {
     let cap = v.capacity();
     let ptr = v.as_mut_ptr();
     std::mem::forget(v);
-    CAPACITIES.with(|c| c.borrow_mut().insert(ptr as usize, cap));
+    CAPACITIES.with(|c| c.borrow_mut().insert(ptr as usize, (len, cap)));
     PxBuffer {
         status: PxStatus::Ok as u32,
         data: ptr,
@@ -121,6 +130,193 @@ unsafe fn borrow<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
 }
 
 // ---------------------------------------------------------------------------
+// Envelope limits
+//
+// `Limits::max_input_bytes` bounds a *picture* the engine decodes. It cannot
+// bound the JSON document a Dart caller hands over, for two reasons that are
+// both structural: the envelope is a different object from the pictures in it,
+// and by the time `validate_bytes` is reached the whole document and every byte
+// array in it has already been materialised.
+//
+// So the envelope gets its own numbers, below, and none of them is a `Limits`
+// field — `docs/ARCHITECTURE.md` records that phase-11 grew two *methods*
+// precisely so the JSON contract the Dart side mirrors would not change, and a
+// field here would change it.
+// ---------------------------------------------------------------------------
+
+/// How many characters one picture byte costs in an envelope at worst.
+///
+/// `BatchFile::bytes` is a JSON array of byte values, so one byte is two
+/// characters at its cheapest (`0,`) and four at its dearest (`255,`). Four is
+/// the number every envelope ceiling below is derived from.
+pub const ENVELOPE_EXPANSION: usize = 4;
+
+/// Most picture bytes summed across the files of one envelope.
+///
+/// **16 MiB.** Not `Limits::max_input_bytes`: that is what this device affords
+/// for *one* picture, and an envelope is neither one picture nor free to be
+/// large — it is a `Uint8List` the Dart isolate builds, a copy the allocator
+/// makes on the way in, a set of parsed `Vec<u8>`s that stay resident for the
+/// length of the export, and, in `BatchRequest`, a buffered parse on top because
+/// `#[serde(flatten)]` cannot stream a sequence.
+///
+/// 16 MiB of picture is what a dozen phone photographs come to, which is a batch
+/// worth exporting; a folder beyond that is *several requests*, which is how the
+/// engine already feeds the worker pool on the folder path
+/// (`folder::process_folder` runs the plan's entries through `process_all` one
+/// file per task rather than one folder per request). `px_batch` is therefore a
+/// small-batch API and says so rather than accepting a request it cannot hold.
+pub const MAX_REQUEST_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+
+/// Most picture bytes in one file of an envelope.
+///
+/// **8 MiB**, half the envelope's total: one file in a batch is one export, and
+/// this is above what a camera JPEG at a normal quality comes to. Separate from
+/// the total because the two fail differently — a folder of modest files that
+/// adds up to too much is worth telling the user to split, while one enormous
+/// file is worth telling them the name of.
+pub const MAX_REQUEST_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Most files in one envelope.
+///
+/// **512.** The engine's own precedent for how many things one caller may hold
+/// at once is the 1024 live cancel tokens `px_cancel_new` allows; a batch half
+/// that is still two orders of magnitude above what a person exports in one go,
+/// and it is only reachable at all by files far too small to need an envelope —
+/// [`folder::MAX_ENTRIES`]'s 10,000 is the folder *plan*, which is the ceiling
+/// for walking a disk, not for transporting pictures across the FFI.
+pub const MAX_REQUEST_FILES: usize = 512;
+
+/// Most bytes in one request envelope.
+///
+/// Derived, not chosen: [`MAX_REQUEST_PAYLOAD_BYTES`] at the worst-case
+/// [`ENVELOPE_EXPANSION`] is exactly this, so an envelope at the ceiling is one
+/// carrying the most picture it is allowed to carry. A sparse envelope of `0,`
+/// elements reaches the payload ceiling first, which is why the two sentences
+/// below are reachable rather than one of them shadowing the other.
+pub const MAX_REQUEST_BYTES: usize = MAX_REQUEST_PAYLOAD_BYTES * ENVELOPE_EXPANSION;
+
+/// Refuse an envelope this build will not parse, in a sentence naming the limit.
+///
+/// Checked before `serde_json::from_slice` on every entry point that takes a
+/// request, because the parse is where the document becomes memory: after it,
+/// `Limits::max_input_bytes` is consulted inside `validate_bytes`, far too late
+/// to have bounded anything.
+///
+/// The desktop profile is used rather than the mobile one the request may ask
+/// for, and that is not an oversight: `mobile_limits` is *inside* the document,
+/// so a pre-parse check cannot know which profile was asked for. The outer gate
+/// is therefore the more permissive of the two, and the per-file and total
+/// payload ceilings are applied afterwards against the profile that was asked
+/// for.
+fn check_envelope(len: usize) -> Option<PxBuffer> {
+    if len <= MAX_REQUEST_BYTES {
+        return None;
+    }
+    Some(err(
+        format!(
+            "this request is {len} bytes and one request may be at most {MAX_REQUEST_BYTES} \
+             bytes; export in smaller groups"
+        ),
+        PxStatus::InvalidArgument,
+    ))
+}
+
+thread_local! {
+    /// The sentence a bounded deserialiser refused with, if it refused on one.
+    ///
+    /// Recorded here *as well as* being returned through serde, because
+    /// `serde_json` renders a custom error as `"<message> at line 1 column
+    /// 33554445"`, and hard rule 9 is about the sentence a user reads rather
+    /// than about where in the document the failure happened. The entry point
+    /// prefers this to serde's rendering; the slot is cleared at the start of
+    /// every bounded parse and taken when the parse fails, so it cannot carry a
+    /// stale refusal into a later call.
+    static BOUND_REFUSAL: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The sentence for a request the boundary refused to parse.
+fn request_failure(e: serde_json::Error) -> PxBuffer {
+    match BOUND_REFUSAL.with(|r| r.borrow_mut().take()) {
+        Some(sentence) => err(sentence, PxStatus::InvalidArgument),
+        None => err(format!("bad request: {e}"), PxStatus::InvalidArgument),
+    }
+}
+
+/// The `files` array of a batch or ZIP envelope, bounded as it is built.
+///
+/// `serde` would materialise a million one-byte files out of a 30 MB document
+/// without noticing, so the ceilings are enforced in the visitor rather than
+/// checked on the result: a file is pushed only while the count, that file and
+/// the running total are all still within budget. Each refusal names which of
+/// the three it was, because "too big" is not something a user can act on and
+/// "this folder has more files in it than one request holds" is.
+#[derive(Debug)]
+struct BoundedFiles(Vec<BatchFile>);
+
+impl<'de> serde::Deserialize<'de> for BoundedFiles {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> std::result::Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        BOUND_REFUSAL.with(|r| *r.borrow_mut() = None);
+
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BoundedFiles;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    f,
+                    "at most {MAX_REQUEST_FILES} files, each at most {MAX_REQUEST_FILE_BYTES} \
+                     bytes, totalling at most {MAX_REQUEST_PAYLOAD_BYTES} bytes"
+                )
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<BoundedFiles, A::Error> {
+                let mut files: Vec<BatchFile> = Vec::new();
+                let mut payload = 0usize;
+                while let Some(file) = seq.next_element::<BatchFile>()? {
+                    let refusal = if files.len() == MAX_REQUEST_FILES {
+                        Some(format!(
+                            "this request carries more than {MAX_REQUEST_FILES} files; export \
+                             them in smaller groups"
+                        ))
+                    } else if file.bytes.len() > MAX_REQUEST_FILE_BYTES {
+                        Some(format!(
+                            "{} is {} bytes and one file in a request may be at most \
+                             {MAX_REQUEST_FILE_BYTES} bytes",
+                            file.name,
+                            file.bytes.len()
+                        ))
+                    } else {
+                        payload = payload.saturating_add(file.bytes.len());
+                        (payload > MAX_REQUEST_PAYLOAD_BYTES).then(|| {
+                            format!(
+                                "the files in this request add up to more than \
+                                 {MAX_REQUEST_PAYLOAD_BYTES} bytes; export them in smaller \
+                                 groups"
+                            )
+                        })
+                    };
+                    if let Some(sentence) = refusal {
+                        BOUND_REFUSAL.with(|r| *r.borrow_mut() = Some(sentence.clone()));
+                        return Err(A::Error::custom(sentence));
+                    }
+                    files.push(file);
+                }
+                Ok(BoundedFiles(files))
+            }
+        }
+
+        de.deserialize_seq(Visitor)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lifecycle
 // ---------------------------------------------------------------------------
 
@@ -136,6 +332,15 @@ pub extern "C" fn px_version() -> PxBuffer {
 
 /// Release a buffer returned by any `px_*` call.
 ///
+/// Idempotent: a pointer this library does not have — because it was never ours,
+/// or because it has already been freed — is left alone. Leaking is strictly
+/// better than rebuilding a `Vec` from a pointer whose layout we no longer know.
+///
+/// `buffer.len` is deliberately **not** used. `PxBuffer` is `#[repr(C)]` and Dart
+/// reads and writes it by offset, so every field in it is caller-supplied
+/// information; the length and capacity recorded when the buffer was handed out
+/// are the only trustworthy ones, and they are what the `Vec` is rebuilt from.
+///
 /// # Safety
 /// `buffer` must be a value returned by this library and not already freed.
 #[unsafe(no_mangle)]
@@ -143,14 +348,15 @@ pub unsafe extern "C" fn px_buffer_free(buffer: PxBuffer) {
     if buffer.data.is_null() {
         return;
     }
-    let cap = CAPACITIES.with(|c| c.borrow_mut().remove(&(buffer.data as usize)));
-    let Some(cap) = cap else {
+    let parts = CAPACITIES.with(|c| c.borrow_mut().remove(&(buffer.data as usize)));
+    let Some((len, cap)) = parts else {
         // Not one of ours, or already freed. Leaking is strictly better than
         // rebuilding a `Vec` from a pointer we do not own.
         return;
     };
-    // SAFETY: `data`, `len` and `cap` all came from `into_raw`.
-    drop(unsafe { Vec::from_raw_parts(buffer.data, buffer.len, cap) });
+    // SAFETY: `data`, `len` and `cap` all came from `into_raw`, keyed by `data`;
+    // the entry is removed above, so this is the first and only free of it.
+    drop(unsafe { Vec::from_raw_parts(buffer.data, len, cap) });
 }
 
 /// Release an error string returned by any `px_*` call.
@@ -295,9 +501,12 @@ pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> P
     let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
+    if let Some(refusal) = check_envelope(raw.len()) {
+        return refusal;
+    }
     let parsed: ProcessRequest = match serde_json::from_slice(raw) {
         Ok(v) => v,
-        Err(e) => return err(format!("bad request: {e}"), PxStatus::InvalidArgument),
+        Err(e) => return request_failure(e),
     };
 
     let mut pipeline = parsed.pipeline;
@@ -449,7 +658,10 @@ struct BatchRequest {
     /// Inputs as base64-free raw arrays would bloat the JSON, so each entry is
     /// `{name, bytes}` where bytes is a JSON array of byte values. Dart builds
     /// this from its `Uint8List`; the alternative (base64) costs 33% size.
-    files: Vec<BatchFile>,
+    ///
+    /// Bounded on the way in by [`BoundedFiles`], so the count, the per-file size
+    /// and the total are refused while the sequence is being built.
+    files: BoundedFiles,
 }
 
 #[derive(Debug, Deserialize)]
@@ -469,9 +681,12 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
     let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
+    if let Some(refusal) = check_envelope(raw.len()) {
+        return refusal;
+    }
     let parsed: BatchRequest = match serde_json::from_slice(raw) {
         Ok(v) => v,
-        Err(e) => return err(format!("bad request: {e}"), PxStatus::InvalidArgument),
+        Err(e) => return request_failure(e),
     };
 
     let cancel = match parsed.cancel {
@@ -504,8 +719,12 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
         ..parsed.pipeline
     };
 
+    // `f.bytes` moves rather than copies: this is the `Vec` `serde` already
+    // built, handed to the job, not a second copy of the picture. What this costs
+    // is one `Job` header per file.
     let jobs: Vec<Job> = parsed
         .files
+        .0
         .into_iter()
         .enumerate()
         .map(|(i, f)| Job {
@@ -527,18 +746,26 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
 pub unsafe extern "C" fn px_zip(request: *const u8, request_len: usize) -> PxBuffer {
     #[derive(Deserialize)]
     struct ZipRequest {
-        files: Vec<BatchFile>,
+        /// Bounded exactly as `BatchRequest::files` is. `px_zip` builds no
+        /// `Limits` at all — there is no picture in it to bound — so the envelope
+        /// ceilings above are the only thing standing between a ZIP request and
+        /// whatever it asked for.
+        files: BoundedFiles,
     }
     let borrowed = unsafe { borrow(request, request_len) };
     let Some(raw) = borrowed else {
         return err("null request", PxStatus::InvalidArgument);
     };
+    if let Some(refusal) = check_envelope(raw.len()) {
+        return refusal;
+    }
     let parsed: ZipRequest = match serde_json::from_slice(raw) {
         Ok(v) => v,
-        Err(e) => return err(format!("bad request: {e}"), PxStatus::InvalidArgument),
+        Err(e) => return request_failure(e),
     };
     let items: Vec<(String, Vec<u8>)> = parsed
         .files
+        .0
         .into_iter()
         .map(|f| (f.name, f.bytes))
         .collect();
@@ -1275,6 +1502,175 @@ mod tests {
         }
     }
 
+    // ---- envelope limits -------------------------------------------------
+
+    /// A JSON array of `len` zero bytes, which is the cheapest way to put `len`
+    /// payload bytes in a document: two characters per byte, against four for a
+    /// byte at 255. The sparse form is what makes the *payload* ceilings
+    /// reachable before the *envelope* ceiling rather than behind it.
+    fn sparse_bytes(len: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(len * 2 + 2);
+        out.push(b'[');
+        for _ in 0..len {
+            out.extend_from_slice(b"0,");
+        }
+        if len > 0 {
+            // The separator after the last element would be a trailing comma.
+            out.pop();
+        }
+        out.push(b']');
+        out
+    }
+
+    fn zip_body_of_payloads(payloads: &[usize]) -> Vec<u8> {
+        let mut body = Vec::from(&b"{\"files\":["[..]);
+        for (i, len) in payloads.iter().enumerate() {
+            if i > 0 {
+                body.push(b',');
+            }
+            body.extend_from_slice(b"{\"name\":\"f");
+            body.extend_from_slice(i.to_string().as_bytes());
+            body.extend_from_slice(b".jpg\",\"bytes\":");
+            body.extend_from_slice(&sparse_bytes(*len));
+            body.push(b'}');
+        }
+        body.extend_from_slice(b"]}");
+        body
+    }
+
+    /// An envelope past the ceiling is refused by all three request entry points,
+    /// and refused *before* the document is parsed.
+    ///
+    /// "Before it is parsed" is the half that matters: `Limits::max_input_bytes`
+    /// is consulted inside `validate_bytes`, which runs after `serde_json` has
+    /// built the whole document and every `Vec<u8>` in it, so a ceiling checked
+    /// there bounds nothing. The assertion that the sentence is the envelope's
+    /// own rather than serde's is what proves the refusal came first — a document
+    /// this size does not parse in any reasonable time, so a test that waited for
+    /// a parse error would hang rather than fail.
+    #[test]
+    fn an_envelope_past_the_ceiling_is_refused_before_it_is_parsed() {
+        // Two characters per payload byte, so this is a document just over
+        // `MAX_REQUEST_BYTES` carrying half that many payload bytes.
+        let payload = MAX_REQUEST_BYTES / 2 + 1024;
+        let body = zip_body_of_payloads(&[payload]);
+        assert!(
+            body.len() > MAX_REQUEST_BYTES,
+            "the fixture is {} bytes, which is not over the ceiling",
+            body.len()
+        );
+
+        unsafe {
+            for (which, (status, data, msg)) in [
+                ("px_zip", take(px_zip(body.as_ptr(), body.len()))),
+                ("px_batch", take(px_batch(body.as_ptr(), body.len()))),
+                ("px_process", take(px_process(body.as_ptr(), body.len()))),
+            ] {
+                assert_eq!(status, PxStatus::InvalidArgument as u32, "{which}: {msg}");
+                assert!(
+                    data.is_empty(),
+                    "{which} returned data for a refused request"
+                );
+                assert!(
+                    msg.contains(&MAX_REQUEST_BYTES.to_string()),
+                    "{which}: the refusal does not name the limit: {msg}"
+                );
+                assert!(
+                    !msg.contains("bad request"),
+                    "{which}: the refusal came from serde rather than from the check: {msg}"
+                );
+                assert!(!msg.contains("line"), "{which}: {msg}");
+            }
+        }
+    }
+
+    /// More files in one envelope than one request holds.
+    ///
+    /// Cheap to build and cheap to parse, which is the point: 513 empty files are
+    /// about 12 KB, so the count ceiling is reachable without a large document
+    /// and a test can cross it honestly.
+    #[test]
+    fn a_request_carrying_too_many_files_is_refused_with_the_count() {
+        let body = zip_body_of_payloads(&vec![0; MAX_REQUEST_FILES + 1]);
+        unsafe {
+            let (status, _, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::InvalidArgument as u32);
+            assert!(
+                msg.contains("more than") && msg.contains(&MAX_REQUEST_FILES.to_string()),
+                "the refusal does not name the file count: {msg}"
+            );
+        }
+    }
+
+    /// One file larger than a single export may be.
+    ///
+    /// The message names the file, because the two payload refusals fail
+    /// differently for a user: "this file is 8388609 bytes" is something to act
+    /// on, "the request is too big" is not.
+    #[test]
+    fn one_file_past_the_per_file_ceiling_is_refused_by_name() {
+        let body = zip_body_of_payloads(&[MAX_REQUEST_FILE_BYTES + 1]);
+        unsafe {
+            for (which, (status, _, msg)) in [
+                ("px_batch", take(px_batch(body.as_ptr(), body.len()))),
+                ("px_zip", take(px_zip(body.as_ptr(), body.len()))),
+            ] {
+                assert_eq!(status, PxStatus::InvalidArgument as u32, "{which}");
+                assert!(msg.contains("f0.jpg"), "{which}: no file name: {msg}");
+                assert!(
+                    msg.contains(&MAX_REQUEST_FILE_BYTES.to_string()),
+                    "{which}: no limit named: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Modest files that add up to more than the envelope holds.
+    ///
+    /// Two files at the per-file ceiling are legal — that is the point of a
+    /// separate per-file number — so this is the third file that tips the total,
+    /// which is what makes the two ceilings distinct rather than one number
+    /// written twice.
+    #[test]
+    fn files_that_add_up_past_the_payload_ceiling_are_refused_as_a_total() {
+        let body = zip_body_of_payloads(&[MAX_REQUEST_FILE_BYTES, MAX_REQUEST_FILE_BYTES, 1]);
+        unsafe {
+            let (status, _, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::InvalidArgument as u32);
+            assert!(
+                msg.contains("add up") && msg.contains(&MAX_REQUEST_PAYLOAD_BYTES.to_string()),
+                "the refusal does not name the total: {msg}"
+            );
+        }
+    }
+
+    /// A batch inside every ceiling still works.
+    ///
+    /// The bound is only worth having if it refuses what it should and nothing
+    /// else, so this is the negative case for all three numbers at once.
+    #[test]
+    fn a_batch_inside_the_envelope_ceilings_still_works() {
+        let input = sample(64, 48);
+        let body = serde_json::to_vec(&serde_json::json!({
+            "crop": null, "orientation": null, "resize": null, "strip_metadata": true,
+            "format": "jpeg", "quality": 85, "target": null,
+            "files": [{ "name": "a.jpg", "bytes": input }]
+        }))
+        .unwrap();
+        unsafe {
+            let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
+            assert_eq!(report.succeeded(), 1, "{msg}");
+            // And the refusal slot cannot leak into the next call: this one
+            // follows a refused request in the same thread in the tests above, and
+            // a stale sentence would turn a successful batch into an error.
+            let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            assert!(!data.is_empty());
+        }
+    }
+
     #[test]
     fn buffers_can_be_freed_safely_and_repeatedly() {
         unsafe {
@@ -1289,6 +1685,69 @@ mod tests {
                 error: std::ptr::null_mut(),
             });
             assert!(!ptr.is_null());
+        }
+    }
+
+    /// Freeing the same buffer twice is a no-op the second time.
+    ///
+    /// The property is not "a second free does not crash" — it is that the
+    /// bookkeeping that makes the first free legal is *consumed* by it. A second
+    /// free that found the entry still there would rebuild a `Vec` from a pointer
+    /// the allocator has already reclaimed, which is a double free.
+    #[test]
+    fn a_second_free_of_the_same_buffer_is_a_no_op() {
+        fn live() -> usize {
+            CAPACITIES.with(|c| c.borrow().len())
+        }
+        unsafe {
+            let buffer = px_version();
+            let kept = PxBuffer {
+                status: buffer.status,
+                data: buffer.data,
+                len: buffer.len,
+                error: buffer.error,
+            };
+            assert_eq!(live(), 1, "one buffer is outstanding");
+            px_buffer_free(buffer);
+            assert_eq!(live(), 0, "the first free did not take the entry");
+
+            // The same pointer and length, as a caller that kept a copy of the
+            // struct across a round trip through Dart would hand back.
+            px_buffer_free(kept);
+            assert_eq!(live(), 0, "the second free invented an entry");
+        }
+    }
+
+    /// A `PxBuffer` whose `len` field has been corrupted still frees exactly once,
+    /// and does not take the process down doing it.
+    ///
+    /// This is the audit's finding 8, and the assertion that matters is that the
+    /// call *returns*: `Vec::from_raw_parts` asserts `cap >= len` inside
+    /// `RawVec::cap_set`, so the pre-fix code — which took the length from the
+    /// caller — panicked here, inside a `no_mangle` function that a host calls
+    /// for cleanup. Hard rule 3 is about not panicking on numbers somebody else
+    /// supplied, and `len` is as supplied as `ptr` is.
+    #[test]
+    fn a_buffer_with_a_corrupted_length_frees_exactly_once() {
+        for wrong_len in [usize::MAX, 1 << 40, 0] {
+            let live = CAPACITIES.with(|c| c.borrow().len());
+            unsafe {
+                let buffer = px_version();
+                let (len, cap) =
+                    CAPACITIES.with(|c| *c.borrow().get(&(buffer.data as usize)).unwrap());
+                assert!(len <= cap, "the registry holds an impossible Vec");
+                px_buffer_free(PxBuffer {
+                    status: buffer.status,
+                    data: buffer.data,
+                    len: wrong_len,
+                    error: buffer.error,
+                });
+                assert_eq!(
+                    CAPACITIES.with(|c| c.borrow().len()),
+                    live,
+                    "len {wrong_len}: the free did not take the entry"
+                );
+            }
         }
     }
 

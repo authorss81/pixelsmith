@@ -31,6 +31,37 @@ pub enum Error {
     #[error("dimensions must be greater than zero")]
     ZeroDimension,
 
+    /// A crop rectangle that runs past the edge of the picture it was asked
+    /// about.
+    ///
+    /// Its own variant rather than a reuse of `SuspiciousDimensions` for three
+    /// reasons, and the third is why the message carries the crop rather than a
+    /// sum:
+    ///
+    /// * `SuspiciousDimensions` says "decompression bomb", which is a claim about
+    ///   a *file* and the opposite of what happened: the file is fine and the
+    ///   request does not fit it.
+    /// * The pair of numbers a user needs is the picture's own size and the
+    ///   rectangle they asked for, and this build's answer is to move the crop.
+    /// * `{"x": 4294967295, "width": 1}` arrives from Dart and the sum of those
+    ///   two is not a `u32`, so there is no `w`/`h` to put in the other
+    ///   variant's fields. Adding the two numbers overflows in every
+    ///   overflow-checked build — `dev` and `test`, so every CI run — which is a
+    ///   panic on a value the caller chose.
+    #[error(
+        "this picture is {src_width}x{src_height} and the crop asked for a \
+         {requested_width}x{requested_height} rectangle at ({requested_x}, {requested_y}), \
+         which runs past its edge; crop inside the picture or leave the crop unset"
+    )]
+    CropOutOfBounds {
+        requested_x: u32,
+        requested_y: u32,
+        requested_width: u32,
+        requested_height: u32,
+        src_width: u32,
+        src_height: u32,
+    },
+
     #[error("decode failed: {0}")]
     Decode(#[source] image::ImageError),
 

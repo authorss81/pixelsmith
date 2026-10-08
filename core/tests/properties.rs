@@ -275,7 +275,8 @@ proptest! {
     fn output_dimensions_agrees_with_apply(
         src_w in 8u32..=600, src_h in 8u32..=600, target in 1u32..=500,
         fit_idx in 0usize..5,
-        crop_x in 0u32..100, crop_y in 0u32..100,
+        crop_x in prop_oneof![0u32..100, any::<u32>()],
+        crop_y in prop_oneof![0u32..100, any::<u32>()],
         crop_w in 1u32..=200, crop_h in 1u32..=200,
         use_crop in any::<bool>(), use_orientation in any::<bool>(),
         orientation in 1u32..=8,
@@ -301,13 +302,19 @@ proptest! {
 
         // A crop that does not fit inside the source is not a legal crop, so
         // skip those rather than asserting on an error the caller would never
-        // have constructed. `Pipeline`'s fields are public, so this is a struct
-        // update rather than a builder call.
+        // have constructed - with one exception, which is the audit's finding 7:
+        // a crop whose *sum* is not representable is not skipped, because
+        // deciding that with an unchecked add is the panic this property exists
+        // to catch. `Pipeline`'s fields are public, so this is a struct update
+        // rather than a builder call.
         let crop = CropSpec { x: crop_x, y: crop_y, width: crop_w, height: crop_h };
-        if use_crop {
-            if crop.x + crop.width > src_w || crop.y + crop.height > src_h {
-                return Ok(());
-            }
+        let overflows = crop.x.checked_add(crop.width).is_none()
+            || crop.y.checked_add(crop.height).is_none();
+        let fits = matches!(
+            (crop.x.checked_add(crop.width), crop.y.checked_add(crop.height)),
+            (Some(x), Some(y)) if x <= src_w && y <= src_h
+        );
+        if use_crop && (fits || overflows) {
             pipeline.crop = Some(crop);
         }
         if use_orientation && orientation != 1 {
@@ -649,5 +656,57 @@ fn a_zero_target_is_refused_with_an_explained_message() {
             );
         }
         Ok(dim) => panic!("a 0x0 target must be refused, got {dim:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A crop rectangle whose sum is not a u32
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #![proptest_config(config(0x5EED_0005))]
+
+    /// A crop whose `x + width` (or `y + height`) is not representable is refused
+    /// by name, by the prediction and by the pixels alike.
+    ///
+    /// The numbers are built rather than generated, because generating them
+    /// uniformly would almost never land in the region and proptest would answer
+    /// "too many rejects" instead of a verdict: `x = u32::MAX - back` with
+    /// `width = back + 1 + extra` sums to `u32::MAX + 1 + extra` in every case,
+    /// so every case is the interesting one.
+    ///
+    /// Before phase-18 this was a panic in every overflow-checked build — that is,
+    /// every `cargo test` — from a `CropSpec` deserialised straight out of a
+    /// `px_process` request.
+    #[test]
+    fn a_crop_whose_sum_overflows_is_refused_by_both_halves(
+        back in 0u32..=256, extra in 1u32..=256,
+        axis in 0usize..2, swap in any::<bool>(),
+    ) {
+        let (x, y, width, height) = if axis == 0 {
+            (u32::MAX - back, 0, back + 1 + extra, 1)
+        } else {
+            (0, u32::MAX - back, 1, back + 1 + extra)
+        };
+        let (x, y) = if swap { (y, x) } else { (x, y) };
+        let src_w = 64;
+        let src_h = 48;
+        let pipeline = Pipeline {
+            crop: Some(CropSpec { x, y, width, height }),
+            ..Pipeline::new()
+        };
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(src_w, src_h));
+
+        prop_assert!(
+            matches!(
+                pipeline.output_dimensions(src_w, src_h),
+                Err(Error::CropOutOfBounds { .. })
+            ),
+            "x={x} y={y} {width}x{height} must be refused by name, not added"
+        );
+        prop_assert!(
+            matches!(pipeline.apply(&img), Err(Error::CropOutOfBounds { .. })),
+            "x={x} y={y} {width}x{height} must be refused by name, not added"
+        );
     }
 }

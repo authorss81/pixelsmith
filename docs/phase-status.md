@@ -29,7 +29,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-15 | Supply-chain policy and reproducible builds | DONE | (this commit) | See [phase-15 notes](#phase-15-notes) below. **The CI workflow is a patch, as in phase-05/06/07/08/10 — most of the policy does not run in CI until it is applied.** One of eight targets is measured reproducible; seven are honestly blank. |
 | phase-16 | Release artefacts: the APK and the EXE | DONE | `a332803` | Corrected by phase-17: the row said `PENDING` while `.done` was on disk. **The release workflow is a patch, so `scripts/RELEASE-SHA256.txt` records hashes nothing in this tree produces** — `docs/AUDIT.md` finding 18. |
 | phase-17 | Self-audit and next-phase generation | DONE | (this commit) | See [phase-17 notes](#phase-17-notes) below. Wrote `docs/AUDIT.md` and eleven phases. |
-| phase-18 | Bound every allocation untrusted bytes can reach | PENDING | | Audit findings 1, 6, 7, 8. The unbounded PNG `iCCP` inflate, the un-limited FFI JSON envelopes, `CropSpec`'s unchecked `u32` add, and `px_buffer_free`'s trusted length. |
+| phase-18 | Bound every allocation untrusted bytes can reach | DONE | (this commit) | Audit findings 1, 6, 7, 8, all four closed with a test that fails on the code as it stood. See [phase-18 notes](#phase-18-notes) below. **A fifth hole was found and recorded rather than fixed** — audit finding 26, `px_exif` consults no `Limits` at all. |
 | phase-19 | Make `cargo test` work in every feature configuration | PENDING | | Audit finding 2. `cargo test` — the README's command — does not compile, and `--all-features` in the gate is the only reason nobody noticed. |
 | phase-20 | The Dart JSON contract, and a check that makes drift fail the gate | PENDING | | Audit findings 3, 4, 5, 13. Five phases of drift, an app that crashes on a HEIC and counts skips as successes, and a leak on every failed call. |
 | phase-21 | The tests that assert nothing, and the module with none | PENDING | | Audit findings 19, 20. Four tests measure nothing, one of them is hard rule 4's only sentinel, and `error.rs` has no test module. |
@@ -40,6 +40,73 @@ ever disagree, the marker wins and the table is a bug.
 | phase-26 | **Track B** — Export flows and the folder plan | PENDING | | Where files go, and what happens when two are the same photograph. Adds the `px_plan` entry point the folder preview needs. |
 | phase-27 | CI that executes what it compiles | PENDING | | Audit findings 14–18, 23. No job runs a test on any target but Linux x86; four jobs exist only as patches; the fuzzers are never run. |
 | phase-28 | `streaming`: make it correct, then decide whether it ships | PENDING | | Audit findings 10, 11. A stride bug that skews every JPEG the path touches, a 2 GB fallback outside its budget, and the release measurement the default has been waiting on. |
+
+## phase-18 notes
+
+**The audit's headline defect is closed, and the test that closes it fails on the
+old code.** `colour::png_icc` inflated a PNG's `iCCP` payload into a `Vec` with no
+ceiling, on the path every `px_inspect`, `px_exif`, `px_process`, `px_batch` and
+every folder plan reaches. It now inflates through `Read::take(MAX_ICC_PROFILE)`.
+
+**The cap is 4 MiB and the reasoning is a measurement.** The largest profile this
+tree reads is 464 bytes (`p3_profile()`); every RGB profile in ordinary use is a
+few kilobytes — sRGB IEC61966-2.1 is 3,144 — and the largest press profiles, which
+this engine refuses to convert anyway, measure around 2.1 MB. So 4 MiB is about
+twice the largest profile that exists, and a profile over it is a bomb rather than
+a colour space. The cap would be **raised** rather than lowered if a real profile
+is ever refused: 16 MiB is where it goes, and the comment says so next to the
+number rather than leaving it to the next reader.
+
+**`px_buffer_free` was worse than the audit said.** Finding 8 called it
+UB-by-the-standard with low exploitability. `Vec::from_raw_parts` asserts
+`cap >= len` inside `RawVec::cap_set`, so a Dart-side `len` that had drifted above
+the capacity took the process down with a **non-unwinding panic** — an abort, on
+the cleanup path, in the library that ships. Confirmed by running the new test
+against the old code: SIGABRT, not a failed assertion. The registry now stores
+`(len, cap)` and the free ignores the caller's `len` completely.
+
+**The envelope numbers are the part of this phase that will be argued with, so
+here is why they are what they are.** `MAX_REQUEST_BYTES` (64 MiB) is *derived*:
+`MAX_REQUEST_PAYLOAD_BYTES` (16 MiB) times `ENVELOPE_EXPANSION` (4), which is what
+a JSON byte array costs at its dearest — `255,` is four characters. 16 MiB of
+picture is a dozen phone photographs, and a folder beyond that is several requests,
+which is already how `folder::process_folder` feeds the worker pool. The
+consequence is that **`px_batch` is a small-batch API**: a folder export is more
+than one request, and a UI has to chunk. Nothing in `app/` batches today, so
+nothing is broken — but that is the thing to know before a folder button is built
+on this entry point.
+
+**`px_batch`'s "second full copy" is not one.** The prompt described
+`ffi.rs:507-516` as copying every byte array into a `Job`; `f.bytes` *moves* the
+`Vec` out of the parsed `BatchFile`, so the only allocation there is one `Job`
+header per file. Left alone, and said here rather than silently.
+
+**A refusal through serde arrives wearing a column number.** `serde_json` renders a
+custom error as `"<text> at line 1 column 33554445"`, so a bound refusal is
+recorded in a thread-local as well as returned through serde, and the entry point
+prefers the recorded sentence. Three sentences a user can act on, one per
+ceiling: *"this request carries more than 512 files; export them in smaller
+groups"*, *"f0.jpg is 8388609 bytes and one file in a request may be at most
+8388608 bytes"*, *"the files in this request add up to more than 16777216 bytes;
+export them in smaller groups"*.
+
+**Two behaviour changes worth stating rather than burying.** An out-of-bounds crop
+in a batch now reports a **failure** with `Error::CropOutOfBounds` rather than a
+`TooLarge` skip, because the file is fine and the request does not fit it; and
+`check_crop` is one function called by both halves rather than the same three lines
+written twice, since a check that exists in one of them is not a check.
+
+**A fifth hole was found and recorded, not fixed.** `px_exif(ptr, len)` calls
+`exif::read` and constructs no `Limits` at all — it is the one entry point that
+takes a file and never reaches `validate_bytes`. That is `docs/AUDIT.md` finding
+26, left for the phase that can afford to think about it.
+
+**The Flutter builds cannot be affected**, which is the claim the phase prompt
+asked to be made explicitly: this phase changed no `px_*` signature, no JSON field
+and no Dart-mirrored type. `cargo build --release --all-features` succeeds, and
+the one thing the envelope numbers did change is the *behaviour* of three entry
+points for a request larger than 64 MiB — which is a refusal with a sentence, not
+a shape the binary could fail to parse.
 
 ## phase-17 notes
 

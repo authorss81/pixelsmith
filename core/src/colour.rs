@@ -467,6 +467,35 @@ const MAX_TAGS: usize = 1024;
 /// The longest description this module will read out of a profile, in bytes.
 const MAX_TEXT: usize = 1024;
 
+/// The largest ICC profile this module will inflate out of a PNG `iCCP` chunk.
+///
+/// [`MAX_TEXT`] and [`MAX_TAGS`] cap the *parsed* structures, and this caps the
+/// one allocation that precedes parsing: a PNG of about 4 KiB whose `iCCP` payload
+/// is a zlib stream expanding to gigabytes grows a single `Vec` until the
+/// allocator refuses, and Rust's allocation-failure handler aborts the process.
+/// Nothing after the cap is reachable, which is the point — the engine's answer
+/// to a decompression bomb everywhere else is to refuse it before the
+/// allocation, not to notice afterwards.
+///
+/// **4 MiB**, and the reasoning is a measurement plus a headroom:
+///
+/// * the largest profile in this tree's own fixtures is `p3_profile()`, at 464
+///   bytes — the largest thing this module actually reads is four orders of
+///   magnitude below the cap;
+/// * every RGB profile in ordinary use is a few kilobytes: sRGB IEC61966-2.1 is
+///   3,144 bytes, Display P3 and ProPhoto RGB are the same shape, and the largest
+///   *press* profiles — CMYK, which this engine refuses to convert anyway — are
+///   around 2.1 MB;
+/// * so 4 MiB is roughly twice the largest profile that exists in the wild, and
+///   a profile over it is a bomb rather than a colour space.
+///
+/// The cost of being wrong in the tight direction is small and the cost of
+/// being wrong in the loose direction is an abort, so this would be raised
+/// rather than lowered: 16 MiB is where it goes if a real profile is ever
+/// refused, still a twelfth of `Limits::mobile().max_input_bytes` and small next
+/// to what a phone's working set is.
+const MAX_ICC_PROFILE: usize = 4 * 1024 * 1024;
+
 type Matrix3 = [[f32; 3]; 3];
 
 fn identity() -> Matrix3 {
@@ -685,6 +714,14 @@ fn jpeg_icc(input: &[u8]) -> Option<Vec<u8>> {
 /// The compression is why `flate2` is a dependency of this module: an `iCCP`
 /// chunk read without inflating it is a hundred opaque bytes, and every PNG in
 /// the world would be reported as untagged.
+///
+/// It is also the only unbounded allocation on the untrusted-input path in this
+/// crate, so the inflate runs through a [`std::io::Read::take`] of
+/// [`MAX_ICC_PROFILE`] + 1. The ceiling is enforced *during* the inflate rather
+/// than checked on the result, because a check after `read_to_end` arrives when
+/// the `Vec` has already been grown — and growing it is the defect, not
+/// measuring it. The extra byte is what distinguishes "exactly at the cap" from
+/// "over it".
 fn png_icc(input: &[u8]) -> Option<Vec<u8>> {
     use std::io::Read;
     const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -707,9 +744,16 @@ fn png_icc(input: &[u8]) -> Option<Vec<u8>> {
                 return None;
             }
             let mut profile = Vec::new();
-            flate2::read::ZlibDecoder::new(&data[nul + 2..])
-                .read_to_end(&mut profile)
-                .ok()?;
+            let mut inflate =
+                flate2::read::ZlibDecoder::new(&data[nul + 2..]).take((MAX_ICC_PROFILE + 1) as u64);
+            inflate.read_to_end(&mut profile).ok()?;
+            if profile.len() > MAX_ICC_PROFILE {
+                // A profile this big is not a colour space, it is a bomb. The file
+                // is reported as untagged rather than refused, which is the same
+                // answer a PNG with no `iCCP` chunk gets and the only safe one:
+                // the pixels are still perfectly good sRGB.
+                return None;
+            }
             return (!profile.is_empty()).then_some(profile);
         }
         if kind == b"IEND" {
@@ -1588,6 +1632,65 @@ mod tests {
         assert!(profile.icc_present, "the iCCP chunk was not found");
         assert_eq!(profile.icc_bytes, icc.len());
         assert_eq!(profile.source, ColourSpace::DisplayP3);
+    }
+
+    /// A PNG whose `iCCP` payload inflates past the cap is ignored, and the file
+    /// stays a few kilobytes.
+    ///
+    /// This is the audit's finding 1: the inflate had no ceiling, so a 4 KiB file
+    /// grew one `Vec` until the allocator refused — and Rust's
+    /// allocation-failure handler aborts, which is worse than any error this
+    /// engine returns. The fixture is built through the real
+    /// [`crate::format::png_insert_icc`], so what is under test is the same path
+    /// `validate_bytes` → `exif::read` → here reaches on every inspect.
+    ///
+    /// The assertion is `icc_present == false` rather than an error, because the
+    /// answer a PNG with an unreadable profile deserves is the answer a PNG with
+    /// no profile gets: the pixels are fine, so the file is exported as sRGB
+    /// instead of being refused.
+    #[test]
+    fn an_iccp_payload_that_inflates_past_the_cap_is_ignored() {
+        let mut png =
+            crate::encode_fixed(&solid(PATCH), OutputFormat::Png, EncodingOptions::default())
+                .unwrap();
+        let bomb = vec![0u8; MAX_ICC_PROFILE + 1024];
+        crate::format::png_insert_icc(&mut png, &bomb).unwrap();
+        // The whole point: a small file carrying an enormous profile.
+        assert!(
+            png.len() < 64 * 1024,
+            "the fixture is {} bytes, which is no longer a bomb in a file",
+            png.len()
+        );
+
+        let profile = ColourProfile::read(&png, OutputFormat::Png);
+        assert!(
+            !profile.icc_present,
+            "a profile of {} bytes was accepted past the {MAX_ICC_PROFILE}-byte cap",
+            bomb.len()
+        );
+        assert_eq!(profile.icc_bytes, 0);
+        assert_eq!(profile.source, ColourSpace::Untagged);
+        // The file is still a picture: a capped profile is not a broken PNG.
+        assert_eq!(
+            crate::format::detect_format(&png).unwrap(),
+            OutputFormat::Png
+        );
+    }
+
+    /// The cap is above every profile this tree actually reads.
+    ///
+    /// A cap that rejected the fixtures would be a cap in the wrong place, and
+    /// the honest way to say so is a number rather than an assurance: the largest
+    /// profile in the tree is 464 bytes, and every RGB profile in ordinary use is
+    /// a few kilobytes.
+    #[test]
+    fn the_icc_cap_is_far_above_every_profile_this_tree_reads() {
+        let largest = srgb_profile().len().max(p3_profile().len());
+        assert_eq!(largest, 464, "the fixtures changed size");
+        assert!(
+            largest * 16 < MAX_ICC_PROFILE,
+            "the cap is within an order of magnitude of a real profile"
+        );
     }
 
     #[test]
