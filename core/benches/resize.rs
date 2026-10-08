@@ -106,7 +106,10 @@ fn resize(c: &mut Criterion) {
         let src = common::decoded(case.source);
         // Throughput in destination pixels, because that is the work the kernel
         // does per output sample. Source pixels are reported by the label.
-        let (w, h) = case.spec.resolve(src.width(), src.height()).expect("static case");
+        let (w, h) = case
+            .spec
+            .resolve(src.width(), src.height())
+            .expect("static case");
         group.throughput(Throughput::Elements(u64::from(w) * u64::from(h)));
         group.bench_function(BenchmarkId::from_parameter(case.label), |b| {
             b.iter(|| {

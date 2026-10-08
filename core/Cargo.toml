@@ -29,6 +29,22 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # what `core/benches/` is for — so this costs nothing.
 bench = false
 
+[[bin]]
+name = "px-abi-dump"
+path = "src/bin/px-abi-dump.rs"
+# `cargo bench` builds and *runs* a libtest harness for every binary target as
+# well as for every `[[bench]]`, and it forwards everything after `--` to all of
+# them. libtest does not know `--profile`, so
+#
+#   cargo bench --all-features -- --profile ci
+#
+# died on the engine's own ABI-dump tool with `error: Unrecognized option:
+# 'profile'`, before a single benchmark ran, naming a binary rather than a
+# benchmark. `bench = false` is the fix and costs nothing: this target has no
+# `#[bench]` function and never will — it dumps the FFI ABI and runs the sandbox
+# worker. `cargo test` still builds and runs it, which is what it is for.
+bench = false
+
 [dependencies]
 image = { version = "0.25", default-features = false, features = [
   "jpeg",
@@ -290,3 +306,25 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Without this, `cargo bench --all-features` does not compile and does not run.
+#
+# `cargo bench` builds the `bench` profile from `release`, so the dependency graph
+# is compiled with `panic = "abort"` (correct for the shipped library — see
+# `docs/ARCHITECTURE.md` gotcha 8), while the benchmark binaries themselves are
+# built with `unwind`, because libtest and criterion both have to unwind to
+# report a failure at all. Cargo then builds that graph a second time for the
+# bench targets, and the bench targets link a *different* `image` than the crate
+# they are benchmarking. The result is 26 `mismatched types` errors and two
+# `expected an Fn(...)` errors, none of which mention the real cause, and the
+# same "output filename collision" warnings the `bench = false` note above
+# describes. Nothing in the engine can be changed to avoid it; the profile can.
+#
+# Every other setting is inherited from `release`, which is the whole point: a
+# benchmark compiled at `opt-level = 0` would time the wrong code.
+#
+# Cargo prints `warning: panic setting is ignored for bench profile` while doing
+# this, which reads as though the key did nothing. It did: remove this section
+# and the suite does not build.
+[profile.bench]
+panic = "unwind"

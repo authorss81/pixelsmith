@@ -1,0 +1,11 @@
+{
+  "_comment": "The machine these numbers were measured on. A baseline is a measurement of one machine: comparing a run on different hardware does not measure a regression, it measures the hardware. scripts/bench-compare.py reads this file, compares cpu_model against the machine it is running on, and refuses to call a regression when they differ. Refresh it with the same commit as the baseline it describes.",
+  "cpu_model": "AMD EPYC 7763 64-Core Processor",
+  "cores_visible": 4,
+  "isa": "avx2",
+  "os": "Linux 6.17.0-1022-azure x86_64",
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "features": "--all-features (avif, webp-lossy, heic, simd)",
+  "profile": "ci",
+  "note": "simd is ON here, so the resize/* rows are the fast_image_resize kernel, not image's. The reference-kernel comparison is core/examples/resize_bench.rs."
+}

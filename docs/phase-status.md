@@ -21,7 +21,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-07 | AVIF encode, progressive JPEG, chroma subsampling | DONE | `d815024` | See [phase-07 notes](#phase-07-notes) below. The `app/` half is a patch, as in phase-05 and phase-06. |
 | phase-08 | Lossy WebP via libwebp, verified on every target | DONE | `374e6ed` | See [phase-08 notes](#phase-08-notes) below. The two prior attempts failed on a pre-existing gate defect, not on their work. |
 | phase-09 | SIMD resize path behind a feature flag | DONE | `e906fa6` | See [phase-09 notes](#phase-09-notes) below. |
-| phase-10 | Benchmarks and a performance regression gate | PENDING | | |
+| phase-10 | Benchmarks and a performance regression gate | DONE | (this commit) | See [phase-10 notes](#phase-10-notes) below. **The CI workflow is delivered as a patch, as in phase-05/06/07/08 — the gate does not run until it is applied.** |
 | phase-11 | Low-peak-memory decode for very large images | PENDING | | |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
 | phase-13 | Animated GIF: honest handling | PENDING | | |
@@ -786,6 +786,110 @@ inside the suite so the table cannot rot under a future `image` release.
 - Alpha is filtered straight by both kernels, not premultiplied. That is a
   deliberate match, not an oversight, and it belongs to phase-12's colour management
   applied to both.
+
+## phase-10 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with `--all-features`.
+`cargo bench --all-features -- --profile ci` completes in 2 min 40 s including the
+compile, and writes results to `core/target/criterion/`.
+
+**What was added.** `core/benches/` — five bench targets, twenty cases, criterion
+0.7 — plus `core/benches/baseline/` (the committed baseline, 27 KB of criterion's
+own JSON), `scripts/bench-compare.py` (the 15% rule) and
+`.github/workflows/bench.yml` (nightly plus every pull request). Each hot path the
+prompt named is covered: decode at 2/12/24 MP for JPEG, PNG and WebP; resize
+downscale-to-1920, downscale-to-400, downscale-to-64 and a 2x upscale; encode at
+JPEG q85 and q95, WebP lossy q80 and PNG; `TargetBytes::encode_with` in encodes
+per successful fit; and EXIF read and strip on a file carrying every tag class
+`write_back` filters.
+
+**`cargo bench` did not work, twice, and neither reason was in the benchmarks.**
+`[profile.release] panic = "abort"` (gotcha 8) means cargo compiles the `bench`
+profile's dependency graph with `panic = "abort"` and then builds the benchmark
+binaries with `unwind`, because libtest and criterion have to unwind to report a
+failure at all. Cargo builds that graph twice and the benchmarks end up linking a
+*different* `image` than the crate they are benchmarking: 26 `mismatched types`
+errors and two `expected an Fn(...)` errors, none of which name the real cause.
+`[profile.bench] panic = "unwind"` fixes it, and cargo's `warning: panic setting is
+ignored for bench profile` reads as though the key did nothing — it did. Separately,
+`cargo bench` builds and runs a libtest harness for every *binary* target as well
+as every `[[bench]]`, forwarding everything after `--` to it, so `--profile ci` killed
+the run on `px-abi-dump` with `Unrecognized option: 'profile'`. That target is now
+declared `bench = false`.
+
+**The suite hung, silently, and that was the worst bug in it.**
+`benches/common/mod.rs` cached generated fixtures in a `Mutex<HashMap>` and built a
+fixture *while holding the lock*; `jpeg_with_exif` builds on top of `jpeg`, so it
+re-entered the same non-reentrant mutex and the process deadlocked with no output
+and no panic. Ten minutes of a hung benchmark is not a failure mode you notice
+while working on the benchmark you are waiting for. Fixed by never holding a cache
+lock across a build, in both caches, with the reason written down so it is not
+"tidied" back.
+
+**`--test` printed usage and exited 0, while its own docs said it smoke-tested the
+benchmarks.** It shared a match arm with `--help`. Split into two flags; `--test`
+now visits every closure in the smallest run criterion's builder allows, and the
+doc comment says plainly that it is ten passes rather than one, because
+`Mode::Test` is only reachable through `configure_from_args`.
+
+**`TargetBytes` was measuring the wrong function, and looked fine doing it.** The
+first ceiling was 120,000 bytes for a 12 MP photo whose q30 floor is 292,610 — so
+the search ran anyway, returned `target_met: false` next to a 292 KB file, and
+produced a clean 879 ms number for a path the file's own doc comment said was not
+the interesting one. The assumption behind it ("an unreachable ceiling skips the
+search") is simply false: the unreachable path costs about the same, 8 passes
+against 6. The ceiling is now 400,000 bytes with the measured size curve beside it,
+and the benchmark asserts the fit succeeded.
+
+**The baseline is a measurement of one machine, so the gate checks the machine
+first.** The numbers in `docs/BENCHMARKS.md`'s suite section were taken on an AMD
+EPYC 7763; phase-09's resize table was taken on an Intel Xeon 6973P-C. That is
+recorded in `core/benches/baseline/machine.json`, printed in every job summary, and
+checked by `scripts/bench-compare.py`: when the CPU model differs the script reports
+the numbers and gives **no verdict**, because a difference between two machines is
+not a change in the code. Until someone re-measures the baseline on the CI
+runner's class, this gate will compare and find nothing rather than fail wrongly —
+which is the honest state, stated rather than hidden.
+
+**The threshold is 15%, and the argument for not choosing 5% is in the workflow.**
+Ten samples over a 3 s window on a shared runner cannot resolve 5%, and a gate that
+is red more often than green stops being read. A real regression in this codebase is
+a second resampling pass or an encoder called at the wrong quality, which is 2x,
+not 1.05x. One row (`exif/read`, 15.6 µs) is exempt from the verdict and reported
+as advisory: it is shorter than a scheduler tick, so the ci profile cannot resolve
+anything about it.
+
+**What the numbers say, in one line each.** PNG at 2 MP costs more than JPEG at
+12 MP (585 ms against 154 ms). WebP decode is 4.6x JPEG's. Reading EXIF is free
+(15.6 µs) and stripping it is a 31.8 ms memory copy. The whole 20-case suite runs
+in under three minutes on one core.
+
+**Known limits of this phase's own claims.**
+
+- No wall-clock figure here is an export time: none of them includes the resize
+  that normally precedes an encode, and none includes filesystem I/O. A real
+  export is decode, resize, strip, encode, and the benchmark for each is a
+  separate number.
+- AVIF is deliberately not in the suite. At ~3.2 s for 1600x1200 it would dominate
+  the wall clock, and the number already in `docs/ARCHITECTURE.md` stands in for it.
+- PNG is measured at 2 MP rather than 12 MP, and says so in its own benchmark name.
+  Shrinking an input to make a benchmark finish is the failure mode this phase
+  exists to prevent, so the input is in the name and in the docs rather than
+  quietly reduced.
+- Every figure is single-threaded. The batch path's rayon parallelism is not
+  measured, which is the optimistic half.
+- The fixtures are compressible on purpose (a noise fixture times libjpeg's Huffman
+  coder, and can never meet a byte ceiling), which means the decode numbers
+  under-report entropy decoding relative to a camera original. Stated at the top of
+  the section rather than in a footnote.
+- **The workflow is a patch, so the gate does not run.** Pushing this phase's
+  first commit was rejected outright:
+  `refusing to allow a GitHub App to create or update workflow
+  .github/workflows/bench.yml without workflows permission`. It is committed as
+  `workspace/phase-10/bench.yml.patch` (applies cleanly with `git apply`), and
+  the honest statement is that the suite is measured by hand until someone
+  applies it with a credential that may write workflows. `scripts/bench-compare.py`
+  is what the workflow calls, and it works from a shell today.
 
 ## Status values
 

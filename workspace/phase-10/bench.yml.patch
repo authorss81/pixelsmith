@@ -1,0 +1,270 @@
+diff --git a/.github/workflows/bench.yml b/.github/workflows/bench.yml
+new file mode 100644
+index 0000000..9338fd6
+--- /dev/null
++++ b/.github/workflows/bench.yml
+@@ -0,0 +1,264 @@
++name: bench
++
++# The performance regression gate.
++#
++# Runs the twenty benchmarks in core/benches/, compares them against the baseline
++# committed in core/benches/baseline/, and fails a pull request when something
++# got more than 15% slower. `scripts/verify.sh` checks that the code is correct;
++# nothing in it checks that the code is still fast, which is how a 2x regression
++# reaches a user as "the app got slow" rather than as a red build.
++#
++# Deliberately separate from `build`. A benchmark run needs ~3 minutes of an
++# otherwise-idle machine to mean anything, and it must not be able to block a
++# release build; a regression should also never be able to stop a phase, because
++# a phase is allowed to be slower as long as it is correct.
++#
++# NOT IN THE TREE. This file is delivered as workspace/phase-10/bench.yml.patch,
++# for the same reason phase-08's matrix job is a patch: this pipeline's push
++# credential is refused `workflows` permission on `.github/workflows/`, so a
++# commit carrying this file cannot be pushed at all — the push is rejected with
++#
++#   refusing to allow a GitHub App to create or update workflow
++#   `.github/workflows/bench.yml` without `workflows` permission
++#
++# Apply it with `git apply workspace/phase-10/bench.yml.patch` from the repository
++# root, from a credential that may write workflows. Until then **the gate does not
++# run**, and the honest statement is that this suite is measured by hand rather
++# than by CI. See docs/phase-status.md under phase-10.
++
++on:
++  schedule:
++    # Nightly, at 03:17 UTC. Off the hour on purpose: every workflow in every
++    # repository submits at :00, and a benchmark measures a machine, so being
++    # scheduled into the same minute as everything else is how you get a number
++    # that is really a measurement of somebody else's job.
++    - cron: "17 3 * * *"
++  pull_request:
++  push:
++    branches: [main]
++  workflow_dispatch:
++
++permissions:
++  contents: read
++
++# Every job here times a machine. Two of them running at once is two
++# benchmarks competing for the same cores, and the loser of that race is reported
++# as a regression. Cancel in-progress runs of the same ref, but never cancel a
++# run on main to start another one: the nightly on main is the reference.
++concurrency:
++  group: bench-${{ github.ref }}
++  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
++
++jobs:
++  # ---------------------------------------------------------------------------
++  # Nightly on main: save a fresh baseline and publish the numbers.
++  #
++  # This job has no verdict to give. There is nothing to compare against until a
++  # human decides a baseline should move, and a job that rewrites the committed
++  # baseline on a timer would erase the one piece of context a regression needs
++  # ("which commit was this measured on?"). So it uploads what it measured, and
++  # refreshing core/benches/baseline/ stays a commit a person makes, with a
++  # reason in the message. See core/benches/baseline/README.md.
++  nightly:
++    name: nightly baseline
++    runs-on: ubuntu-latest
++    timeout-minutes: 45
++    steps:
++      - uses: actions/checkout@v5
++
++      - uses: dtolnay/rust-toolchain@stable
++
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: core
++
++      - name: Which machine is this?
++        run: |
++          echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
++          echo "cores: $(nproc)"
++          echo "rustc: $(rustc --version)"
++
++      - name: Run the benchmarks and save a baseline
++        working-directory: core
++        run: |
++          set -o pipefail
++          cargo bench --all-features -- --profile ci --save-baseline main 2>&1 | tee ../bench-nightly.log
++
++      - name: What did this machine say?
++        run: |
++          {
++            echo "### nightly benchmark run"
++            echo ""
++            echo "| | |"
++            echo "| --- | --- |"
++            echo "| CPU | $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs) |"
++            echo "| cores visible | $(nproc) |"
++            echo "| rustc | $(rustc --version) |"
++            echo ""
++            echo '```'
++            grep -E '^\S+ +time:|^ +time:' bench-nightly.log | head -40
++            echo '```'
++          } >> "$GITHUB_STEP_SUMMARY"
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: bench-baseline
++          path: core/target/criterion/*/**/main/*.json
++          if-no-files-found: error
++          retention-days: 90
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: bench-nightly-log
++          path: bench-nightly.log
++          if-no-files-found: warn
++          retention-days: 30
++
++  # ---------------------------------------------------------------------------
++  # The gate itself: a pull request, measured against the committed baseline.
++  regression:
++    name: benchmark regression
++    if: github.event_name == 'pull_request'
++    runs-on: ubuntu-latest
++    timeout-minutes: 45
++    steps:
++      - uses: actions/checkout@v5
++
++      - uses: dtolnay/rust-toolchain@stable
++
++      - uses: Swatinem/rust-cache@v2
++        with:
++          workspaces: core
++
++      - name: Which machine is this?
++        id: machine
++        run: |
++          echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)" >> "$GITHUB_OUTPUT"
++          {
++            echo "### machine"
++            echo ""
++            echo "| | |"
++            echo "| --- | --- |"
++            echo "| CPU | ${{ steps.machine.outputs.cpu }} |"
++            echo "| cores visible | $(nproc) |"
++            echo "| rustc | $(rustc --version) |"
++            echo "| baseline measured on | $(python3 -c "import json;print(json.load(open('core/benches/baseline/machine.json'))['cpu_model'])") |"
++          } >> "$GITHUB_STEP_SUMMARY"
++
++      # criterion reads a baseline from its own output directory and compares the
++      # run against it, so the committed baseline has to be installed there before
++      # the suite starts. `--baseline main` then makes every run write its own
++      # results to .../new/ and print a comparison against .../main/.
++      - name: Install the committed baseline
++        run: |
++          mkdir -p core/target/criterion
++          cp -r core/benches/baseline/. core/target/criterion/
++
++      - name: Run the benchmarks against the baseline
++        working-directory: core
++        run: |
++          set -o pipefail
++          cargo bench --all-features -- --profile ci --baseline main 2>&1 | tee ../bench-pr.log
++
++      - name: Apply the 15% rule
++        id: verdict
++        run: |
++          set +e
++          python3 scripts/bench-compare.py \
++            --criterion-dir core/target/criterion \
++            --markdown /tmp/verdict.md
++          rc=$?
++          echo "rc=$rc" >> "$GITHUB_OUTPUT"
++          {
++            echo "### benchmark comparison"
++            echo ""
++            cat /tmp/verdict.md
++          } >> "$GITHUB_STEP_SUMMARY"
++          exit 0
++
++      - name: Comment the result on the pull request
++        uses: actions/github-script@v7
++        with:
++          script: |
++            const fs = require('fs');
++            const rc = '${{ steps.verdict.outputs.rc }}';
++            const table = fs.readFileSync('/tmp/verdict.md', 'utf8');
++            const failed = rc !== '0';
++            const body = [
++              failed
++                ? '### :warning: benchmark regression'
++                : '### benchmark comparison',
++              '',
++              '```',
++              table.trim(),
++              '```',
++              '',
++              failed
++                ? 'One of these got more than **15%** slower. See the workflow run for the per-case confidence intervals, and check the last commit that touched the file in the name before treating it as a real regression — a shared runner can be busy.'
++                : 'Nothing here regressed by more than 15%. Note what this does *not* cover: filesystem I/O, the batch path\'s rayon parallelism, and anything slower than the `--profile ci` sample size can resolve.',
++            ].join('\n');
++            const {owner, repo} = context.repo;
++            const issue_number = context.payload.pull_request.number;
++            // Sticky: one comment per pull request, updated rather than
++            // accumulated, so a branch with ten commits does not have ten
++            // identical benchmark tables to scroll past.
++            const marker = '<!-- pixelsmith-benchmark-report -->';
++            const comment = `${marker}\n${body}`;
++            const existing = (await github.paginate(github.rest.issues.listComments, {
++              owner, repo, issue_number, per_page: 100,
++            })).find(c => c.body && c.body.includes(marker));
++            if (existing) {
++              await github.rest.issues.updateComment({owner, repo, comment_id: existing.id, body: comment});
++            } else {
++              await github.rest.issues.createComment({owner, repo, issue_number, body: comment});
++            }
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: bench-pr-log
++          path: bench-pr.log
++          if-no-files-found: warn
++          retention-days: 30
++
++      # Last, so the report and the comment exist before the job goes red.
++      - name: Fail the pull request
++        if: steps.verdict.outputs.rc != '0'
++        run: |
++          echo "::error::a benchmark regressed by more than 15%"
++          exit 1
++
++  # ---------------------------------------------------------------------------
++  # THE THRESHOLD, and why it is 15% and not 5%.
++  #
++  # 5% is the number criterion uses, and it is the number people reach for. On
++  # this suite it would produce a gate that is red more often than green, and a
++  # gate that is always red is not a gate — it is noise with an exit code, and
++  # the first thing a team does with one is `--allow-failures` it away.
++  #
++  # The three reasons 5% cannot work here, in order of how much they matter:
++  #
++  # 1. **Ten samples over three seconds is not a 5% measurement.** criterion's
++  #    default is 100 samples over 5 s; the ci profile here is a deliberate cut
++  #    to keep twenty benchmarks inside a nightly job's budget, and ten samples
++  #    of a 12 MP encode is four iterations. The 95% confidence interval on a
++  #    single row in the table below is routinely wider than 5%.
++  # 2. **The runner is shared.** GitHub's standard Linux runners are virtualised
++  #    onto hardware that is also running other jobs. A 24 MP resize is 80 ms of
++  #    arithmetic that a noisy neighbour can extend by a fifth without the code
++  #    changing at all. Measured repeat-to-repeat spread in this suite: 1-4% on
++  #    the long cases, worse than 10% on the short ones.
++  # 3. **The 15% figure still catches what this gate is for.** A real
++  #    performance regression in this codebase is not a 6% one. It is someone
++  #    reaching for a second resampling pass (hard rule 5), an encoder called at
++  #    the wrong quality, a `Vec` copied per iteration, or a limit that stopped
++  #    being enforced — those are 2x, not 1.05x. phase-09's SIMD kernel is 2.6x
++  #    to 19.9x, and the reason that was worth a feature flag is precisely that
++  #    the large wins are the ones worth gating.
++  #
++  # What 15% costs: a genuine 10% regression slips through until someone
++  # re-baselines. That is the right trade for a gate nobody will read.
++  #
++  # One benchmark is exempt from the verdict, and the script says so in its
++  # output: `exif/read/full_tag_set` runs in 15 microseconds, which is shorter
++  # than a scheduler tick on a loaded machine. It is reported every run and it is
++  # never the reason a pull request goes red.

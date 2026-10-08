@@ -55,9 +55,9 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use criterion::Criterion;
+use pixelsmith_core::Limits;
 use pixelsmith_core::decode_bounded;
 use pixelsmith_core::format::{EncodingOptions, OutputFormat};
-use pixelsmith_core::Limits;
 
 pub const MP2: (u32, u32) = (1632, 1224);
 pub const MP12: (u32, u32) = (4000, 3000);
@@ -172,11 +172,20 @@ impl CiProfile {
 /// `--baseline <name>`, `--bench`, `--test`, `--help`, and one optional
 /// positional FILTER (a substring, which is criterion's own rule).
 ///
-/// `--test` runs every benchmark once and reports nothing, which is what
+/// `--test` exercises every benchmark once and reports nothing, which is what
 /// `cargo test --benches` does in criterion. `scripts/verify.sh` does not do that
 /// — `cargo test` without `--benches` does not build bench targets at all, and
 /// `cargo clippy --all-targets` compiles them without running them — but the flag
-/// is honoured here so a benchmark can be smoke-tested without a full run.
+/// is honoured here so a benchmark can be smoke-tested in seconds rather than by
+/// a full `--profile ci` run.
+///
+/// criterion's own `--test` runs each closure exactly once, via a `Mode` this
+/// suite cannot reach: `Mode::Test` is only set inside `configure_from_args`, and
+/// `std::env::set_args` is still unstable, so there is no way to ask the builder
+/// for it. What is reachable is the smallest run that still visits every closure:
+/// the minimum sample count, and a warm-up and measurement window of 1 ms each. So
+/// `--test` is ten passes per benchmark rather than one, which is a smoke test and
+/// not a measurement — nothing it prints should be quoted anywhere.
 ///
 /// # Panics
 ///
@@ -195,7 +204,8 @@ pub fn criterion_configure() -> Criterion {
         match arg {
             "--bench" => {}
             "--noplot" => profile.plots = false,
-            "--test" | "--help" => profile.help = true,
+            "--test" => profile.test = true,
+            "--help" => profile.help = true,
             "--profile" | "--save-baseline" | "--baseline" => {
                 let value = args.get(i + 1).unwrap_or_else(|| {
                     eprintln!("bench: {arg} needs a value");
@@ -203,7 +213,9 @@ pub fn criterion_configure() -> Criterion {
                 });
                 match arg {
                     "--profile" => profile = parse_profile(value),
-                    "--save-baseline" => profile.baseline = Some(BaselineAction::Save(value.clone())),
+                    "--save-baseline" => {
+                        profile.baseline = Some(BaselineAction::Save(value.clone()))
+                    }
                     _ => profile.baseline = Some(BaselineAction::Compare(value.clone())),
                 }
                 i += 1;
@@ -245,11 +257,7 @@ pub fn criterion_configure() -> Criterion {
         // being a flag that pretends to control something.
         c = c.without_plots();
     }
-    if profile.help {
-        // `--test`: one unmeasured pass per benchmark, which is what criterion's
-        // own `--test` does. sample_size's floor is 10 and warm-up/measurement must
-        // be non-zero, so this is the smallest run that still exercises every
-        // closure without producing a number anyone could mistake for one.
+    if profile.test {
         c = c
             .sample_size(10)
             .warm_up_time(std::time::Duration::from_millis(1))
@@ -269,7 +277,7 @@ pub fn criterion_configure() -> Criterion {
 const USAGE: &str = "\
 usage: cargo bench --all-features -- [--profile <name>] [--noplot]
                        [--save-baseline <name> | --baseline <name>]
-                       [--test] [FILTER]
+                       [--test] [--help] [FILTER]
 
 profiles:
   ci      short run for a CI regression gate (the default for this suite's docs)
@@ -281,6 +289,9 @@ struct Profile {
     /// See [`CiProfile`] for the numbers and why they are these.
     ci: CiProfile,
     plots: bool,
+    /// `--test`: visit every closure, print nothing worth quoting.
+    test: bool,
+    /// `--help`: print usage and exit.
     help: bool,
     baseline: Option<BaselineAction>,
 }
@@ -299,6 +310,7 @@ impl Default for Profile {
         Self {
             ci: CiProfile::CI,
             plots: false,
+            test: false,
             help: false,
             baseline: None,
         }
@@ -342,7 +354,8 @@ fn announce(profile: &Profile) {
         },
         match &profile.baseline {
             Some(BaselineAction::Save(name)) => format!(" (saving baseline `{name}`)"),
-            Some(BaselineAction::Compare(name)) => format!(" (comparing against baseline `{name}`)"),
+            Some(BaselineAction::Compare(name)) =>
+                format!(" (comparing against baseline `{name}`)"),
             None => String::new(),
         }
     );
@@ -380,16 +393,31 @@ fn cache() -> &'static FixtureCache {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cached(kind: u8, quality: u8, size: (u32, u32), build: impl FnOnce() -> Vec<u8>) -> &'static [u8] {
+fn cached(
+    kind: u8,
+    quality: u8,
+    size: (u32, u32),
+    build: impl FnOnce() -> Vec<u8>,
+) -> &'static [u8] {
     let key = (kind, quality, size.0 * 100_000 + size.1);
-    // A poisoned lock means a previous build panicked; the bytes are still
-    // perfectly usable and this is a benchmark process.
-    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(found) = map.get(&key) {
-        return found;
+    // Lookup and insert are separately locked, and nothing is locked while a
+    // fixture is built. `jpeg_with_exif` builds on top of `jpeg`, so a builder
+    // that re-entered the cache would deadlock on this non-reentrant mutex —
+    // which is a hang with no output and no panic, and the single least obvious
+    // way this suite can fail. Two threads racing on the same key would each
+    // build one and the loser's copy would be dropped; the suite is
+    // single-threaded and the bytes are deterministic, so that cannot happen.
+    {
+        let map = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = map.get(&key) {
+            return found;
+        }
     }
     let leaked: &'static [u8] = Box::leak(build().into_boxed_slice());
-    map.insert(key, leaked);
+    cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, leaked);
     leaked
 }
 
@@ -402,7 +430,11 @@ pub fn jpeg_size_probe(size: (u32, u32)) -> &'static [u8] {
 /// JPEG bytes for `size`, at `quality`.
 pub fn jpeg(size: (u32, u32), quality: u8) -> &'static [u8] {
     cached(1, quality, size, || {
-        encode(&image::DynamicImage::ImageRgba8(photograph(size.0, size.1)), OutputFormat::Jpeg, quality)
+        encode(
+            &image::DynamicImage::ImageRgba8(photograph(size.0, size.1)),
+            OutputFormat::Jpeg,
+            quality,
+        )
     })
 }
 
@@ -410,7 +442,11 @@ pub fn jpeg(size: (u32, u32), quality: u8) -> &'static [u8] {
 /// is `deflate` either way, which is exactly why this case is slow.
 pub fn png(size: (u32, u32)) -> &'static [u8] {
     cached(2, 0, size, || {
-        encode(&image::DynamicImage::ImageRgba8(photograph(size.0, size.1)), OutputFormat::Png, 0)
+        encode(
+            &image::DynamicImage::ImageRgba8(photograph(size.0, size.1)),
+            OutputFormat::Png,
+            0,
+        )
     })
 }
 
@@ -439,8 +475,12 @@ pub fn webp_decode_fixture(size: (u32, u32)) -> &'static [u8] {
 }
 
 fn encode(img: &image::DynamicImage, format: OutputFormat, quality: u8) -> Vec<u8> {
-    pixelsmith_core::encode_fixed(img, format, EncodingOptions::default().with_quality(quality))
-        .expect("the engine's own encoder must accept the fixture it was handed")
+    pixelsmith_core::encode_fixed(
+        img,
+        format,
+        EncodingOptions::default().with_quality(quality),
+    )
+    .expect("the engine's own encoder must accept the fixture it was handed")
 }
 
 /// Decoded pixels for `size`, through the bounded path production uses.
@@ -453,15 +493,21 @@ pub fn decoded(size: (u32, u32)) -> &'static image::DynamicImage {
     static DECODED: OnceLock<Mutex<HashMap<u32, &'static image::DynamicImage>>> = OnceLock::new();
     let key = size.0 * 100_000 + size.1;
     let map = DECODED.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = map.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(found) = map.get(&key) {
-        return found;
+    // Same rule as [`cached`]: the lock is a cache, not a transaction. A builder
+    // that re-entered it would deadlock rather than recurse.
+    {
+        let guard = map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(found) = guard.get(&key) {
+            return found;
+        }
     }
     let encoded = jpeg(size, 90);
     let img = decode_bounded(encoded, &Limits::default())
         .expect("a JPEG this engine just wrote must decode within the default limits");
     let leaked: &'static image::DynamicImage = Box::leak(Box::new(img));
-    map.insert(key, leaked);
+    map.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, leaked);
     leaked
 }
 
@@ -494,7 +540,7 @@ pub fn jpeg_with_exif(size: (u32, u32)) -> &'static [u8] {
 /// also populated, and a benchmark fixture is not the place to discover that.
 pub fn exif_fields(size: (u32, u32)) -> Vec<exif::Field> {
     use exif::{Tag, Value};
-    use pixelsmith_core::exif::{ascii, field, long, GPS_IFD};
+    use pixelsmith_core::exif::{GPS_IFD, ascii, field, long};
 
     vec![
         field(Tag::Make, GPS_IFD, ascii("Pexelsmith")),
@@ -503,49 +549,74 @@ pub fn exif_fields(size: (u32, u32)) -> Vec<exif::Field> {
         field(Tag::Orientation, GPS_IFD, Value::Short(vec![6])),
         field(Tag::DateTime, GPS_IFD, ascii("2026:10:07 12:34:56")),
         field(Tag::DateTimeOriginal, GPS_IFD, ascii("2026:10:07 12:34:56")),
-        field(Tag::ExposureTime, GPS_IFD, Value::Rational(vec![exif::Rational {
-            num: 1,
-            denom: 250,
-        }])),
-        field(Tag::FNumber, GPS_IFD, Value::Rational(vec![exif::Rational {
-            num: 18,
-            denom: 10,
-        }])),
+        field(
+            Tag::ExposureTime,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational { num: 1, denom: 250 }]),
+        ),
+        field(
+            Tag::FNumber,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational { num: 18, denom: 10 }]),
+        ),
         field(Tag::ISOSpeed, GPS_IFD, Value::Short(vec![400])),
-        field(Tag::FocalLength, GPS_IFD, Value::Rational(vec![exif::Rational {
-            num: 35,
-            denom: 1,
-        }])),
+        field(
+            Tag::FocalLength,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational { num: 35, denom: 1 }]),
+        ),
         field(Tag::Artist, GPS_IFD, ascii("Benchmark Fixture")),
-        field(Tag::Copyright, GPS_IFD, ascii("(c) 2026 nobody, all rights reserved")),
+        field(
+            Tag::Copyright,
+            GPS_IFD,
+            ascii("(c) 2026 nobody, all rights reserved"),
+        ),
         field(Tag::CameraOwnerName, GPS_IFD, ascii("Jane Q. Bench")),
         field(Tag::BodySerialNumber, GPS_IFD, ascii("B0DGEH0000000001")),
         field(Tag::LensModel, GPS_IFD, ascii("PX Bench 24-70mm f/2.8")),
         field(Tag::LensSerialNumber, GPS_IFD, ascii("L0NSB0000000001")),
-        field(Tag::GPSLatitude, GPS_IFD, Value::Rational(vec![
-            exif::Rational { num: 51, denom: 1 },
-            exif::Rational { num: 30, denom: 1 },
-            exif::Rational { num: 0, denom: 100 },
-        ])),
+        field(
+            Tag::GPSLatitude,
+            GPS_IFD,
+            Value::Rational(vec![
+                exif::Rational { num: 51, denom: 1 },
+                exif::Rational { num: 30, denom: 1 },
+                exif::Rational { num: 0, denom: 100 },
+            ]),
+        ),
         field(Tag::GPSLatitudeRef, GPS_IFD, ascii("N")),
-        field(Tag::GPSLongitude, GPS_IFD, Value::Rational(vec![
-            exif::Rational { num: 0, denom: 1 },
-            exif::Rational { num: 7, denom: 1 },
-            exif::Rational { num: 39, denom: 100 },
-        ])),
+        field(
+            Tag::GPSLongitude,
+            GPS_IFD,
+            Value::Rational(vec![
+                exif::Rational { num: 0, denom: 1 },
+                exif::Rational { num: 7, denom: 1 },
+                exif::Rational {
+                    num: 39,
+                    denom: 100,
+                },
+            ]),
+        ),
         field(Tag::GPSLongitudeRef, GPS_IFD, ascii("W")),
-        field(Tag::GPSAltitude, GPS_IFD, Value::Rational(vec![
-            exif::Rational { num: 1234, denom: 10 },
-        ])),
+        field(
+            Tag::GPSAltitude,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational {
+                num: 1234,
+                denom: 10,
+            }]),
+        ),
         field(Tag::GPSAltitudeRef, GPS_IFD, Value::Byte(vec![0])),
-        field(Tag::XResolution, GPS_IFD, Value::Rational(vec![exif::Rational {
-            num: 72,
-            denom: 1,
-        }])),
-        field(Tag::YResolution, GPS_IFD, Value::Rational(vec![exif::Rational {
-            num: 72,
-            denom: 1,
-        }])),
+        field(
+            Tag::XResolution,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational { num: 72, denom: 1 }]),
+        ),
+        field(
+            Tag::YResolution,
+            GPS_IFD,
+            Value::Rational(vec![exif::Rational { num: 72, denom: 1 }]),
+        ),
         field(Tag::ResolutionUnit, GPS_IFD, Value::Short(vec![2])),
         field(Tag::ImageWidth, GPS_IFD, long(size.0)),
         field(Tag::ImageLength, GPS_IFD, long(size.1)),
