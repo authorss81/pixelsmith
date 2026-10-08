@@ -24,7 +24,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-10 | Benchmarks and a performance regression gate | DONE | `0ebccdf` | See [phase-10 notes](#phase-10-notes) below. **The CI workflow is delivered as a patch, as in phase-05/06/07/08 — the gate does not run until it is applied.** |
 | phase-11 | Low-peak-memory decode for very large images | DONE | `9cef389` | See [phase-11 notes](#phase-11-notes) below. |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | DONE | `7dc119d` | See [phase-12 notes](#phase-12-notes) below. The `app/` half was never delivered as a patch — see the notes. |
-| phase-13 | Animated GIF: honest handling | DONE | (this commit) | See [phase-13 notes](#phase-13-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07. |
+| phase-13 | Animated GIF: honest handling | DONE | `ce804a9` | See [phase-13 notes](#phase-13-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07. |
 | phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
 | phase-15 | Supply-chain policy and reproducible builds | PENDING | | |
 | phase-16 | Release artefacts: the APK and the EXE | PENDING | | Publishes the installable binaries |
