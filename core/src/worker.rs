@@ -10,6 +10,7 @@
 //! * **Accounting.** Every batch returns per-file success *and* failure, so one
 //!   unreadable file in a folder of 200 does not discard the other 199.
 
+use crate::animation::{self, AnimationOutcome, AnimationPolicy};
 use crate::colour::ColourOutcome;
 use crate::error::{Error, Result};
 use crate::format::{EncodingOptions, OutputFormat};
@@ -40,6 +41,10 @@ pub struct Settings {
     pub encoding: EncodingOptions,
     pub target: Option<TargetBytes>,
     pub limits: Limits,
+    /// What to do when the output format cannot hold every frame of an
+    /// animation. The default keeps the frames or refuses the export; see
+    /// [`crate::animation`] and `docs/GIF.md`.
+    pub animation: AnimationPolicy,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -48,6 +53,7 @@ impl Default for Settings {
             encoding: EncodingOptions::default(),
             target: None,
             limits: Limits::default(),
+            animation: AnimationPolicy::Keep,
         }
     }
 }
@@ -96,6 +102,13 @@ pub struct Outcome {
     /// Display-P3 photo and is now sRGB" next to the file it just wrote rather
     /// than leaving the user to notice.
     pub colour: ColourOutcome,
+    /// What happened to this file's frames.
+    ///
+    /// Present on every outcome, including failures and cancellations, because
+    /// a caller must be able to ask "did the animation survive?" without
+    /// decoding the output and without parsing the error string. A failed file
+    /// carries [`AnimationOutcome::unknown`], which claims nothing.
+    pub animation: AnimationOutcome,
     pub error: Option<String>,
 }
 
@@ -179,6 +192,24 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // safe.
     let report = crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
 
+    // What happens to the frames is decided before a pixel is decoded, so a
+    // refusal costs the header walk that found them and nothing more. Three
+    // outcomes: a still runs the ordinary single-image path below, an animation
+    // into a format that holds several goes frame by frame through
+    // `animation::preserve`, and an animation into a format that holds one is
+    // either flattened on request or refused here.
+    let animation = animation::decide(report.frames, settings.format, settings.animation)?;
+
+    // The pipeline's chroma choice is the authority: it is the one a UI sets on
+    // the picture, and `Settings::encoding` is the fallback for a caller that
+    // never touches the pipeline. See `Pipeline::chroma_subsampling`. Computed
+    // here rather than further down because the animation path needs it too.
+    let options = settings.encoding.with_chroma(pipeline.chroma_subsampling);
+
+    if animation.is_preserved() {
+        return process_animation(job, pipeline, settings, &report, animation);
+    }
+
     let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
 
     // Colour first, geometry second, and it has to be first: the source space is a
@@ -214,11 +245,6 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     } else {
         out
     };
-
-    // The pipeline's chroma choice is the authority: it is the one a UI sets on
-    // the picture, and `Settings::encoding` is the fallback for a caller that
-    // never touches the pipeline. See `Pipeline::chroma_subsampling`.
-    let options = settings.encoding.with_chroma(pipeline.chroma_subsampling);
 
     // Zero means "no quality setting was applied", which is what a lossless
     // format gets. Reporting the requested number there would be a claim about a
@@ -286,9 +312,64 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         quality_used,
         target_met,
         colour,
+        animation,
         error: None,
     };
     Ok(Processed { outcome, bytes })
+}
+
+/// The animation branch of [`process_one`]: every frame through the pipeline,
+/// one animation out.
+///
+/// Separate from the still path rather than a flag inside it, because almost
+/// everything the still path does is a no-op here and pretending otherwise is how
+/// a reader ends up looking for the ICC arm in the wrong place: metadata is
+/// already gone (the frames are built from decoded samples, which is what
+/// `exif::strip` does for a still), no profile can be embedded (`colour::apply`
+/// refuses GIF, the only format this reaches), EXIF write-back is JPEG-only, and
+/// a byte ceiling is impossible because `Settings::validate` refuses a ceiling on
+/// a format with no quality setting.
+fn process_animation(
+    job: &Job,
+    pipeline: &Pipeline,
+    settings: &Settings,
+    report: &crate::validate::ValidateReport,
+    animation: AnimationOutcome,
+) -> Result<Processed> {
+    let preserved = animation::preserve(
+        &job.bytes,
+        report,
+        &settings.limits,
+        pipeline,
+        settings.format,
+    )?;
+    // `preserve` refuses rather than shortening the animation, so this is an
+    // assertion about an invariant it enforces, not a second guess at the count.
+    let animation = AnimationOutcome::preserved(preserved.frames, animation.policy);
+
+    let stem = sanitise_stem(&job.name);
+    let outcome = Outcome {
+        id: job.id.clone(),
+        name: job.name.clone(),
+        output_name: format!("{stem}.{}", settings.format.extension()),
+        input_bytes: job.bytes.len(),
+        output_bytes: preserved.bytes.len(),
+        width: preserved.width,
+        height: preserved.height,
+        // GIF is palette-quantised, so no quality setting was applied and none is
+        // reported — the same rule the still path uses.
+        quality_used: 0,
+        // No ceiling was asked for, or one was refused before this point: GIF has
+        // no quality setting for a search to move.
+        target_met: settings.target.is_none(),
+        colour: preserved.colour,
+        animation,
+        error: None,
+    };
+    Ok(Processed {
+        outcome,
+        bytes: preserved.bytes,
+    })
 }
 
 /// Resize while the bytes are still compressed, or `None` to use the in-memory
@@ -384,6 +465,7 @@ pub fn process_batch(
                 quality_used: 0,
                 target_met: false,
                 colour: ColourOutcome::unknown(),
+                animation: AnimationOutcome::unknown(),
                 error: Some("cancelled".into()),
             },
             Err(e) => Outcome {
@@ -397,6 +479,16 @@ pub fn process_batch(
                 quality_used: 0,
                 target_met: false,
                 colour: ColourOutcome::unknown(),
+                // A refusal is the one failure where the frames are known and
+                // the file is fine, so it reports them rather than claiming
+                // nothing happened. Every other failure is
+                // `AnimationOutcome::unknown()`.
+                animation: match &e {
+                    Error::AnimationRefused { frames, .. } => {
+                        AnimationOutcome::refused(*frames, settings.animation)
+                    }
+                    _ => AnimationOutcome::unknown(),
+                },
                 error: Some(e.to_string()),
             },
         })

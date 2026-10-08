@@ -1,5 +1,4 @@
 use crate::error::{Error, Result};
-use image::AnimationDecoder;
 
 /// Limits applied *before* and *during* decode.
 ///
@@ -131,6 +130,30 @@ impl Limits {
         self.max_pixels.saturating_mul(4)
     }
 
+    /// The same budget applied to every frame of an animation at once.
+    ///
+    /// An animation's frames are all held in memory while the encoder writes
+    /// them, so a 200-frame export costs 200 times what one frame costs — and
+    /// [`Limits::check_header`] is called per frame, so each check would pass.
+    /// The budget is therefore applied to the whole animation rather than to
+    /// each frame, which is the honest reading of `max_pixels`: the profile says
+    /// how many pixels of decoded picture this device will hold at once, and an
+    /// animation presents them all at once.
+    ///
+    /// Checked before the first frame is decoded, so a refusal costs nothing but
+    /// the header walk that found the frames.
+    pub fn check_animation(&self, w: u32, h: u32, frames: u32) -> Result<()> {
+        self.check_header(w, h)?;
+        let pixels = u64::from(w) * u64::from(h) * u64::from(frames.max(1));
+        if pixels > self.max_pixels {
+            return Err(Error::PixelBudgetExceeded {
+                limit: self.max_pixels,
+                actual: pixels as f64 / 1_000_000.0,
+            });
+        }
+        Ok(())
+    }
+
     /// The header check for a streamed decode.
     ///
     /// Same per-side ceiling as [`Limits::check_header`], and a pixel budget of
@@ -181,6 +204,25 @@ pub struct ValidateReport {
     pub megapixels: f64,
     pub has_exif: bool,
     pub has_animated: bool,
+    /// How many frames the file's container claims.
+    ///
+    /// 1 for a still, which is the overwhelming majority of files, and 1 for
+    /// every format this build cannot see frames in. It is the number the UI
+    /// shows *before* an export, so the count beside the finished file is the
+    /// same number the user was warned with.
+    ///
+    /// Read from the container rather than by decoding — see
+    /// [`FrameScan`] — so a 40 MB animation costs a walk of its own bytes
+    /// instead of a full decode during a folder scan.
+    pub frames: u32,
+    /// Whether the frame walk stopped before the trailer, which makes `frames` a
+    /// lower bound rather than a count.
+    ///
+    /// Its own field because the two cannot be told apart from `frames` alone,
+    /// and the difference decides whether an animation may be written out at
+    /// all: `frames` says how many there are, this says whether that is knowable.
+    /// A file that says "at least 3" cannot be checked against a write of 3.
+    pub frames_truncated: bool,
     pub sensitive_tags: Vec<String>,
     pub orientation: Option<u32>,
     /// The colour profile the file carries, or that it does not. This is the
@@ -236,6 +278,15 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
         }
     };
 
+    // A GIF's frames are counted from its container rather than by decoding
+    // them, because this function runs over a whole folder before the user has
+    // committed to anything. See `scan_gif_frames`.
+    let scan = if format.supports_animation() {
+        scan_gif_frames(input)
+    } else {
+        FrameScan::STILL
+    };
+
     let suspicious = if w > limits.max_dimension || h > limits.max_dimension {
         Some(format!(
             "{w}x{h} exceeds the {} px per-side limit",
@@ -247,6 +298,14 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
             megapixels(w, h),
             limits.max_pixels as f64 / 1_000_000.0
         ))
+    } else if scan.truncated {
+        // Last, because a file that is both oversize and damaged should be told
+        // about the size: that is the reason it will be refused.
+        Some(
+            "this GIF's frame structure is damaged, so the number of frames in it is a \
+             lower bound and it may not open at all"
+                .into(),
+        )
     } else {
         None
     };
@@ -264,7 +323,9 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
         height: h,
         megapixels: megapixels(w, h),
         has_exif: !exif.entries.is_empty() || heif_exif,
-        has_animated: format.supports_animation() && count_frames(input, format) > 1,
+        has_animated: scan.frames > 1,
+        frames: scan.frames,
+        frames_truncated: scan.truncated,
         sensitive_tags: exif.sensitive_tags.clone(),
         orientation: exif.orientation,
         // Taken from the `exif::read` above rather than re-walked: it read the
@@ -275,17 +336,165 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
     })
 }
 
-fn count_frames(input: &[u8], format: crate::format::OutputFormat) -> usize {
-    // Only GIF exposes a multi-frame decoder in this build. APNG and animated
-    // WebP are reported as single-frame, which means the UI treats them as
-    // stills and says so rather than quietly flattening them.
-    match format {
-        crate::format::OutputFormat::Gif => {
-            image::codecs::gif::GifDecoder::new(std::io::Cursor::new(input))
-                .map(|d| d.into_frames().count())
-                .unwrap_or(1)
+/// What a GIF's container says about its frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameScan {
+    /// Image descriptors found. Zero when the container could not be read at
+    /// all, which is a broken file rather than a still one — `truncated` says so
+    /// and the decode that follows says it in a sentence.
+    pub frames: u32,
+    /// The walk stopped early: the buffer ended before the trailer, or a byte
+    /// appeared where a block introducer had to be.
+    ///
+    /// Carried rather than absorbed because it changes what the frame count
+    /// means. `frames` is then a lower bound, and this is how a caller knows it
+    /// is one.
+    pub truncated: bool,
+}
+
+impl FrameScan {
+    /// A file with no container to walk: one frame, and nothing damaged.
+    pub const STILL: Self = Self {
+        frames: 1,
+        truncated: false,
+    };
+}
+
+/// How many frames a GIF holds, read from the container without decoding pixels.
+///
+/// GIF is the only format in this build with more than one frame, so this is
+/// the whole animation-detection story: APNG and animated WebP are reported as
+/// single-frame, which means the UI treats them as stills and says so rather
+/// than quietly flattening them.
+///
+/// The previous implementation counted frames with `into_frames().count()`,
+/// which *decodes* every frame — so the folder scan in `validate_bytes`, whose
+/// entire selling point is being cheap enough to run on a whole folder, was
+/// materialising every animation in it. It also had no way to distinguish "one
+/// frame" from "a container too damaged to read", and swallowed the difference
+/// into `unwrap_or(1)`. Both are what [`FrameScan`] now states.
+///
+/// Every offset is checked against the buffer length and every walk is bounded
+/// by it, because the bytes come off the user's disk: the loop advances only
+/// past a block it has found the end of, so a sub-block header claiming more
+/// bytes than the file holds ends the walk instead of indexing past it. It
+/// cannot panic, and it cannot loop, and it allocates nothing.
+pub fn scan_gif_frames(input: &[u8]) -> FrameScan {
+    /// `GIF87a` or `GIF89a`.
+    const SIGNATURE: usize = 6;
+    /// Logical screen descriptor: four 16-bit fields and one packed byte.
+    const SCREEN_DESCRIPTOR: usize = 7;
+    const EXTENSION_INTRODUCER: u8 = 0x21;
+    const IMAGE_SEPARATOR: u8 = 0x2c;
+    const TRAILER: u8 = 0x3b;
+    /// Legal filler between blocks in some encoders' output.
+    const PADDING: u8 = 0x00;
+
+    if input.len() < SIGNATURE + SCREEN_DESCRIPTOR
+        || (&input[..SIGNATURE] != b"GIF87a" && &input[..SIGNATURE] != b"GIF89a")
+    {
+        return FrameScan {
+            frames: 0,
+            truncated: true,
+        };
+    }
+
+    let mut at = SIGNATURE + SCREEN_DESCRIPTOR;
+    // The global colour table sits between the screen descriptor and the first
+    // block rather than being part of the block stream. Skipping it is what
+    // stops a table entry that happens to hold 0x2c from being counted as a
+    // frame — a 256-colour table has a 25% chance of containing one.
+    let packed = input[SIGNATURE + 4];
+    if packed & 0x80 != 0 {
+        let entries = 2usize << (packed & 0x07);
+        at = at.saturating_add(entries * 3);
+    }
+
+    let mut frames: u32 = 0;
+    'walk: loop {
+        let Some(&introducer) = input.get(at) else {
+            break 'walk FrameScan {
+                frames,
+                truncated: true,
+            };
+        };
+        match introducer {
+            TRAILER => {
+                break 'walk FrameScan {
+                    frames,
+                    truncated: false,
+                };
+            }
+            PADDING => at = at.saturating_add(1),
+            EXTENSION_INTRODUCER => {
+                // Introducer, label, then a sub-block chain.
+                let Some(next) = skip_sub_blocks(input, at.saturating_add(2)) else {
+                    break 'walk damaged(frames);
+                };
+                at = next;
+            }
+            IMAGE_SEPARATOR => {
+                frames = frames.saturating_add(1);
+                let Some(next) = after_image_descriptor(input, at) else {
+                    break 'walk damaged(frames);
+                };
+                at = next;
+            }
+            // Not a byte that can start a block. The stream is out of sync and
+            // every later guess about where a frame begins would be fiction.
+            _ => break 'walk damaged(frames),
         }
-        _ => 1,
+    }
+}
+
+/// A walk that stopped before the trailer, having counted this many frames.
+fn damaged(frames: u32) -> FrameScan {
+    FrameScan {
+        frames,
+        truncated: true,
+    }
+}
+
+/// Step past one image descriptor: the descriptor, an optional **local** colour
+/// table, the LZW minimum code size, then the frame's own sub-block chain.
+///
+/// The local table is the trap, and it is not a rare one. It sits inside the
+/// descriptor block, so those nine fixed bytes are not the whole block — and
+/// `image`'s own GIF encoder emits one for every frame it writes, so a walk
+/// that forgets it counts exactly one frame in an animation of four and reports
+/// a perfectly ordinary still.
+fn after_image_descriptor(input: &[u8], at: usize) -> Option<usize> {
+    /// Image descriptor introducer plus its nine bytes.
+    const DESCRIPTOR: usize = 10;
+    let end = at.checked_add(DESCRIPTOR)?;
+    // The packed byte is the last of the descriptor's nine.
+    let packed = *input.get(end.checked_sub(1)?)?;
+    let mut next = end;
+    if packed & 0x80 != 0 {
+        let entries = 2usize << (packed & 0x07);
+        next = next.checked_add(entries * 3)?;
+    }
+    // One byte of LZW minimum code size, then the frame's data.
+    skip_sub_blocks(input, next.checked_add(1)?)
+}
+
+/// Skip a chain of GIF sub-blocks, returning the offset of the byte after it.
+///
+/// Each sub-block is a length byte followed by that many bytes; a zero length
+/// ends the chain. A length that runs past the end of the buffer returns `None`
+/// rather than a position past it, which is the only way this walk can end
+/// other than at a trailer.
+fn skip_sub_blocks(input: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let len = usize::from(*input.get(at)?);
+        at = at.checked_add(1)?;
+        if len == 0 {
+            return Some(at);
+        }
+        at = at.checked_add(len)?;
+        if at > input.len() {
+            return None;
+        }
     }
 }
 

@@ -12,6 +12,7 @@
 //! * No function takes a raw pointer the caller could pass as null. Pointers
 //!   are checked and turned into an error result.
 
+use crate::animation::{AnimationOutcome, AnimationPolicy};
 use crate::error::Result;
 use crate::format::{EncodingOptions, OutputFormat};
 use crate::pipeline::Pipeline;
@@ -250,6 +251,11 @@ struct ProcessRequest {
     data_base64: String,
     #[serde(default)]
     strip_metadata: Option<bool>,
+    /// What to do with an animation the chosen format cannot hold every frame
+    /// of. Defaults to keeping the frames, or refusing the export; `first_frame`
+    /// is the explicit opt-in for a still. See `core/src/animation.rs`.
+    #[serde(default)]
+    animation: AnimationPolicy,
     #[serde(default)]
     mobile_limits: bool,
 }
@@ -271,6 +277,11 @@ struct ProcessResponse {
     quality_used: u8,
     target_met: bool,
     detected_format: OutputFormat,
+    /// What happened to this file's frames. Carried here as well as on the batch
+    /// outcome because the single-image path is what a preview calls, and a
+    /// caller must not have to decode the output to find out whether the
+    /// animation survived.
+    animation: AnimationOutcome,
 }
 
 /// Process one image. The request and the response are both JSON so the Dart side
@@ -310,6 +321,7 @@ pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> P
         },
         target: parsed.target.map(TargetBytes::new),
         limits,
+        animation: parsed.animation,
     };
     // The image travels base64-encoded inside the request envelope. An earlier
     // revision passed `raw.to_vec()` — the JSON envelope itself — as the image,
@@ -347,6 +359,7 @@ pub unsafe extern "C" fn px_process(request: *const u8, request_len: usize) -> P
                 quality_used: processed.outcome.quality_used,
                 target_met: processed.outcome.target_met,
                 detected_format: detected,
+                animation: processed.outcome.animation,
                 bytes: processed.bytes,
             })
         }
@@ -419,6 +432,9 @@ struct BatchRequest {
     /// Scan-by-scan JPEG. See `ProcessRequest::progressive`.
     #[serde(default)]
     progressive: bool,
+    /// What to do with an animation. See `ProcessRequest::animation`.
+    #[serde(default)]
+    animation: AnimationPolicy,
     target: Option<u64>,
     #[serde(default)]
     mobile_limits: bool,
@@ -473,6 +489,7 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
         } else {
             Limits::default()
         },
+        animation: parsed.animation,
     };
     let pipeline = Pipeline {
         strip_metadata: parsed.pipeline.strip_metadata,

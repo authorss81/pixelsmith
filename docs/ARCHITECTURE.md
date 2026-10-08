@@ -9,16 +9,21 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Fifteen modules, one submodule, no circular references. Dependencies point downward:
-`lib.rs` → `worker.rs` / `pipeline.rs` / `colour.rs` → `resize.rs` → `validate.rs` /
-`heic.rs` → `error.rs`. Nothing below `error.rs` knows anything exists above it.
+Sixteen modules, one submodule, no circular references. Dependencies point downward:
+`lib.rs` → `worker.rs` / `pipeline.rs` / `colour.rs` / `animation.rs` → `resize.rs`
+→ `validate.rs` / `heic.rs` → `error.rs`. Nothing below `error.rs` knows anything
+exists above it. `animation.rs` sits below `worker.rs` and above `validate.rs`
+because it needs the limits and the report the validation pass produces, while
+`validate.rs` must not need it — so the *container walk* lives in `validate.rs`
+(reading a header is `validate`'s stated job) and the *decision* lives in
+`animation.rs`.
 
 | Module | Owns | Key types |
 | --- | --- | --- |
 | `core/src/lib.rs` | The crate root: the re-export surface, the honest capability list, and the four functions that make up the plain-Rust API (decode, transform, encode, encode-to-target). | `Capabilities`, `capabilities()`, `process()`, `decode_bounded()`, `encode_fixed()`, `encode_to_target()` |
 | `core/src/error.rs` | Every failure mode in the engine, as one enum, plus the `Result<T>` alias. Nothing unwinds out of a public entry point, so a malformed file cannot take down the host process. | `Error`, `Result<T>` |
 | `core/src/format.rs` | What a format *is*: the `OutputFormat` enum, magic-byte detection, the encode dispatch, the per-format `EncodingOptions` (quality, progressive, chroma), JPEG APP1 splicing, and output-capacity estimation. Reading is broader than writing, which is normal. | `OutputFormat`, `ChromaSubsampling`, `EncodingOptions`, `detect_format()`, `encode()`, `append_exif()` |
-| `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only check, and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `validate_bytes()`, `inspect()`, `ValidateReport` |
+| `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only checks (including the GIF frame walk, which reads the container rather than decoding it), and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `check_animation()`, `validate_bytes()`, `inspect()`, `FrameScan`, `scan_gif_frames()`, `ValidateReport` |
 | `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
 | `core/src/stream.rs` | The low-peak-memory decode, behind `streaming`: decode a row at a time, resample it into the destination in the same pass. One resampling pass, one output-sized buffer. | `decode_resized()`, `working_set_bytes()`, `Axis` |
@@ -27,7 +32,8 @@ Fifteen modules, one submodule, no circular references. Dependencies point downw
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
 | `core/src/presets.rs` | The preset catalogue, grouped by intent and carrying a `category` so the UI can present tabs. Custom values are always allowed. | `Preset`, `PRESETS`, `all_presets()`, `find_preset()`, `to_pipeline()` |
-| `core/src/worker.rs` | The layer the UI actually calls: per-file work, Rayon parallelism, cancellation, ZIP output, per-file accounting, and filename sanitisation. | `Job`, `Settings`, `Outcome`, `BatchReport`, `CancelToken`, `process_one()`, `process_batch()`, `sanitise_stem()` |
+| `core/src/worker.rs` | The layer the UI actually calls: per-file work, Rayon parallelism, cancellation, ZIP output, per-file accounting, and filename sanitisation. | `Job`, `Settings`, `Outcome`, `BatchReport`, `CancelToken`, `process_one()`, `process_animation()`, `process_batch()`, `sanitise_stem()` |
+| `core/src/animation.rs` | What happens to an animation: the policy, the decision, the refusal sentence, the outcome type, and the frame-by-frame path through the pipeline. Does not re-implement GIF composition — see `docs/GIF.md`. | `AnimationPolicy`, `AnimationAction`, `AnimationOutcome`, `decide()`, `preserve()`, `refusal_note()` |
 | `core/src/ffi.rs` | The C ABI, where Rust's safety stops protecting the caller. 15 `px_*` entry points, a tagged result struct, and buffer ownership rules. | `PxBuffer`, `PxStatus`, `PxHandle`, `px_*` |
 | `core/src/ffi_abi.rs` | The same ABI as data: one declaration per entry point, proved against `ffi.rs` at compile time and rendered into the Dart declarations `app/lib/rust/bindings.dart` must contain. | `ENTRY_POINTS`, `EntryPoint`, `px_buffer_layout()`, `dart_drift()` |
 
@@ -41,7 +47,10 @@ and a one-off result cannot drift apart.
 bytes off disk
   → worker::Settings::validate  a request this build cannot carry out is refused here
   → validate::validate_bytes   input size, magic bytes, header dimensions
-                              (heic::header for HEIF, image header otherwise)
+                              (heic::header for HEIF, image header otherwise),
+                              and a GIF frame count read from the container
+  → animation::decide          what happens to the frames: keep, flatten on
+                              request, or refuse. Before a pixel is decoded.
   → lib::decode_bounded        decoder limits applied, then decode, then re-check
   → colour::apply              source space → working space, before the geometry:
                               a Cow, so an untagged or sRGB file touches no pixel
@@ -304,6 +313,7 @@ enforcement points, in the order a file meets them:
 | 6 | `worker::process_one` (`worker.rs:134`) | Runs 1–5 for every file, so the batch path cannot skip what the single-file path enforces. |
 | 7 | `ffi::px_inspect` (`ffi.rs:177`) | Selects `Limits::mobile()` when Dart passes `mobile_limits = true`. |
 | 8 | `pipeline::Pipeline::output_dimensions` | Rejects a crop rectangle that runs past the source edges, before the UI predicts a size for it. |
+| 9 | `validate::Limits::check_animation` (`validate.rs`) | The pixel budget applied to `width × height × frames` rather than per frame, before the first frame of an animation is decoded. Every resized frame is resident at once, so a per-frame check would pass all of them. |
 
 Steps 1–4 are cheap and run on a whole folder before the user commits to
 anything; step 5 is the belt to step 3's braces.
@@ -490,6 +500,44 @@ without the encoder. `is_read_only()` is the flag the UI reads, and a test
 asserts it against `format::encode` so the two cannot drift into a format the UI
 offers and the encoder refuses.
 
+## Animation
+
+`animation::AnimationPolicy` is one field on `worker::Settings` and the whole
+policy is four cells wide; `docs/GIF.md` is the argument and this is the shape.
+
+| Input | Output | `Keep` (default) | `FirstFrame` |
+| --- | --- | --- | --- |
+| Still | anything | written | written |
+| Animated | GIF | every frame, with its delay | first frame, `dropped()` reported |
+| Animated | anything else | **nothing written**, refused in a sentence | first frame, `dropped()` reported |
+
+`animation::decide` is that table, called from `worker::process_one` right after
+`validate_bytes` and **before a pixel is decoded**, so a refusal costs the header
+walk that found the frames. `animation::preserve` is the `Preserved` cell: every
+frame through `colour::apply` and `Pipeline::apply`, one resampling pass per
+frame, delays carried across, then `format::encode_frames` into one GIF.
+
+Three things about the decision that are worth knowing before changing it:
+
+* **`Keep` does not mean "refuse animations".** It means "do not lose frames
+  silently". A GIF exported as a GIF loses nothing and is not refused, so the
+  default policy is not the conservative one — it is the one that keeps the most
+  user requests working while still never dropping a frame unannounced.
+* **The frame count comes from the container, not from a decode.**
+  `validate::scan_gif_frames` walks the GIF block stream counting image
+  descriptors, so `validate_bytes` can still be cheap enough to run over a whole
+  folder. It replaced a `into_frames().count()` that *decoded every frame* during
+  that folder scan.
+* **`ValidateReport.frames_truncated` is load-bearing, not diagnostic.** It says
+  whether `frames` is a count or a lower bound, and a lower bound cannot be
+  checked against a write of the same number — so `preserve` refuses a truncated
+  animation rather than emitting one that is quietly shorter than the original.
+
+`AnimationOutcome` rides on `worker::Outcome`, on `px_batch`'s report and on
+`px_process`'s response. A refused animation is the one *failure* that reports
+its frame count, because the file is fine and the frames were read; everything
+else reports `AnimationOutcome::unknown()`.
+
 ## The FFI boundary
 
 Hostile by default. Every Dart-supplied pointer and length is checked, and every
@@ -502,7 +550,7 @@ might dereference.
 | `px_inspect(ptr, len, mobile_limits)` | bytes | `PxBuffer` — JSON `ValidateReport` |
 | `px_exif(ptr, len)` | bytes | `PxBuffer` — JSON `ExifInfo` |
 | `px_presets()` | — | `PxBuffer` — JSON preset catalogue |
-| `px_process(ptr, len)` | JSON request | `PxBuffer` — JSON result |
+| `px_process(ptr, len)` | JSON request | `PxBuffer` — JSON result, carrying `animation` as well |
 | `px_batch(ptr, len)` | JSON request | `PxBuffer` — JSON `BatchReport` |
 | `px_zip(ptr, len)` | JSON `[{name, bytes}]` | `PxBuffer` — ZIP bytes |
 | `px_buffer_free(buffer)` | `PxBuffer` | — |
@@ -873,6 +921,32 @@ named so you can check the handling rather than re-derive it.
     where no test looking at "metadata stripped" would have found it. Handled in
     `core/src/worker.rs` (`process_one`) and pinned by
     `a_p3_photo_stripped_of_its_profile_is_converted_rather_than_left_alone`.
+
+29. **A GIF image descriptor is not nine bytes of descriptor.** The packed byte at
+   its end can announce a **local colour table**, which sits inside the block
+   before the LZW minimum code size and the frame's data. The container walk in
+   `validate::scan_gif_frames` stepped straight into it on its first run and
+   counted exactly one frame in an animation of four — and `image`'s own encoder
+   emits a local table for every frame it writes, so the fixture that exposed it
+   was every fixture. The global colour table before the first block is the same
+   trap. Handled in `core/src/validate.rs` (`after_image_descriptor`, and the
+   packed check before the block walk).
+30. **A GIF's frame count is a lower bound until the trailer is found.** A file
+   whose frame data runs out mid-stream still decodes: `image`'s decoder stops at
+   end-of-file and hands back the frames it managed, which is the right behaviour
+   for a viewer and the wrong one for an exporter, because 99 frames of a
+   100-frame GIF is a successful-looking animation that is missing a frame.
+   `FrameScan::truncated` is how the walk says so and `AnimationPolicy` is what
+   acts on it. Handled in `core/src/validate.rs` (`FrameScan`) and
+   `core/src/animation.rs` (`preserve`).
+31. **`image`'s GIF encoder writes `dispose = Background` for every frame it
+   writes**, whatever the caller asked for. That is safe here only because every
+   frame this engine writes is a full composited canvas, so there is no disposal
+   method to get right — a transparent pixel in a composited frame means nothing
+   was ever painted there. Reached by hand with `encode_frame` on a sub-rectangle,
+   it would silently blank parts of the animation. Handled in
+   `core/src/animation.rs` (`preserve`) by never emitting a sub-rectangle, and
+   pinned by `an_animation_exported_as_gif_keeps_every_frame_and_its_delay`.
 
 ## Verification
 

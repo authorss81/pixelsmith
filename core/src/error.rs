@@ -83,6 +83,26 @@ pub enum Error {
     #[error("{0}")]
     ColourProfile(&'static str),
 
+    /// An animation was offered and the output format holds one picture, so
+    /// exporting it would have dropped every frame but the first. The message
+    /// is written for a person and names the frame count, what was not written
+    /// and the format that would keep them — see
+    /// [`crate::animation::Policy`].
+    ///
+    /// Its own variant because the file is fine, the frames are readable, and
+    /// the request is the thing this build will not carry out. Reporting it as a
+    /// decode failure would blame the user's file for the engine's decision.
+    #[error("{note}")]
+    AnimationRefused {
+        /// How many frames the file had, so a batch report can say so in a
+        /// field rather than only in a string.
+        frames: u32,
+        /// The sentence, built by [`crate::animation::refusal_note`] because the
+        /// useful wording is a decision about the product rather than about
+        /// this enum.
+        note: String,
+    },
+
     #[error("output could not be written: {0}")]
     Io(#[source] io::Error),
 

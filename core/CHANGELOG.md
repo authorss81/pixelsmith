@@ -9,6 +9,25 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Animated GIF: honest handling, and frame-preserving export.** An animated GIF
+  used to be decoded to its first frame and re-encoded as a still, with the
+  `has_animated` flag sitting unread on the report. Now: an animation exported as
+  a GIF keeps **every frame and its delay** (one resampling pass per frame, all of
+  them resident at once and bounded by `Limits::check_animation`), and an
+  animation exported into a format that holds one picture is **refused in a
+  sentence** rather than quietly reduced — unless the caller opts in with
+  `AnimationPolicy::FirstFrame`, which produces the still and reports how many
+  frames are not in it. `worker::Outcome.animation` carries
+  `AnimationOutcome { frames_in, frames_out, policy, action }` on every result,
+  so a caller never has to decode the output to find out whether the animation
+  survived. The argument is `docs/GIF.md`.
+- **The GIF frame count is read from the container.**
+  `validate::scan_gif_frames` walks the block stream counting image descriptors
+  instead of decoding every frame, so the folder scan `validate_bytes` performs
+  no longer materialises every animation in the folder. `ValidateReport` gains
+  `frames` and `frames_truncated`; the second is load-bearing, because a lower
+  bound cannot be checked against a write of the same number.
+
 - **Low-peak-memory decode, behind the off-by-default `streaming` feature.**
   `stream::decode_resized` decodes a row at a time and resamples it into the
   destination in the same pass, so peak memory is the output buffer plus one row

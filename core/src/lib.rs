@@ -7,6 +7,7 @@
 //! 4. **Predictable pipeline.** Transform order is fixed: crop -> orient -> resize.
 //!    See [`pipeline`].
 
+pub mod animation;
 pub mod colour;
 pub mod error;
 pub mod exif;
@@ -24,13 +25,14 @@ pub mod target;
 pub mod validate;
 pub mod worker;
 
+pub use animation::{AnimationAction, AnimationOutcome, AnimationPolicy};
 pub use colour::{ColourOptions, ColourOutcome, ColourProfile, ColourSpace};
 pub use error::{Error, Result};
 pub use format::{ChromaSubsampling, EncodingOptions, OutputFormat, detect_format};
 pub use pipeline::{CropSpec, FitMode, Orientation, Pipeline, ResampleFilter, ResizeSpec};
 pub use presets::{Preset, all_presets, find_preset};
 pub use target::TargetBytes;
-pub use validate::{Limits, ValidateReport, inspect, validate_bytes};
+pub use validate::{FrameScan, Limits, ValidateReport, inspect, validate_bytes};
 pub use worker::{BatchReport, CancelToken, Job, Outcome, Settings, process_batch, process_one};
 
 /// Crate version, surfaced through the FFI so the UI can prove which engine it

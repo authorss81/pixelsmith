@@ -856,6 +856,68 @@ pub(crate) fn to_rgba8(img: &image::DynamicImage) -> image::RgbaImage {
 /// Pre-size the output buffer so a 20 MP JPEG does not realloc a dozen times.
 fn estimate_capacity(img: &image::DynamicImage) -> usize {
     let px = img.width() as usize * img.height() as usize;
+    estimate_pixels(px)
+}
+
+/// Encode every frame of an animation into one container.
+///
+/// GIF is the only encoder in this tree that takes more than one frame, so every
+/// other format is refused *by name* rather than quietly given the first one.
+/// That refusal is the reason this function exists separately from
+/// [`encode`]: the alternative is a caller with a `Vec<Frame>` handing the
+/// still encoder its head element and believing it wrote an animation, which is
+/// the exact failure [`crate::animation`] exists to make impossible.
+///
+/// No `EncodingOptions` argument, because GIF has none of the three: it is
+/// palette-quantised, has no scan order and stores chroma at full resolution.
+/// [`OutputFormat::is_lossless`] already reports that, so a caller that wants to
+/// offer the sliders has already been told not to.
+pub fn encode_frames(frames: &[image::Frame], format: OutputFormat) -> Result<Vec<u8>> {
+    if format != OutputFormat::Gif {
+        return Err(Error::UnsupportedFormat(
+            "this format holds one picture, so it cannot carry an animation. Choose GIF \
+             output to keep every frame",
+        ));
+    }
+    if frames.is_empty() {
+        return Err(Error::Encode(image::ImageError::IoError(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "an animation with no frames in it cannot be encoded",
+            ),
+        )));
+    }
+
+    let pixels: usize = frames
+        .iter()
+        .map(|f| {
+            let b = f.buffer();
+            b.width() as usize * b.height() as usize
+        })
+        .sum();
+    let mut out: Vec<u8> = Vec::with_capacity(estimate_pixels(pixels));
+    let mut cursor = std::io::Cursor::new(&mut out);
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut cursor);
+        for frame in frames {
+            encoder.encode_frame(frame.clone()).map_err(Error::Encode)?;
+        }
+        // The `gif` crate writes its trailer from `Drop`, and this writer is a
+        // `Vec` cursor, which cannot fail — so the fallback branch of that
+        // `Drop` (a panic on an I/O error) is unreachable here. Scoped so the
+        // encoder, and therefore the trailer, is finished before the cursor is
+        // read back out.
+    }
+    Ok(out)
+}
+
+/// A capacity hint from a pixel count, for the writers that append to a `Vec`.
+///
+/// Split out of [`estimate_capacity`] so the animation path can total the frames
+/// it is about to write rather than sizing for the first one. A hint, not a
+/// limit: over-reserving wastes memory and under-reserving costs one
+/// reallocation.
+fn estimate_pixels(px: usize) -> usize {
     // Empirically ~0.6 bytes/px for q75 JPEG; PNG is worst case 4 bytes/px.
     (px / 2).clamp(64 * 1024, 64 * 1024 * 1024)
 }
