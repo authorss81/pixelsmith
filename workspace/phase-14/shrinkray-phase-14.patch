@@ -1,0 +1,421 @@
+diff --git a/lib/rust/engine.dart b/lib/rust/engine.dart
+index cd5b9d9..5a1c697 100644
+--- a/lib/rust/engine.dart
++++ b/lib/rust/engine.dart
+@@ -57,8 +57,12 @@ final class PixelSmithEngine {
+   /// [mobileLimits] picks the tighter phone profile. The app sets it from the
+   /// device rather than hard-coding it, so a tablet is not held to a phone's
+   /// ceiling.
+-  Future<ValidateReport> inspect(List<int> bytes, {bool mobileLimits = false}) =>
+-      Isolate.run(() => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)));
++  Future<ValidateReport> inspect(
++    List<int> bytes, {
++    bool mobileLimits = false,
++  }) => Isolate.run(
++    () => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)),
++  );
+ 
+   /// The engine's own view of `PxBuffer`'s layout, from the loaded library.
+   ///
+@@ -108,6 +112,7 @@ final class PixelSmithEngine {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    BatchPolicy policy = BatchPolicy.all,
+   }) {
+     final request = Requests.batch(
+       pipeline: pipeline,
+@@ -117,6 +122,7 @@ final class PixelSmithEngine {
+       targetBytes: targetBytes,
+       cancelHandle: cancelHandle,
+       mobileLimits: mobileLimits,
++      policy: policy,
+     );
+     return Isolate.run(() => _batchStatic(request));
+   }
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 77c9800..8585901 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -328,6 +328,152 @@ final class ProcessResult {
+ }
+ 
+ /// Per-file outcome in a batch. Mirrors `Outcome` in `core/src/worker.rs`.
++/// Why a file produced no output on purpose.
++///
++/// Mirrors `SkipReason` in `core/src/worker.rs`, which carries
++/// `#[serde(tag = "kind", rename_all = "snake_case")]`. A skip is not a failure:
++/// the engine read the file, decided, and can say why. What it must never do is
++/// decide quietly, which is why this is one type per answer rather than a
++/// boolean.
++sealed class SkipReason {
++  const SkipReason();
++
++  /// Which answer this is, matching the engine's `kind` tag.
++  String get kind;
++
++  /// A sentence for the person whose folder this is, built here rather than
++  /// parsed out of an error string.
++  String get note;
++
++  static SkipReason fromJson(Map<String, Object?> json) {
++    final String kind = json['kind'] as String;
++    return switch (kind) {
++      'duplicate' => SkipReasonDuplicate(json['of'] as String),
++      'unreadable' => const SkipReasonUnreadable(),
++      'unsupported_format' => SkipReasonUnsupportedFormat(
++        json['format'] as String,
++      ),
++      'too_large' => SkipReasonTooLarge(
++        limit: (json['limit'] as num).toInt(),
++        actual: (json['actual'] as num).toInt(),
++        pixels: json['unit'] == 'pixels',
++      ),
++      'would_upscale' => SkipReasonWouldUpscale(
++        requestedWidth: (json['requested'] as List)[0] as int,
++        requestedHeight: (json['requested'] as List)[1] as int,
++        actualWidth: (json['actual'] as List)[0] as int,
++        actualHeight: (json['actual'] as List)[1] as int,
++      ),
++      // An engine newer than this app can name an answer we do not know. Refusing
++      // to parse would turn "one new reason" into a crash on every file in the
++      // folder, which is exactly the sort of small contract drift the engine's
++      // capability list is meant to prevent.
++      _ => const SkipReasonUnreadable(),
++    };
++  }
++}
++
++/// Another file in this batch already exported this picture. `of` is that file's
++/// name.
++final class SkipReasonDuplicate extends SkipReason {
++  const SkipReasonDuplicate(this.of);
++  final String of;
++  @override
++  String get kind => 'duplicate';
++  @override
++  String get note => 'the same picture is already exported as $of';
++}
++
++/// The bytes are not a picture this build can open, or it would not decode.
++final class SkipReasonUnreadable extends SkipReason {
++  const SkipReasonUnreadable();
++  @override
++  String get kind => 'unreadable';
++  @override
++  String get note =>
++      'this file could not be read as an image; it may be damaged, or not the '
++      'kind of file its name says';
++}
++
++/// A real image in a container this build cannot decode. The file is fine; the
++/// limitation is the engine's.
++///
++/// The format is carried twice, as the name the engine sent and as the enum value
++/// if this app knows it. `OutputFormat.fromJson` throws on a name it does not
++/// have — deliberately, so a request cannot be misread — which is the right
++/// behaviour for a *request* and the wrong one here: an engine that starts
++/// reporting HEIC skips against an app that has not been taught HEIC would crash
++/// every report in the folder rather than render one line of it.
++final class SkipReasonUnsupportedFormat extends SkipReason {
++  const SkipReasonUnsupportedFormat(this.formatName) : format = null;
++
++  /// Parses when this app knows the format, and leaves [format] null when it does
++  /// not. Never throws.
++  factory SkipReasonUnsupportedFormat.known(String name) {
++    for (final candidate in OutputFormat.values) {
++      if (candidate.name == name) {
++        return SkipReasonUnsupportedFormat._(name, candidate);
++      }
++    }
++    return SkipReasonUnsupportedFormat(name);
++  }
++
++  const SkipReasonUnsupportedFormat._(this.formatName, this.format);
++
++  final String formatName;
++
++  /// Null when the engine names a format this app's enum does not have yet.
++  final OutputFormat? format;
++
++  @override
++  String get kind => 'unsupported_format';
++  @override
++  String get note =>
++      'this build cannot open $formatName files; convert them to JPEG, PNG, '
++      'WebP or GIF, or use a build with that decoder';
++}
++
++/// Over a ceiling the engine's limit profile states. `pixels` says which.
++final class SkipReasonTooLarge extends SkipReason {
++  const SkipReasonTooLarge({
++    required this.limit,
++    required this.actual,
++    required this.pixels,
++  });
++  final int limit;
++  final int actual;
++  final bool pixels;
++  @override
++  String get kind => 'too_large';
++  @override
++  String get note => pixels
++      ? 'this picture is $actual pixels once decoded and this device accepts up '
++            'to $limit'
++      : 'this file is $actual bytes and this device accepts up to $limit';
++}
++
++/// The request asked for a bigger picture than the file has, and the engine
++/// refused to invent the detail.
++final class SkipReasonWouldUpscale extends SkipReason {
++  const SkipReasonWouldUpscale({
++    required this.requestedWidth,
++    required this.requestedHeight,
++    required this.actualWidth,
++    required this.actualHeight,
++  });
++  final int requestedWidth;
++  final int requestedHeight;
++  final int actualWidth;
++  final int actualHeight;
++  @override
++  String get kind => 'would_upscale';
++  @override
++  String get note =>
++      'this picture is ${actualWidth}x$actualHeight and the request asked for '
++      '${requestedWidth}x$requestedHeight; enlarging it adds no detail, so it '
++      'was left alone';
++}
++
+ final class BatchOutcome {
+   const BatchOutcome({
+     required this.id,
+@@ -340,6 +486,7 @@ final class BatchOutcome {
+     required this.qualityUsed,
+     required this.targetMet,
+     required this.error,
++    this.skipped,
+   });
+ 
+   final String id;
+@@ -355,7 +502,13 @@ final class BatchOutcome {
+   /// Set when this file failed. Every failure carries a reason.
+   final String? error;
+ 
+-  bool get ok => error == null;
++  /// Set when this file was read and then deliberately not written, with the
++  /// reason. A skip is a third thing: not a success, because there is no file, and
++  /// not a failure, because nothing went wrong. Both are present-or-absent and
++  /// never both set, so a report cannot claim to have written a file it skipped.
++  final SkipReason? skipped;
++
++  bool get ok => error == null && skipped == null;
+ 
+   static BatchOutcome fromJson(Map<String, Object?> json) => BatchOutcome(
+     id: json['id'] as String,
+@@ -368,9 +521,54 @@ final class BatchOutcome {
+     qualityUsed: (json['quality_used'] as num).toInt(),
+     targetMet: json['target_met'] as bool,
+     error: json['error'] as String?,
++    skipped: json['skipped'] == null
++        ? null
++        : SkipReason.fromJson((json['skipped'] as Map).cast<String, Object?>()),
+   );
+ }
+ 
++/// What a batch does with a file it will not process.
++///
++/// Mirrors `BatchPolicy` in `core/src/worker.rs`. The three answers are
++/// independent: a caller may want duplicates collapsed and still want a corrupt
++/// file reported as a failure, or the reverse. The engine's default is all three
++/// on, because for a folder the alternatives are silently dropping a file and
++/// silently failing one.
++final class BatchPolicy {
++  const BatchPolicy({
++    this.deduplicate = true,
++    this.skipUnprocessable = true,
++    this.skipUpscales = true,
++  });
++
++  /// Collapse a file whose content is already exported.
++  final bool deduplicate;
++
++  /// Report a file that cannot be processed at all as a skip with a reason rather
++  /// than as a failure.
++  final bool skipUnprocessable;
++
++  /// Report a file whose requested geometry is larger than the picture as a skip
++  /// rather than writing it out at its own size.
++  final bool skipUpscales;
++
++  /// Every answer on, which is also what an engine predating this model means.
++  static const BatchPolicy all = BatchPolicy();
++
++  /// Every answer off: report everything as a failure.
++  static const BatchPolicy none = BatchPolicy(
++    deduplicate: false,
++    skipUnprocessable: false,
++    skipUpscales: false,
++  );
++
++  Map<String, Object?> toJson() => {
++    'deduplicate': deduplicate,
++    'skip_unprocessable': skipUnprocessable,
++    'skip_upscales': skipUpscales,
++  };
++}
++
+ /// A batch report. Mirrors `BatchReport` in `core/src/worker.rs`.
+ final class BatchReport {
+   const BatchReport({required this.outcomes, required this.cancelled});
+@@ -379,7 +577,17 @@ final class BatchReport {
+   final bool cancelled;
+ 
+   int get succeeded => outcomes.where((o) => o.ok).length;
+-  int get failed => outcomes.where((o) => !o.ok).length;
++
++  /// Files the engine read and then declined to write. Its own number rather than
++  /// `outcomes.length - succeeded`, because a caller showing "370 of 400" needs to
++  /// be able to say *why* the other thirty are not failures.
++  int get skipped => outcomes.where((o) => o.skipped != null).length;
++
++  int get failed => outcomes.where((o) => !o.ok && o.skipped == null).length;
++
++  /// Of the skipped files, how many were pictures this batch already exported.
++  int get duplicates =>
++      outcomes.where((o) => o.skipped is SkipReasonDuplicate).length;
+ 
+   static BatchReport fromJson(Map<String, Object?> json) => BatchReport(
+     outcomes: (json['outcomes'] as List)
+@@ -449,6 +657,7 @@ abstract final class Requests {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    BatchPolicy policy = BatchPolicy.all,
+   }) => jsonEncode({
+     ...pipeline.toJson(),
+     'format': format.toJson(),
+@@ -456,6 +665,7 @@ abstract final class Requests {
+     'target': targetBytes,
+     'mobile_limits': mobileLimits,
+     'cancel': cancelHandle,
++    'policy': policy.toJson(),
+     'files': [
+       for (final f in files)
+         {
+diff --git a/test/models_test.dart b/test/models_test.dart
+index 949c83d..0c3b2c0 100644
+--- a/test/models_test.dart
++++ b/test/models_test.dart
+@@ -117,29 +117,99 @@ void main() {
+ 
+   group('BatchReport', () {
+     test('counts successes and failures', () {
+-      BatchOutcome outcome({required String? error}) => BatchOutcome(
+-        id: '1',
+-        name: 'a.jpg',
+-        outputName: 'a.jpg',
+-        inputBytes: 10,
+-        outputBytes: 5,
+-        width: 10,
+-        height: 10,
+-        qualityUsed: 80,
+-        targetMet: true,
+-        error: error,
+-      );
++      BatchOutcome outcome({required String? error, SkipReason? skipped}) =>
++          BatchOutcome(
++            id: '1',
++            name: 'a.jpg',
++            outputName: 'a.jpg',
++            inputBytes: 10,
++            outputBytes: 5,
++            width: 10,
++            height: 10,
++            qualityUsed: 80,
++            targetMet: true,
++            error: error,
++            skipped: skipped,
++          );
+       final report = BatchReport(
+         outcomes: [
+           outcome(error: null),
+           outcome(error: 'broken'),
++          outcome(error: null, skipped: SkipReasonDuplicate('a.jpg')),
+         ],
+         cancelled: false,
+       );
+       expect(report.succeeded, 1);
+       expect(report.failed, 1);
++      // A skip is a third category: counting it as a failure would report a
++      // deliberate decision as an error.
++      expect(report.skipped, 1);
++      expect(report.duplicates, 1);
+       expect(report.outcomes.first.ok, isTrue);
++      expect(report.outcomes[1].ok, isFalse);
+       expect(report.outcomes.last.ok, isFalse);
++      expect(report.outcomes.last.skipped!.note, contains('a.jpg'));
++    });
++
++    test('parses every skip reason the engine can send', () {
++      final reasons = <Map<String, Object?>>[
++        {'kind': 'duplicate', 'of': 'one.jpg'},
++        {'kind': 'unreadable'},
++        // `avif` rather than `heic`: this app's `OutputFormat` enum does not have
++        // HEIC until phase-06's patch lands, and naming a format it cannot
++        // represent would make this fail for a reason that has nothing to do with
++        // the skip reason it is testing.
++        {'kind': 'unsupported_format', 'format': 'avif'},
++        {'kind': 'too_large', 'limit': 1000, 'actual': 2000, 'unit': 'bytes'},
++        {
++          'kind': 'too_large',
++          'limit': 40000000,
++          'actual': 60000000,
++          'unit': 'pixels',
++        },
++        {
++          'kind': 'would_upscale',
++          'requested': [1920, 1080],
++          'actual': [640, 480],
++        },
++      ];
++      for (final json in reasons) {
++        final reason = SkipReason.fromJson(json);
++        expect(reason.kind, json['kind']);
++        // Hard rule 9 on this side too: every reason reaches the user as a
++        // sentence, not as a code.
++        expect(
++          reason.note.length,
++          greaterThan(20),
++          reason: json['kind'] as String,
++        );
++        expect(reason.note, isNot(contains('Error:')));
++      }
++      // An engine newer than this app must not crash the whole report, in either
++      // direction: an answer we have never heard of, and an answer we know that
++      // names a format this app's enum lacks.
++      expect(SkipReason.fromJson({'kind': 'something_new'}).kind, 'unreadable');
++      final unknownFormat =
++          SkipReason.fromJson({'kind': 'unsupported_format', 'format': 'heic'})
++              as SkipReasonUnsupportedFormat;
++      expect(unknownFormat.formatName, 'heic');
++      expect(unknownFormat.format, isNull);
++      expect(unknownFormat.note, contains('heic'));
++      expect(
++        SkipReasonUnsupportedFormat.known('avif').format,
++        OutputFormat.avif,
++      );
++    });
++
++    test('the default batch policy is every answer on', () {
++      final json = BatchPolicy.all.toJson();
++      expect(json['deduplicate'], isTrue);
++      expect(json['skip_unprocessable'], isTrue);
++      expect(json['skip_upscales'], isTrue);
++      final none = BatchPolicy.none.toJson();
++      expect(none['deduplicate'], isFalse);
++      expect(none['skip_unprocessable'], isFalse);
++      expect(none['skip_upscales'], isFalse);
+     });
+   });
+ }

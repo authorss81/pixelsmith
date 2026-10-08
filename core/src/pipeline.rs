@@ -275,6 +275,48 @@ impl Pipeline {
 
         Ok((w, h))
     }
+
+    /// The size the request asked for, when the pipeline would not deliver it and
+    /// nothing else about the file would change anyway. `None` in every other
+    /// case.
+    ///
+    /// Four conditions, each of which has to hold for the answer to be `Some`:
+    ///
+    /// * there is a resize at all, since without one nothing was asked;
+    /// * the resolved output is the source's own size, so the geometry did not
+    ///   change;
+    /// * no crop and no orientation transform — either is real work even when the
+    ///   dimensions come out the same, which is what a square source with a
+    ///   quarter turn does; and
+    /// * the request, read with `no_upscale` ignored, asked for more than it got.
+    ///
+    /// A batch uses this to decide between writing a file and reporting a skip,
+    /// so it is deliberately `None` in every case where writing the file would
+    /// still do something the user asked for. The argument for treating the
+    /// remaining case as a skip rather than a warning is in
+    /// `docs/ARCHITECTURE.md`.
+    pub fn refused_upscale(&self, src_w: u32, src_h: u32) -> Result<Option<(u32, u32)>> {
+        if self.resize.is_none() {
+            return Ok(None);
+        }
+        if self.crop.is_some() || self.orientation.is_some_and(Orientation::needs_transform) {
+            return Ok(None);
+        }
+        if self.output_dimensions(src_w, src_h)? != (src_w, src_h) {
+            return Ok(None);
+        }
+        let mut unclamped = self.clone();
+        unclamped.resize = self.resize.map(|spec| ResizeSpec {
+            no_upscale: false,
+            ..spec
+        });
+        let (wanted_w, wanted_h) = unclamped.output_dimensions(src_w, src_h)?;
+        if wanted_w > src_w || wanted_h > src_h {
+            Ok(Some((wanted_w, wanted_h)))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 impl ResizeSpec {

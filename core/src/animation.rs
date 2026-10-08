@@ -762,9 +762,19 @@ mod tests {
             },
             crate::worker::Job {
                 id: "3".into(),
+                // A *different* picture from the one above. Two solid black
+                // buffers used to be interchangeable here because a batch had no
+                // reason to compare them; phase-14 deduplicates on content, so two
+                // identical pictures in one batch are one output with a reason, and
+                // a fixture that stopped being distinct would stop testing the
+                // refusal this test is about.
                 name: "b.jpg".into(),
                 bytes: crate::encode_fixed(
-                    &image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 24)),
+                    &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                        32,
+                        24,
+                        image::Rgb([17, 200, 90]),
+                    )),
                     OutputFormat::Jpeg,
                     EncodingOptions::default().with_quality(95),
                 )
@@ -775,6 +785,7 @@ mod tests {
             &jobs,
             &Pipeline::new(),
             &settings(OutputFormat::Jpeg),
+            &crate::worker::BatchPolicy::default(),
             &crate::worker::CancelToken::new(),
         );
         assert_eq!(report.succeeded(), 2);

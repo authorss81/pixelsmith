@@ -140,6 +140,32 @@ pub enum Error {
     #[error("operation was cancelled")]
     Cancelled,
 
+    /// Another file in the same batch already exported this picture, so this one
+    /// was not written.
+    ///
+    /// An error rather than a value because there are no bytes to hand back and
+    /// the *batch* is where the decision makes sense: `worker::process_batch`
+    /// turns it into a `SkipReason::Duplicate` naming the file that held the key,
+    /// and the single-image path never produces it because nothing is deduped
+    /// when there is only one file.
+    #[error("the same picture is already exported as {of}")]
+    Duplicate { of: String },
+
+    /// The request asked for a bigger picture than this file has and the
+    /// pipeline refused to invent the detail, so there was nothing to write.
+    ///
+    /// Carries both sizes because "would upscale" on its own is a half-sentence:
+    /// a user needs to see that they asked for 1920 and the photo is 800.
+    #[error(
+        "this picture is {actual_width}x{actual_height} and the request asked for {requested_width}x{requested_height}; enlarging adds no detail"
+    )]
+    WouldUpscale {
+        requested_width: u32,
+        requested_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+
     /// A sandboxed decode failed. The message is already written for a person:
     /// it names what happened to the file and what the limit was, because the
     /// alternative is surfacing a child's exit status or a Rust panic string to

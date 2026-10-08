@@ -81,6 +81,168 @@ impl Settings {
     }
 }
 
+/// What the numbers in a [`SkipReason::TooLarge`] are counting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeUnit {
+    Bytes,
+    Pixels,
+}
+
+/// Why a file produced no output on purpose.
+///
+/// A skip is not a failure and not a crash: the engine read the file, decided,
+/// and can say why in a sentence ([`SkipReason::note`]). What it must never do
+/// is decide quietly. A folder of 400 that turns into 370 with nothing to show
+/// for the other thirty is the one answer hard rule 9 forbids, and it is the
+/// reason this is an enum with one variant per answer rather than a boolean.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SkipReason {
+    /// Another file in this batch already exported this picture. `of` is that
+    /// file's name, so the report says which one was kept — and not which one
+    /// should have been: under parallelism either may win the race.
+    Duplicate { of: String },
+    /// The bytes are not a picture this build can open, or the picture in them
+    /// would not decode. Not the engine's fault and not the format's: the file
+    /// is damaged, or it is not the image its name claims.
+    Unreadable,
+    /// A real image in a container this build cannot decode. The user's file is
+    /// fine — the limitation is ours, and `format` names it so the report can
+    /// point at the capability flag that says so.
+    UnsupportedFormat { format: OutputFormat },
+    /// Over a ceiling the limit profile states. `unit` says which: the input
+    /// byte limit, or the decoded pixel budget, which is the same idea applied to
+    /// the picture rather than to the file it arrived in.
+    TooLarge {
+        limit: u64,
+        actual: u64,
+        unit: SizeUnit,
+    },
+    /// The request asks for a bigger picture than the file has and the pipeline
+    /// refused to invent the detail. See
+    /// [`crate::pipeline::Pipeline::refused_upscale`] and the argument for it in
+    /// `docs/ARCHITECTURE.md`.
+    WouldUpscale {
+        /// What the request asked for, which the pipeline would not deliver.
+        requested: (u32, u32),
+        /// What the file actually is.
+        actual: (u32, u32),
+    },
+}
+
+impl SkipReason {
+    /// A sentence for the person whose folder this is.
+    ///
+    /// Written per variant rather than from a template, because the two cases
+    /// that look alike need different next steps: a file that is not an image
+    /// needs nothing from the user, while one this build cannot open is our
+    /// limitation and has to say which one.
+    pub fn note(&self) -> String {
+        match self {
+            Self::Duplicate { of } => {
+                format!("the same picture is already exported as {of}")
+            }
+            Self::Unreadable => {
+                "this file could not be read as an image; it may be damaged, or not the \
+                 kind of file its name says"
+                    .to_string()
+            }
+            Self::UnsupportedFormat { format } => format!(
+                "this build cannot open {format:?} files; convert them to JPEG, PNG, WebP \
+                 or GIF, or use a build with that decoder"
+            ),
+            Self::TooLarge {
+                limit,
+                actual,
+                unit,
+            } => match unit {
+                SizeUnit::Bytes => {
+                    format!("this file is {actual} bytes and this device accepts up to {limit}")
+                }
+                SizeUnit::Pixels => format!(
+                    "this picture is {actual} pixels once decoded and this device accepts \
+                     up to {limit}"
+                ),
+            },
+            Self::WouldUpscale { requested, actual } => format!(
+                "this picture is {}x{} and the request asked for {}x{}; enlarging it adds \
+                 no detail, so it was left alone",
+                actual.0, actual.1, requested.0, requested.1
+            ),
+        }
+    }
+
+    /// Whether this is the case the phase prompt opens with: a picture this
+    /// batch already has.
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, Self::Duplicate { .. })
+    }
+
+    /// Which variant this is, ignoring the detail.
+    ///
+    /// [`BatchReport::skip_reasons`] groups on this, because the detail is what
+    /// differs between two duplicates — each names a different file that held the
+    /// key — and a summary that reads "30 duplicates" is the thing a report is
+    /// for. Grouping on the whole value would produce thirty groups of one.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Duplicate { .. } => "duplicate",
+            Self::Unreadable => "unreadable",
+            Self::UnsupportedFormat { .. } => "unsupported_format",
+            Self::TooLarge { .. } => "too_large",
+            Self::WouldUpscale { .. } => "would_upscale",
+        }
+    }
+}
+
+/// What a batch does with a file it will not process.
+///
+/// A field rather than a mode, because the three answers are independent: a
+/// caller may want duplicates collapsed and still want a corrupt file reported
+/// as a failure, or the reverse. Every one of them defaults to on, because the
+/// default for *this* function — a folder of many files — is the one where
+/// quietly dropping or quietly failing are both worse.
+///
+/// None of it applies to [`process_one`], which has no batch to reason about:
+/// a user who picks one file and gets an error is being told the truth about
+/// that file, and a folder is a different question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BatchPolicy {
+    /// Collapse a file whose content is already exported. See
+    /// [`crate::dedupe`].
+    pub deduplicate: bool,
+    /// Report a file that cannot be processed at all — not an image, damaged, or
+    /// over a ceiling — as a skip with a reason rather than as a failure.
+    pub skip_unprocessable: bool,
+    /// Report a file whose requested geometry is larger than the picture as a
+    /// skip rather than writing it out at its own size. See
+    /// [`crate::pipeline::Pipeline::refused_upscale`].
+    pub skip_upscales: bool,
+}
+
+impl Default for BatchPolicy {
+    fn default() -> Self {
+        Self {
+            deduplicate: true,
+            skip_unprocessable: true,
+            skip_upscales: true,
+        }
+    }
+}
+
+impl BatchPolicy {
+    /// Every answer off: report everything as a failure, as a caller that wants
+    /// to handle its own reporting would.
+    pub fn report_everything() -> Self {
+        Self {
+            deduplicate: false,
+            skip_unprocessable: false,
+            skip_upscales: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub id: String,
@@ -109,12 +271,66 @@ pub struct Outcome {
     /// decoding the output and without parsing the error string. A failed file
     /// carries [`AnimationOutcome::unknown`], which claims nothing.
     pub animation: AnimationOutcome,
+    /// Why no file was written, when no file was written on purpose.
+    ///
+    /// Present on every outcome and `None` whenever something was written, so a
+    /// caller never has to infer it from an absent error: a skip is not a
+    /// failure, and a batch report that conflated the two would report a
+    /// deliberate decision as an error.
+    pub skipped: Option<SkipReason>,
     pub error: Option<String>,
 }
 
 impl Outcome {
+    /// True when a file was written. A skip is not a success and not a failure:
+    /// it is the third thing, and `ok()` says "there is a file".
     pub fn ok(&self) -> bool {
-        self.error.is_none()
+        self.error.is_none() && self.skipped.is_none()
+    }
+
+    /// An outcome for a file the engine read and then declined to write.
+    ///
+    /// Every field a written file would have carried is at its "nothing happened"
+    /// value — zero bytes, no dimensions, no output name — because reporting a
+    /// size for a file that does not exist is the kind of small wrong number a
+    /// UI cannot tell apart from a right one.
+    pub fn skipped(job: &Job, reason: SkipReason) -> Self {
+        Self {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            output_name: String::new(),
+            input_bytes: job.bytes.len(),
+            output_bytes: 0,
+            width: 0,
+            height: 0,
+            // No quality was applied to nothing, which is what zero has meant
+            // everywhere else on this struct.
+            quality_used: 0,
+            target_met: false,
+            colour: ColourOutcome::unknown(),
+            animation: AnimationOutcome::unknown(),
+            skipped: Some(reason),
+            error: None,
+        }
+    }
+
+    /// An outcome for a file the engine could not process at all.
+    pub fn failed(job: &Job, error: &Error, animation: AnimationOutcome) -> Self {
+        Self {
+            id: job.id.clone(),
+            name: job.name.clone(),
+            output_name: String::new(),
+            input_bytes: job.bytes.len(),
+            output_bytes: 0,
+            width: 0,
+            height: 0,
+            quality_used: 0,
+            target_met: false,
+            colour: ColourOutcome::unknown(),
+            animation,
+            skipped: None,
+            error: Some(error.to_string()),
+        }
     }
 
     pub fn saved_percent(&self) -> f64 {
@@ -137,7 +353,46 @@ impl BatchReport {
     }
 
     pub fn failed(&self) -> usize {
-        self.outcomes.iter().filter(|o| !o.ok()).count()
+        self.outcomes
+            .iter()
+            .filter(|o| !o.ok() && o.skipped.is_none())
+            .count()
+    }
+
+    /// Files the engine read and then chose not to write, each with a reason.
+    ///
+    /// Its own number rather than `outcomes.len() - succeeded() - failed()`,
+    /// because a caller showing "370 of 400" needs to be able to say *why* the
+    /// other thirty are not failures, and a subtraction cannot.
+    pub fn skipped(&self) -> usize {
+        self.outcomes.iter().filter(|o| o.skipped.is_some()).count()
+    }
+
+    /// Of the skipped files, how many were pictures this batch had already
+    /// exported. The headline number for the case this phase exists for: 370
+    /// written out of 400 offered.
+    pub fn duplicates(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.skipped, Some(SkipReason::Duplicate { .. })))
+            .count()
+    }
+
+    /// Every kind of skip that occurred, with how many files carried it and one
+    /// representative reason, so a report can be summarised rather than
+    /// re-derived by the UI.
+    pub fn skip_reasons(&self) -> Vec<(SkipReason, usize)> {
+        let mut out: Vec<(SkipReason, usize)> = Vec::new();
+        for reason in self.outcomes.iter().filter_map(|o| o.skipped.clone()) {
+            match out
+                .iter_mut()
+                .find(|(known, _)| known.kind() == reason.kind())
+            {
+                Some((_, count)) => *count += 1,
+                None => out.push((reason, 1)),
+            }
+        }
+        out
     }
 
     pub fn input_bytes(&self) -> usize {
@@ -178,7 +433,22 @@ pub struct Processed {
 
 /// Process a single image. This is the unit of work both the single-image and
 /// batch paths use, so a batch result and a one-off result cannot diverge.
+///
+/// Called without a [`BatchContext`], because a batch is the only place where
+/// "this file is not worth writing" is a question with an answer: with one file
+/// on screen the honest response to anything the engine cannot do is to say so
+/// and fail. [`process_batch`] supplies the context and the same code runs.
 pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Result<Processed> {
+    process_one_within(job, pipeline, settings, None)
+}
+
+/// Shared by [`process_one`] and [`process_batch`].
+fn process_one_within(
+    job: &Job,
+    pipeline: &Pipeline,
+    settings: &Settings,
+    batch: Option<&BatchContext>,
+) -> Result<Processed> {
     // A request this build cannot carry out is refused before anything is
     // decoded, so the user gets a sentence about their settings rather than a
     // file that quietly misses the ceiling they asked for.
@@ -191,6 +461,22 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // this call, because it is the header check that makes row-at-a-time decoding
     // safe.
     let report = crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
+
+    // Whether the request asks for a bigger picture than this file is, decided
+    // from the header alone — no decode, and no encode, to find out. Inside a
+    // batch that is a skip with a reason; for a single file it is not a question
+    // at all, so this arm does not exist there.
+    if let Some(ctx) = batch
+        && ctx.policy.skip_upscales
+        && let Some((wanted_w, wanted_h)) = pipeline.refused_upscale(report.width, report.height)?
+    {
+        return Err(Error::WouldUpscale {
+            requested_width: wanted_w,
+            requested_height: wanted_h,
+            actual_width: report.width,
+            actual_height: report.height,
+        });
+    }
 
     // What happens to the frames is decided before a pixel is decoded, so a
     // refusal costs the header walk that found them and nothing more. Three
@@ -207,7 +493,7 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     let options = settings.encoding.with_chroma(pipeline.chroma_subsampling);
 
     if animation.is_preserved() {
-        return process_animation(job, pipeline, settings, &report, animation);
+        return process_animation(job, pipeline, settings, &report, animation, batch);
     }
 
     let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
@@ -219,6 +505,21 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // path allocates nothing — see `colour::apply`.
     let (working_colour, colour) =
         crate::colour::apply(&decoded, &report.colour, pipeline.colour, settings.format)?;
+
+    // The duplicate check sits here, between the decode and the geometry, for
+    // two reasons. It costs nothing extra: the picture is already in hand, and
+    // the key is a row-at-a-time hash of it rather than a second decode. And it
+    // is after the colour conversion, so a Display-P3 copy of a photo and an
+    // sRGB copy of it are one picture — which is what a user means by "the same
+    // photo" — rather than two, because from here on they are the same bytes.
+    if let Some(ctx) = batch
+        && ctx.policy.deduplicate
+    {
+        let key = crate::dedupe::ContentKey::from_pixels(&working_colour, pipeline, settings);
+        if let Some(first) = ctx.dedup.claim(key, &job.name) {
+            return Err(Error::Duplicate { of: first });
+        }
+    }
 
     // Behind `streaming`: decode straight into the resized destination instead of
     // materialising the source first. Chosen here rather than inside the pipeline
@@ -313,6 +614,7 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         target_met,
         colour,
         animation,
+        skipped: None,
         error: None,
     };
     Ok(Processed { outcome, bytes })
@@ -335,6 +637,7 @@ fn process_animation(
     settings: &Settings,
     report: &crate::validate::ValidateReport,
     animation: AnimationOutcome,
+    batch: Option<&BatchContext>,
 ) -> Result<Processed> {
     let preserved = animation::preserve(
         &job.bytes,
@@ -346,6 +649,19 @@ fn process_animation(
     // `preserve` refuses rather than shortening the animation, so this is an
     // assertion about an invariant it enforces, not a second guess at the count.
     let animation = AnimationOutcome::preserved(preserved.frames, animation.policy);
+
+    // The same duplicate check as the still path, keyed on what `preserve` built
+    // rather than on the decoded frames: those frames are already gone by now, and
+    // the encoded animation is the one canonical form this engine produces. See
+    // `ContentKey::from_encoded`.
+    if let Some(ctx) = batch
+        && ctx.policy.deduplicate
+    {
+        let key = crate::dedupe::ContentKey::from_encoded(&preserved.bytes, pipeline, settings);
+        if let Some(first) = ctx.dedup.claim(key, &job.name) {
+            return Err(Error::Duplicate { of: first });
+        }
+    }
 
     let stem = sanitise_stem(&job.name);
     let outcome = Outcome {
@@ -364,6 +680,7 @@ fn process_animation(
         target_met: settings.target.is_none(),
         colour: preserved.colour,
         animation,
+        skipped: None,
         error: None,
     };
     Ok(Processed {
@@ -431,72 +748,209 @@ fn streamed_resize(
     Ok(Some(img))
 }
 
+/// What a batch shares between its workers: the deduplication table and the
+/// policy that decides what a skip is.
+pub struct BatchContext {
+    policy: BatchPolicy,
+    dedup: crate::dedupe::Dedup,
+}
+
+impl BatchContext {
+    pub fn new(policy: BatchPolicy) -> Self {
+        Self {
+            policy,
+            dedup: crate::dedupe::Dedup::new(),
+        }
+    }
+}
+
 /// Run a batch in parallel. Failures are collected, not propagated.
+///
+/// Four things are decided here rather than in [`process_one`], because they are
+/// questions about a *folder* and have no answer for a single file:
+///
+/// * one picture exported once, via [`crate::dedupe`];
+/// * a file the engine cannot process reported as a skip with a
+///   [`SkipReason`] rather than as a failure;
+/// * a file the request cannot be carried out on, reported the same way; and
+/// * the pool, which [`crate::folder::pool_size`] sizes to the machine's memory
+///   as well as its core count.
 pub fn process_batch(
     jobs: &[Job],
     pipeline: &Pipeline,
     settings: &Settings,
+    policy: &BatchPolicy,
     cancel: &CancelToken,
 ) -> BatchReport {
-    let results: Vec<Result<Processed>> = jobs
-        .par_iter()
-        .map(|job| {
-            if cancel.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
-            process_one(job, pipeline, settings)
-        })
-        .collect();
+    let context = BatchContext::new(*policy);
+    process_all(jobs, pipeline, settings, &context, cancel, |job: &Job| {
+        Ok::<_, (String, Error)>(std::borrow::Cow::Borrowed(job))
+    })
+}
 
-    let cancelled = cancel.is_cancelled();
-    let outcomes = results
-        .into_iter()
-        .zip(jobs)
-        .map(|(result, job)| match result {
-            Ok(p) => p.outcome,
-            Err(Error::Cancelled) => Outcome {
-                id: job.id.clone(),
-                name: job.name.clone(),
-                output_name: String::new(),
-                input_bytes: job.bytes.len(),
-                output_bytes: 0,
-                width: 0,
-                height: 0,
-                quality_used: 0,
-                target_met: false,
-                colour: ColourOutcome::unknown(),
-                animation: AnimationOutcome::unknown(),
-                error: Some("cancelled".into()),
-            },
-            Err(e) => Outcome {
-                id: job.id.clone(),
-                name: job.name.clone(),
-                output_name: String::new(),
-                input_bytes: job.bytes.len(),
-                output_bytes: 0,
-                width: 0,
-                height: 0,
-                quality_used: 0,
-                target_met: false,
-                colour: ColourOutcome::unknown(),
-                // A refusal is the one failure where the frames are known and
-                // the file is fine, so it reports them rather than claiming
-                // nothing happened. Every other failure is
-                // `AnimationOutcome::unknown()`.
-                animation: match &e {
-                    Error::AnimationRefused { frames, .. } => {
-                        AnimationOutcome::refused(*frames, settings.animation)
+/// The one batch loop, over anything that can become a [`Job`].
+///
+/// The loader is what lets the folder path ([`crate::folder::process_folder`])
+/// read each file from disk *inside* its own task rather than handing
+/// `process_batch` a folder already resident in memory — 400 photographs is
+/// gigabytes, and the alternative is a batch that OOMs before it starts. A
+/// `Cow` rather than two functions because the in-memory case must not copy the
+/// bytes it was given.
+pub(crate) fn process_all<'a, T, L>(
+    items: &'a [T],
+    pipeline: &Pipeline,
+    settings: &Settings,
+    context: &BatchContext,
+    cancel: &CancelToken,
+    load: L,
+) -> BatchReport
+where
+    T: Sync,
+    L: Fn(&'a T) -> Loaded<'a> + Sync,
+{
+    // The outcome is built inside the closure rather than after it, and that is
+    // load-bearing rather than tidy: the loader may have read the file from disk
+    // to produce the job, and doing that twice to recover a name for the error
+    // would read 400 photographs off the disk twice. `par_iter().map().collect()`
+    // preserves order, so the report still lines up with the input list.
+    let outcomes: Vec<Outcome> = items
+        .par_iter()
+        .map(|item| {
+            if cancel.is_cancelled() {
+                return cancelled_outcome(&load(item));
+            }
+            let job = match load(item) {
+                Ok(job) => job,
+                // A file that could not even be read is reported with its name
+                // and no bytes, rather than being dropped from the report: a
+                // folder of 400 that lost a file to a read error would otherwise
+                // report 399 outcomes and no reason for the missing one.
+                Err((name, error)) => {
+                    return Outcome::skipped(
+                        &Job {
+                            id: String::new(),
+                            name,
+                            bytes: Vec::new(),
+                        },
+                        skip_reason(&error, context.policy).unwrap_or(SkipReason::Unreadable),
+                    );
+                }
+            };
+            match process_one_within(job.as_ref(), pipeline, settings, Some(context)) {
+                Ok(processed) => processed.outcome,
+                Err(e) => match skip_reason(&e, context.policy) {
+                    Some(reason) => Outcome::skipped(&job, reason),
+                    None => {
+                        // A refusal is the one failure where the frames are known and
+                        // the file is fine, so it reports them rather than claiming
+                        // nothing happened. Every other failure is
+                        // `AnimationOutcome::unknown()`.
+                        let animation = match &e {
+                            Error::AnimationRefused { frames, .. } => {
+                                AnimationOutcome::refused(*frames, settings.animation)
+                            }
+                            _ => AnimationOutcome::unknown(),
+                        };
+                        Outcome::failed(&job, &e, animation)
                     }
-                    _ => AnimationOutcome::unknown(),
                 },
-                error: Some(e.to_string()),
-            },
+            }
         })
         .collect();
 
     BatchReport {
         outcomes,
-        cancelled,
+        cancelled: cancel.is_cancelled(),
+    }
+}
+
+/// What a batch loader produces: a job, or the name it could not produce one
+/// for and why.
+///
+/// Spelled out rather than reusing [`Result`], because this one has a *two*-field
+/// error: a file that cannot be read still has a name, and dropping it would mean
+/// a report with an outcome nobody can attribute.
+pub type Loaded<'a> = std::result::Result<std::borrow::Cow<'a, Job>, (String, Error)>;
+
+/// The outcome for a file the batch never started, naming the file when the
+/// loader could not even open it.
+fn cancelled_outcome(loaded: &Loaded<'_>) -> Outcome {
+    match loaded {
+        Ok(job) => Outcome::failed(job.as_ref(), &Error::Cancelled, AnimationOutcome::unknown()),
+        Err((name, _)) => Outcome::failed(
+            &Job {
+                id: String::new(),
+                name: name.clone(),
+                bytes: Vec::new(),
+            },
+            &Error::Cancelled,
+            AnimationOutcome::unknown(),
+        ),
+    }
+}
+
+/// Classify a failure as a skip, when the policy says this kind of failure is
+/// one.
+///
+/// Only *file-level* problems map: a file that is not an image, one that will
+/// not decode, one over a ceiling, one this build cannot open. A refusal to
+/// carry out the *request* stays a failure, because there is nothing about the
+/// file to change and a folder is no reason to hide it.
+fn skip_reason(error: &Error, policy: BatchPolicy) -> Option<SkipReason> {
+    match error {
+        Error::Duplicate { of } => Some(SkipReason::Duplicate { of: of.clone() }),
+        Error::WouldUpscale {
+            requested_width,
+            requested_height,
+            actual_width,
+            actual_height,
+        } => Some(SkipReason::WouldUpscale {
+            requested: (*requested_width, *requested_height),
+            actual: (*actual_width, *actual_height),
+        }),
+        Error::UnknownFormat => policy.skip_unprocessable.then_some(SkipReason::Unreadable),
+        Error::Decode(_) => policy.skip_unprocessable.then_some(SkipReason::Unreadable),
+        Error::Io(_) => policy.skip_unprocessable.then_some(SkipReason::Unreadable),
+        Error::InputTooLarge { limit, actual } => {
+            policy.skip_unprocessable.then_some(SkipReason::TooLarge {
+                limit: *limit as u64,
+                actual: *actual as u64,
+                unit: SizeUnit::Bytes,
+            })
+        }
+        Error::PixelBudgetExceeded { limit, actual } => {
+            policy.skip_unprocessable.then_some(SkipReason::TooLarge {
+                limit: *limit,
+                actual: (*actual * 1_000_000.0).round() as u64,
+                unit: SizeUnit::Pixels,
+            })
+        }
+        Error::SuspiciousDimensions { w, h, .. } => {
+            policy.skip_unprocessable.then_some(SkipReason::TooLarge {
+                // The per-side ceiling is what was actually broken, so that is the
+                // number the note compares against: the pixel budget is checked
+                // after this one and never reached.
+                limit: u64::from(*w.max(h)),
+                actual: u64::from(*w) * u64::from(*h),
+                unit: SizeUnit::Pixels,
+            })
+        }
+        // A container this build has no decoder for, and nothing wrong with the
+        // file. Anything else in this enum is the file's own problem, and saying
+        // so would be blaming a user's photograph for our feature flags.
+        Error::Heic(
+            crate::heic::HeicError::NotBuilt | crate::heic::HeicError::UnsupportedCoding,
+        ) => policy
+            .skip_unprocessable
+            .then_some(SkipReason::UnsupportedFormat {
+                format: OutputFormat::Heic,
+            }),
+        // The container parsed and was then refused. That is the file's own
+        // problem, so it does not borrow the sentence above.
+        Error::Heic(crate::heic::HeicError::Rejected { .. }) => {
+            policy.skip_unprocessable.then_some(SkipReason::Unreadable)
+        }
+        _ => None,
     }
 }
 
@@ -674,6 +1128,33 @@ mod tests {
             &img,
             OutputFormat::Jpeg,
             EncodingOptions::default().with_quality(95),
+        )
+        .unwrap()
+    }
+
+    /// A picture that is *distinct from every other seed*, for tests that need
+    /// hundreds of them.
+    ///
+    /// `photo` above is deliberately compressible and varies by a phase offset, so
+    /// its images repeat every few seeds — fine for one fixture, useless for the
+    /// 370-distinct-pictures case, which silently deduplicated down to 55 and would
+    /// have been green for the wrong reason. This one is keyed on a multiply-xor
+    /// mix of the pixel and the seed, so no two of them agree.
+    fn distinct(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let mut n = x
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y)
+                .wrapping_add(seed.wrapping_mul(0x85eb_ca6b))
+                .wrapping_add(0x1234_5678);
+            n ^= n >> 15;
+            n = n.wrapping_mul(0x2545_f491);
+            image::Rgb([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+        }));
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
         )
         .unwrap()
     }
@@ -879,6 +1360,415 @@ mod tests {
         );
     }
 
+    // -------------------------------------------------------------------------
+    // phase-14: deduplication and skips
+    // -------------------------------------------------------------------------
+
+    /// The phase's headline claim, in the shape the prompt states it: two byte-
+    /// different encodings of one picture are one output.
+    ///
+    /// The fixture is a flat field because that is the one shape a JPEG round trip
+    /// is exact on, so the two files differ in every byte the container and the
+    /// quantisation tables touch while decoding to the same 1 536 pixels. A file-
+    /// bytes key would call these two; this must call them one.
+    #[test]
+    fn two_byte_different_encodings_of_one_picture_produce_one_output() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            96,
+            64,
+            image::Rgb([128, 128, 128]),
+        ));
+        let at = |q: u8| {
+            crate::encode_fixed(
+                &img,
+                OutputFormat::Jpeg,
+                EncodingOptions::default().with_quality(q),
+            )
+            .unwrap()
+        };
+        let (high, low) = (at(95), at(75));
+        assert_ne!(
+            high, low,
+            "the two encodings must differ or this is vacuous"
+        );
+
+        let jobs = vec![job("1", "first.jpg", high), job("2", "second.jpg", low)];
+        let report = process_batch(
+            &jobs,
+            &Pipeline::new(),
+            &Settings::default(),
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
+        assert_eq!(report.succeeded(), 1);
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(report.duplicates(), 1);
+        assert!(report.outcomes.iter().all(|o| o.error.is_none()));
+        assert_eq!(
+            report
+                .outcomes
+                .iter()
+                .filter(|o| o.output_bytes > 0)
+                .count(),
+            1,
+            "and only one file on disk"
+        );
+    }
+
+    /// The other half of the claim: deduplication is *within a request*.
+    ///
+    /// The same file under a different resize is a different output, because the
+    /// exports differ and merging them would hand the user one picture where they
+    /// asked for two sizes. Two batches rather than one, because a batch has one
+    /// pipeline — the case being tested is two requests, not two files.
+    #[test]
+    fn the_same_picture_under_two_pipelines_produces_two_outputs() {
+        let bytes = photo(120, 90, 3);
+        let jobs = vec![job("1", "a.jpg", bytes.clone())];
+        let s = Settings::default();
+        let first = process_batch(
+            &jobs,
+            &pipeline(60),
+            &s,
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
+        let second = process_batch(
+            &jobs,
+            &pipeline(30),
+            &s,
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
+        assert_eq!(first.succeeded(), 1);
+        assert_eq!(second.succeeded(), 1);
+        assert_eq!(first.outcomes.iter().find(|o| o.ok()).unwrap().width, 60);
+        assert_eq!(second.outcomes.iter().find(|o| o.ok()).unwrap().width, 30);
+
+        // And with a picture that *is* duplicated, each of the two requests still
+        // collapses its own pair — the policy is per batch, not global.
+        let pair = vec![job("1", "a.jpg", bytes.clone()), job("2", "b.jpg", bytes)];
+        for width in [60, 30] {
+            let report = process_batch(
+                &pair,
+                &pipeline(width),
+                &s,
+                &BatchPolicy::default(),
+                &CancelToken::new(),
+            );
+            assert_eq!(report.succeeded(), 1, "width {width}");
+            assert_eq!(report.duplicates(), 1, "width {width}");
+            // Whichever of the two won the race is the one with a width: the other
+            // is the duplicate, and which of them that is has never been promised.
+            let written = report.outcomes.iter().find(|o| o.ok()).unwrap();
+            assert_eq!(written.width, width);
+        }
+    }
+
+    /// 400 files offered, 370 written, 30 skipped, every skip named.
+    ///
+    /// The prompt's arithmetic: a folder of 400 in which 30 pictures appear twice
+    /// yields 370 distinct pictures. The two files of each duplicated pair are the
+    /// *same bytes*, which is the case a real folder has — a library synced twice,
+    /// a "copy 2" from a file manager — and the count is what the phase is for.
+    #[test]
+    fn four_hundred_files_with_thirty_duplicates_writes_three_hundred_and_seventy() {
+        const TOTAL: usize = 400;
+        const DUPLICATED: usize = 30;
+        let distinct_pictures = TOTAL - DUPLICATED;
+
+        let mut jobs: Vec<Job> = Vec::with_capacity(TOTAL);
+        for i in 0..distinct_pictures {
+            // Small on purpose: 400 photographs' worth of pixels would make this a
+            // wall-clock measurement rather than an accounting one, and the
+            // accounting is what is being asserted. The content still has to differ
+            // per file, which is what the seed is for.
+            jobs.push(job(
+                &i.to_string(),
+                &format!("{i:03}.jpg"),
+                distinct(64, 48, i as u32),
+            ));
+        }
+        for i in 0..DUPLICATED {
+            let bytes = jobs[i].bytes.clone();
+            jobs.push(job(&format!("copy{i}"), &format!("{i:03}-copy.jpg"), bytes));
+        }
+
+        let report = process_batch(
+            &jobs,
+            &pipeline(32),
+            &Settings::default(),
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
+        assert_eq!(report.outcomes.len(), TOTAL);
+        assert_eq!(report.succeeded(), distinct_pictures, "370 written");
+        assert_eq!(report.skipped(), DUPLICATED, "30 skipped");
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.duplicates(), DUPLICATED);
+        assert_eq!(report.skip_reasons().len(), 1, "one reason, thirty times");
+        assert_eq!(report.skip_reasons()[0].1, DUPLICATED);
+
+        // Every skip names a file that is in the same report and was written, so
+        // the reason can be acted on rather than merely read.
+        for outcome in report.outcomes.iter().filter(|o| o.skipped.is_some()) {
+            let Some(SkipReason::Duplicate { of }) = &outcome.skipped else {
+                panic!("expected a duplicate, got {:?}", outcome.skipped);
+            };
+            assert!(
+                report.outcomes.iter().any(|o| o.name == *of && o.ok()),
+                "{of} should be one of the files that was written"
+            );
+            assert_eq!(outcome.output_bytes, 0, "a skipped file has no bytes");
+            assert!(outcome.error.is_none(), "a skip is not a failure");
+        }
+
+        // The same folder with deduplication off is 400 files and 400 outputs,
+        // which is what this phase changed and what a caller can turn off.
+        let report = process_batch(
+            &jobs,
+            &pipeline(32),
+            &Settings::default(),
+            &BatchPolicy::report_everything(),
+            &CancelToken::new(),
+        );
+        assert_eq!(report.succeeded(), TOTAL);
+        assert_eq!(report.skipped(), 0);
+    }
+
+    /// Every reason, produced by something real, in one place.
+    ///
+    /// The prompt asks for this because a skip reason with no test is a sentence
+    /// nobody has checked — and because an unreachable variant is a lie told in a
+    /// report: the UI would offer a row the engine can never fill. Four of the
+    /// five come from files a person could actually hand over; the fifth has none
+    /// in this configuration, because the `heic` feature is on and an HEIC decodes.
+    #[test]
+    fn every_skip_reason_is_reachable() {
+        let s = Settings::default();
+        let policy = BatchPolicy::default();
+        let cancel = CancelToken::new();
+
+        let flat = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            32,
+            24,
+            image::Rgb([120, 130, 140]),
+        ));
+        let at = |q: u8| {
+            crate::encode_fixed(
+                &flat,
+                OutputFormat::Jpeg,
+                EncodingOptions::default().with_quality(q),
+            )
+            .unwrap()
+        };
+        // Two copies of one picture, one file that is not an image, and one small
+        // picture that a 4000 px request cannot be carried out on.
+        let folder = vec![
+            job("1", "a.jpg", at(95)),
+            job("2", "b.jpg", at(75)),
+            job("3", "junk.jpg", b"not an image at all".to_vec()),
+            job("4", "small.jpg", photo(64, 48, 9)),
+        ];
+        let upscaler = Pipeline::new().with_resize(crate::pipeline::ResizeSpec {
+            width: Some(4000),
+            height: None,
+            fit: crate::pipeline::FitMode::Width,
+            no_upscale: true,
+            ..Default::default()
+        });
+        let huge = photo(400, 300, 11);
+        let tiny_limits = Settings {
+            limits: crate::validate::Limits {
+                max_input_bytes: 64,
+                ..Default::default()
+            },
+            ..s
+        };
+        let oversized = vec![job("9", "huge.jpg", huge.clone())];
+
+        let plain = process_batch(&folder, &Pipeline::new(), &s, &policy, &cancel);
+        let upscaled = process_batch(&folder, &upscaler, &s, &policy, &cancel);
+        let too_big = process_batch(&oversized, &Pipeline::new(), &tiny_limits, &policy, &cancel);
+
+        let wanted = [
+            (
+                SkipReason::Duplicate { of: "a.jpg".into() },
+                &plain,
+                "two encodings of one flat field",
+            ),
+            (
+                SkipReason::Unreadable,
+                &plain,
+                "bytes that are not a picture",
+            ),
+            (
+                SkipReason::TooLarge {
+                    limit: 64,
+                    actual: huge.len() as u64,
+                    unit: SizeUnit::Bytes,
+                },
+                &too_big,
+                "a file past the input ceiling",
+            ),
+            (
+                SkipReason::WouldUpscale {
+                    requested: (4000, 3000),
+                    actual: (64, 48),
+                },
+                &upscaled,
+                "a picture smaller than the request",
+            ),
+        ];
+        for (expected, report, what) in wanted {
+            let found = report
+                .outcomes
+                .iter()
+                .filter(|o| o.skipped.as_ref() == Some(&expected))
+                .count();
+            assert_eq!(found, 1, "{what}: {expected:?} never came back");
+        }
+
+        // The fifth has no file this build can fail on, so it is reached through
+        // the classification itself, with the exact error a build without the codec
+        // produces. The error is a value here rather than a file, which is what
+        // makes this half of the test independent of the feature set.
+        assert_eq!(
+            skip_reason(&Error::Heic(crate::heic::HeicError::NotBuilt), policy),
+            Some(SkipReason::UnsupportedFormat {
+                format: OutputFormat::Heic
+            }),
+            "a container this build cannot decode is our limitation, not a bad file"
+        );
+        // A container that was read and then refused is the file's own problem, and
+        // must not borrow that sentence.
+        assert_eq!(
+            skip_reason(
+                &Error::Heic(crate::heic::HeicError::Rejected {
+                    detail: "no primary item".into()
+                }),
+                policy
+            ),
+            Some(SkipReason::Unreadable)
+        );
+    }
+
+    /// Nothing here changes what a single-image request does.
+    ///
+    /// A user who picks one 64 px file and asks for 4000 px wide gets that file at
+    /// its own size, exactly as before this phase: "would upscale" is a question
+    /// about a folder, and answering it with a refusal would take away a working
+    /// path to compress and re-encode a small picture.
+    #[test]
+    fn a_single_image_request_is_unchanged_by_the_skip_policy() {
+        let j = job("1", "small.jpg", photo(64, 48, 2));
+        let upscaler = Pipeline::new().with_resize(crate::pipeline::ResizeSpec {
+            width: Some(4000),
+            height: None,
+            fit: crate::pipeline::FitMode::Width,
+            no_upscale: true,
+            ..Default::default()
+        });
+        let processed = process_one(&j, &upscaler, &Settings::default()).unwrap();
+        assert!(processed.outcome.ok());
+        assert_eq!(processed.outcome.skipped, None);
+        assert_eq!(
+            (processed.outcome.width, processed.outcome.height),
+            (64, 48)
+        );
+        assert!(processed.outcome.output_bytes > 0, "a file was written");
+    }
+
+    /// Turning the skip answers off turns them back into failures.
+    ///
+    /// A caller that wants to handle its own reporting — a CLI counting errors, a
+    /// CI job that must fail on one bad file — has to be able to say so, and
+    /// `BatchPolicy::report_everything` is that switch.
+    #[test]
+    fn the_policy_is_what_turns_a_skip_into_a_failure() {
+        let jobs = vec![
+            job("1", "a.jpg", photo(80, 60, 1)),
+            job("2", "b.jpg", b"not an image".to_vec()),
+        ];
+        let strict = process_batch(
+            &jobs,
+            &Pipeline::new(),
+            &Settings::default(),
+            &BatchPolicy::report_everything(),
+            &CancelToken::new(),
+        );
+        assert_eq!(strict.failed(), 1);
+        assert_eq!(strict.skipped(), 0);
+        assert!(strict.outcomes[1].error.is_some());
+
+        let lenient = process_batch(
+            &jobs,
+            &Pipeline::new(),
+            &Settings::default(),
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
+        assert_eq!(lenient.failed(), 0);
+        assert_eq!(lenient.skipped(), 1);
+    }
+
+    /// Every skip carries a sentence, and none of them is "skipped".
+    #[test]
+    fn every_skip_reason_says_something_to_the_user() {
+        let reasons = [
+            SkipReason::Duplicate {
+                of: "one.jpg".into(),
+            },
+            SkipReason::Unreadable,
+            SkipReason::UnsupportedFormat {
+                format: OutputFormat::Heic,
+            },
+            SkipReason::TooLarge {
+                limit: 1000,
+                actual: 2000,
+                unit: SizeUnit::Bytes,
+            },
+            SkipReason::TooLarge {
+                limit: 40_000_000,
+                actual: 60_000_000,
+                unit: SizeUnit::Pixels,
+            },
+            SkipReason::WouldUpscale {
+                requested: (1920, 1080),
+                actual: (640, 480),
+            },
+        ];
+        for reason in &reasons {
+            let note = reason.note();
+            assert!(note.len() > 20, "{reason:?} says nothing: {note:?}");
+            assert!(!note.contains("Error:"), "{reason:?} leaks a diagnostic");
+        }
+        assert!(reasons[0].note().contains("one.jpg"));
+        assert!(SkipReason::Duplicate { of: "x".into() }.is_duplicate());
+        assert!(!SkipReason::Unreadable.is_duplicate());
+    }
+
+    /// A skipped outcome reports the file's size and nothing else.
+    ///
+    /// The temptation with a struct this wide is to leave a decoded width on a file
+    /// that was never processed, and the UI would then show a picture's dimensions
+    /// for a picture it does not have.
+    #[test]
+    fn a_skipped_outcome_reports_no_output_at_all() {
+        let j = job("7", "x.jpg", vec![1, 2, 3, 4]);
+        let outcome = Outcome::skipped(&j, SkipReason::Unreadable);
+        assert_eq!(outcome.id, "7");
+        assert_eq!(outcome.name, "x.jpg");
+        assert_eq!(outcome.input_bytes, 4);
+        assert_eq!(outcome.output_bytes, 0);
+        assert_eq!((outcome.width, outcome.height), (0, 0));
+        assert_eq!(outcome.quality_used, 0);
+        assert!(outcome.output_name.is_empty());
+        assert!(outcome.error.is_none());
+        assert!(!outcome.ok());
+        assert!(!outcome.animation.animated());
+    }
+
     /// The precedence rule, asserted rather than left to the doc comment: the
     /// pipeline describes the picture and wins over the file-level default.
     #[test]
@@ -966,14 +1856,29 @@ mod tests {
             &jobs,
             &pipeline(200),
             &Settings::default(),
+            &BatchPolicy::default(),
             &CancelToken::new(),
         );
         assert_eq!(report.succeeded(), 2);
-        assert_eq!(report.failed(), 1);
-        let error = report.outcomes[1].error.as_deref().unwrap_or("");
+        // A file that is not an image is a *skip* in a batch, not a failure: this
+        // phase moved it there deliberately, because a folder of 200 with three
+        // junk files in it is three lines of explanation rather than three
+        // failures, and the explanation is still on the outcome.
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.skipped(), 1);
+        assert_eq!(
+            report.outcomes[1].skipped,
+            Some(SkipReason::Unreadable),
+            "the reason must be the one the plan would have given"
+        );
         assert!(
-            !error.is_empty(),
-            "the failure must be explained to the user"
+            !report.outcomes[1]
+                .skipped
+                .as_ref()
+                .unwrap()
+                .note()
+                .is_empty(),
+            "the skip must be explained to the user"
         );
         // The two good files must be untouched by the bad one.
         assert!(report.outcomes[0].output_bytes > 0);
@@ -987,7 +1892,13 @@ mod tests {
         let jobs: Vec<Job> = (0..4)
             .map(|i| job(&i.to_string(), &format!("{i}.jpg"), jpeg(200, 200, i as u8)))
             .collect();
-        let report = process_batch(&jobs, &pipeline(100), &Settings::default(), &token);
+        let report = process_batch(
+            &jobs,
+            &pipeline(100),
+            &Settings::default(),
+            &BatchPolicy::default(),
+            &token,
+        );
         assert!(report.cancelled);
         assert_eq!(report.succeeded(), 0);
     }
@@ -1008,7 +1919,13 @@ mod tests {
             target: Some(TargetBytes::new(40 * 1024)),
             ..Settings::default()
         };
-        let report = process_batch(&jobs, &pipeline(600), &settings, &CancelToken::new());
+        let report = process_batch(
+            &jobs,
+            &pipeline(600),
+            &settings,
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        );
         assert_eq!(report.succeeded(), 4);
         for o in &report.outcomes {
             assert!(o.target_met, "{} exceeded the target", o.name);
@@ -1037,7 +1954,7 @@ mod tests {
             .collect();
         let p = pipeline(350);
         let s = Settings::default();
-        let parallel = process_batch(&jobs, &p, &s, &CancelToken::new());
+        let parallel = process_batch(&jobs, &p, &s, &BatchPolicy::default(), &CancelToken::new());
         let sequential: BatchReport = BatchReport {
             outcomes: jobs
                 .iter()
@@ -1192,9 +2109,18 @@ mod tests {
             &jobs,
             &pipeline(150),
             &Settings::default(),
+            &BatchPolicy::default(),
             &CancelToken::new(),
         );
-        assert_eq!(report.succeeded() + report.failed(), jobs.len());
+        // Every file is accounted for exactly once, and a skip is a third
+        // category rather than being folded into either of the other two: this
+        // phase added it, and a report that lost one of the three would be a
+        // report that cannot say how many files it handled.
+        assert_eq!(
+            report.succeeded() + report.failed() + report.skipped(),
+            jobs.len()
+        );
+        assert_eq!(report.skipped(), 1);
         assert!(report.output_bytes() < report.input_bytes());
     }
 
@@ -1225,7 +2151,7 @@ mod tests {
         let sequential = t.elapsed();
 
         let t = Instant::now();
-        let parallel = process_batch(&jobs, &p, &s, &CancelToken::new());
+        let parallel = process_batch(&jobs, &p, &s, &BatchPolicy::default(), &CancelToken::new());
         let parallel_time = t.elapsed();
 
         assert_eq!(parallel.succeeded(), jobs.len());
@@ -1581,6 +2507,7 @@ mod tests {
             &jobs,
             &Pipeline::new(),
             &Settings::default(),
+            &BatchPolicy::default(),
             &CancelToken::new(),
         );
         assert_eq!(report.succeeded(), 2);

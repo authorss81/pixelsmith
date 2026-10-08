@@ -9,10 +9,12 @@
 
 pub mod animation;
 pub mod colour;
+pub mod dedupe;
 pub mod error;
 pub mod exif;
 pub mod ffi;
 pub mod ffi_abi;
+pub mod folder;
 pub mod format;
 pub mod heic;
 pub mod pipeline;
@@ -28,12 +30,16 @@ pub mod worker;
 pub use animation::{AnimationAction, AnimationOutcome, AnimationPolicy};
 pub use colour::{ColourOptions, ColourOutcome, ColourProfile, ColourSpace};
 pub use error::{Error, Result};
+pub use folder::{EntryVerdict, FolderEntry, FolderPlan};
 pub use format::{ChromaSubsampling, EncodingOptions, OutputFormat, detect_format};
 pub use pipeline::{CropSpec, FitMode, Orientation, Pipeline, ResampleFilter, ResizeSpec};
 pub use presets::{Preset, all_presets, find_preset};
 pub use target::TargetBytes;
 pub use validate::{FrameScan, Limits, ValidateReport, inspect, validate_bytes};
-pub use worker::{BatchReport, CancelToken, Job, Outcome, Settings, process_batch, process_one};
+pub use worker::{
+    BatchPolicy, BatchReport, CancelToken, Job, Outcome, Settings, SizeUnit, SkipReason,
+    process_batch, process_one,
+};
 
 /// Crate version, surfaced through the FFI so the UI can prove which engine it
 /// loaded.

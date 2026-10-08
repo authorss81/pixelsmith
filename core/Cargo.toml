@@ -77,6 +77,16 @@ flate2 = "1"
 # already compiled; naming it directly is the honest way to write a PNG chunk
 # rather than hand-rolling the checksum.
 crc32fast = "1"
+# Content hashing for folder deduplication (phase-14). BLAKE3 rather than SHA-256
+# because there is no compatibility requirement here and it is several times
+# faster, which is what matters when a folder of 400 files is being hashed.
+#
+# `default` is `std` only. The SIMD assembly behind the `cc` feature needs a C
+# toolchain, so it is deliberately *not* enabled: the portable implementation is
+# what gets compiled, exactly as the argument in `docs/ARCHITECTURE.md` prefers
+# for anything that is not libwebp. It pulls no new crates into the tree beyond
+# `constant_time_eq`, which has no features and no build script.
+blake3 = "1.8.7"
 
 # `setrlimit`/`getrlimit` for the sandbox's address-space ceiling. Unix-only,
 # already in the dependency tree through rayon and friends, and not a

@@ -438,6 +438,13 @@ struct BatchRequest {
     target: Option<u64>,
     #[serde(default)]
     mobile_limits: bool,
+    /// What to do with a file that will not be processed. Absent in a request
+    /// from an app predating phase-14, and `#[serde(default)]` therefore means
+    /// "collapse duplicates and report every skip" rather than "fail everything",
+    /// which is what this path used to do with the first of those and did not do
+    /// at all with the rest.
+    #[serde(default)]
+    policy: crate::worker::BatchPolicy,
     cancel: Option<PxHandle>,
     /// Inputs as base64-free raw arrays would bloat the JSON, so each entry is
     /// `{name, bytes}` where bytes is a JSON array of byte values. Dart builds
@@ -475,6 +482,7 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
         None => None,
     };
     let cancel = cancel.unwrap_or_default();
+    let policy = parsed.policy;
 
     let settings = Settings {
         format: parsed.format,
@@ -507,7 +515,7 @@ pub unsafe extern "C" fn px_batch(request: *const u8, request_len: usize) -> PxB
         })
         .collect();
 
-    let report = crate::worker::process_batch(&jobs, &pipeline, &settings, &cancel);
+    let report = crate::worker::process_batch(&jobs, &pipeline, &settings, &policy, &cancel);
     from_json(&report)
 }
 
@@ -1014,13 +1022,18 @@ mod tests {
     #[test]
     fn batch_reports_partial_failure() {
         unsafe {
+            // The two good files are *different* pictures. A batch deduplicates on
+            // content as of phase-14, so two identical fixtures in one request are
+            // one output and one `skipped` — which is the behaviour
+            // `a_batch_collapses_two_encodings_of_one_picture` tests, and would
+            // make this one measure the wrong thing.
             let request = serde_json::json!({
                 "crop": null, "orientation": null, "resize": null, "strip_metadata": true,
                 "format": "jpeg", "quality": 85, "target": null,
                 "files": [
                     { "name": "a.jpg", "bytes": sample(200, 100) },
                     { "name": "b.jpg", "bytes": b"broken".to_vec() },
-                    { "name": "c.jpg", "bytes": sample(200, 100) }
+                    { "name": "c.jpg", "bytes": sample(201, 100) }
                 ]
             });
             let body = serde_json::to_vec(&request).unwrap();
@@ -1028,7 +1041,65 @@ mod tests {
             assert_eq!(status, PxStatus::Ok as u32, "{msg}");
             let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
             assert_eq!(report.succeeded(), 2);
-            assert_eq!(report.failed(), 1);
+            // A file that is not an image is reported as a skip with a reason, not
+            // as a failure: the folder is 90% fine and this is one line of the
+            // report saying why the other file is not there.
+            assert_eq!(report.failed(), 0);
+            assert_eq!(report.skipped(), 1);
+        }
+    }
+
+    /// Two byte-different encodings of one picture, through the real boundary.
+    ///
+    /// This is the phase's headline claim as the UI sees it: 400 files in, 370
+    /// out, and the 30 named. The fixture is the flat field from
+    /// `dedupe::tests::two_qualities_of_one_picture_are_one_picture`, because it
+    /// is the shape a JPEG round trip is exact on — two qualities, two different
+    /// files, one picture.
+    #[test]
+    fn a_batch_collapses_two_encodings_of_one_picture() {
+        unsafe {
+            let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                64,
+                48,
+                image::Rgb([128, 128, 128]),
+            ));
+            let at = |q: u8| {
+                crate::encode_fixed(
+                    &img,
+                    OutputFormat::Jpeg,
+                    EncodingOptions::default().with_quality(q),
+                )
+                .unwrap()
+            };
+            let (high, low) = (at(95), at(75));
+            assert_ne!(high, low);
+
+            let request = serde_json::json!({
+                "crop": null, "orientation": null, "resize": null, "strip_metadata": true,
+                "format": "jpeg", "quality": 85, "target": null,
+                "files": [
+                    { "name": "one.jpg", "bytes": high },
+                    { "name": "two.jpg", "bytes": low }
+                ]
+            });
+            let body = serde_json::to_vec(&request).unwrap();
+            let (status, data, msg) = take(px_batch(body.as_ptr(), body.len()));
+            assert_eq!(status, PxStatus::Ok as u32, "{msg}");
+            let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
+            assert_eq!(report.succeeded(), 1);
+            assert_eq!(report.duplicates(), 1);
+            let skip = report.outcomes.iter().find(|o| o.skipped.is_some());
+            assert_eq!(
+                skip.and_then(|o| o.skipped.clone()),
+                Some(crate::worker::SkipReason::Duplicate {
+                    of: "one.jpg".into()
+                }),
+                "the duplicate names the file that was kept"
+            );
+            // And a request from an app that predates this field keeps working: the
+            // policy is `#[serde(default)]`, so "collapses duplicates" is what an
+            // absent key has to mean.
         }
     }
 
