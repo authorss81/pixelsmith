@@ -16,6 +16,18 @@ exclude = ["target/**"]
 [lib]
 name = "pixelsmith_core"
 crate-type = ["lib", "cdylib", "staticlib"]
+# `cargo bench` builds every target that has `bench = true`, and the lib is one
+# of them — so adding any [[bench]] below made cargo compile `pixelsmith_core`
+# twice with different `image` feature sets (once as a bench target, where
+# dev-dependencies unify, once as the dependency the bench binaries link) and
+# emit "output filename collision" four times. The two builds produce two
+# distinct `image` rlibs, and a benchmark that hands one to the other fails to
+# compile with a `DynamicImage` type mismatch that has nothing to do with
+# whatever it is trying to measure.
+#
+# The lib holds no `#[bench]` function and never will — benchmarking a unit is
+# what `core/benches/` is for — so this costs nothing.
+bench = false
 
 [dependencies]
 image = { version = "0.25", default-features = false, features = [
@@ -202,6 +214,20 @@ features = ["std"]
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+# The performance regression gate's harness. `default-features = false` with
+# `cargo_bench_support` only: criterion's defaults pull in `plotters` (a gnuplot
+# binding, and gnuplot is not installed on a CI runner) and `rayon`, neither of
+# which produces a number. The suite is single-threaded on purpose -- a
+# criterion benchmark that used rayon's thread pool would report a number that
+# depends on how many cores the runner happened to have.
+#
+# 0.7 rather than 0.8: 0.8 declares rust-version 1.86 and this crate declares
+# 1.85, so `cargo add` picks 0.7 and a hard 0.8 would make the tree refuse to
+# build on its own stated MSRV.
+criterion = { version = "0.7", default-features = false, features = [
+  "cargo_bench_support",
+] }
+
 # Already a normal dependency, and Cargo unifies the same version across normal
 # and dev builds, so this adds no compilation to a release. It is here because an
 # integration test under core/tests/ can only reach the crate's public API plus
@@ -225,6 +251,38 @@ kamadak-exif = "0.6"
 # not unified into a plain `cargo build --release`, so nothing here reaches the
 # shipped library.
 heic-rs = { version = "0.1.1", default-features = false, features = ["std", "bench"] }
+
+# One entry per hot path the phase prompt names: decode, resize, encode, the
+# byte-target search, and the two EXIF paths.
+#
+# `harness = false` is what tells cargo to hand each file's `main` to criterion
+# instead of to libtest. Declared explicitly rather than left to autobenches so
+# that adding a file to benches/ cannot silently produce a libtest binary which
+# runs one "benchmark", asserts nothing, and reports green -- the same class of
+# green-but-checking-nothing as the FFI tests skipping when the library is
+# missing, which `scripts/verify.sh` had to be taught to catch.
+#
+# `common` is a module directory, not a target: cargo does not autodiscover
+# `benches/common/mod.rs`, which is why it needs no entry here.
+[[bench]]
+name = "decode"
+harness = false
+
+[[bench]]
+name = "resize"
+harness = false
+
+[[bench]]
+name = "encode"
+harness = false
+
+[[bench]]
+name = "target_bytes"
+harness = false
+
+[[bench]]
+name = "exif"
+harness = false
 
 [profile.release]
 opt-level = 3
