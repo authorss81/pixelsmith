@@ -1089,17 +1089,34 @@ mod tests {
             let report: crate::worker::BatchReport = serde_json::from_slice(&data).unwrap();
             assert_eq!(report.succeeded(), 1);
             assert_eq!(report.duplicates(), 1);
-            let skip = report.outcomes.iter().find(|o| o.skipped.is_some());
-            assert_eq!(
-                skip.and_then(|o| o.skipped.clone()),
-                Some(crate::worker::SkipReason::Duplicate {
-                    of: "one.jpg".into()
-                }),
-                "the duplicate names the file that was kept"
+            let skip = report
+                .outcomes
+                .iter()
+                .find_map(|o| match &o.skipped {
+                    Some(crate::worker::SkipReason::Duplicate { of }) => Some(of.clone()),
+                    Some(other) => panic!("expected a duplicate, got {other:?}"),
+                    None => None,
+                })
+                .expect("one of the two files must be reported as the duplicate");
+            // Not "one.jpg" specifically: a batch runs in parallel and the
+            // deduplication table is claimed under a mutex, so which of the two
+            // identical pictures is written is the scheduler's choice. What the
+            // boundary promises is that the reason reaches Dart at all, names one
+            // of the two, and names the one that was written.
+            assert!(
+                ["one.jpg", "two.jpg"].contains(&skip.as_str()),
+                "the duplicate must name one of the two files, not {skip}"
             );
-            // And a request from an app that predates this field keeps working: the
-            // policy is `#[serde(default)]`, so "collapses duplicates" is what an
-            // absent key has to mean.
+            assert!(
+                report.outcomes.iter().any(|o| o.name == skip && o.ok()),
+                "the duplicate must name the file that was written"
+            );
+            // A request from an app that predates this field keeps working: the
+            // `policy` key above is absent from the JSON on purpose, and
+            // `BatchPolicy` is `#[serde(default)]`, so "collapse duplicates" is
+            // what an absent key has to mean. `duplicates() == 1` above *is* that
+            // assertion — an older app's batch collapses its duplicates without
+            // having been taught the field.
         }
     }
 

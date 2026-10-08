@@ -1593,11 +1593,6 @@ mod tests {
 
         let wanted = [
             (
-                SkipReason::Duplicate { of: "a.jpg".into() },
-                &plain,
-                "two encodings of one flat field",
-            ),
-            (
                 SkipReason::Unreadable,
                 &plain,
                 "bytes that are not a picture",
@@ -1628,6 +1623,30 @@ mod tests {
                 .count();
             assert_eq!(found, 1, "{what}: {expected:?} never came back");
         }
+
+        // The duplicate is checked apart from the others because of *which* file
+        // it names. A batch runs in parallel and `Dedup::claim` is a race, so
+        // "a.jpg" or "b.jpg" is whichever thread got there first — asserting one
+        // of them here would be asserting the scheduler. What is guaranteed, and
+        // what the assertion is about, is that the two encodings of one picture
+        // became one output and the reason names a file that was written.
+        let dup = plain
+            .outcomes
+            .iter()
+            .find_map(|o| match &o.skipped {
+                Some(SkipReason::Duplicate { of }) => Some(of.clone()),
+                _ => None,
+            })
+            .expect("two encodings of one picture must produce one duplicate");
+        assert!(
+            ["a.jpg", "b.jpg"].contains(&dup.as_str()),
+            "a duplicate may only name one of the two files that hold the picture, \
+             not {dup}"
+        );
+        assert!(
+            plain.outcomes.iter().any(|o| o.name == dup && o.ok()),
+            "a duplicate names the file that was written, so {dup} was written"
+        );
 
         // The fifth has no file this build can fail on, so it is reached through
         // the classification itself, with the exact error a build without the codec

@@ -11,9 +11,10 @@
 //! file bytes. That makes the key a statement about the output: two files with
 //! the same key export to the same bytes, and two files whose exports would
 //! differ never share one. A PNG re-saved with different compression, or a JPEG
-//! another tool stripped of its EXIF, merges with the original; a different
-//! quality of the same photograph does not, and [`tests`] measures why rather
-//! than guessing.
+//! another tool stripped of its EXIF, merges with the original; a *lossy*
+//! re-encode of the same photograph does not, because its pixels are genuinely
+//! different pixels — `tests::a_lossy_re_encode_is_not_claimed_to_be_a_duplicate`
+//! measures that rather than guessing at it.
 //!
 //! BLAKE3 rather than SHA-256 for two reasons, one of them the only one that
 //! matters: there is no compatibility requirement here — nothing else on earth

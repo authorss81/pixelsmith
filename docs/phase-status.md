@@ -25,7 +25,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-11 | Low-peak-memory decode for very large images | DONE | `9cef389` | See [phase-11 notes](#phase-11-notes) below. |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | DONE | `7dc119d` | See [phase-12 notes](#phase-12-notes) below. The `app/` half was never delivered as a patch — see the notes. |
 | phase-13 | Animated GIF: honest handling | DONE | `ce804a9` | See [phase-13 notes](#phase-13-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07. |
-| phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
+| phase-14 | Content-hash deduplication and a folder pipeline | DONE | (this commit) | See [phase-14 notes](#phase-14-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07/13. |
 | phase-15 | Supply-chain policy and reproducible builds | PENDING | | |
 | phase-16 | Release artefacts: the APK and the EXE | PENDING | | Publishes the installable binaries |
 | phase-17 | Self-audit and next-phase generation | PENDING | | Generates the next phase set |
@@ -1148,6 +1148,121 @@ was for phase-05/06/07.
 - **phase-12's `app/` colour drift is still undelivered** — see the phase-12 notes
   above. It is the one contract change in this project with no patch behind it.
 
+
+## phase-14 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with `--all-features`
+(280 lib tests, 20 hostile, 19 property, 27 sandbox, 1 streaming peak, 17 Flutter
+tests, none skipped).
+
+**The previous attempt had finished the work and failed on one broken intra-doc
+link — the fourth time that exact defect has cost a phase.** `9a0db6b` records
+`verification failed (1)`; `dedupe.rs`'s module doc said "…and [`tests`] measures
+why rather than guessing", and there is no item called `tests` in scope from a
+module-level doc comment. The gate's Rust order is fmt → clippy → test → release →
+doc, so the *last* check is the one that fails, after a five-minute test run that
+had nothing to do with it. Reverting the one-line fix and re-running
+`RUSTDOCFLAGS="-D warnings" cargo doc --all-features` reproduces that single error
+and nothing else. This is now the fourth instance of one pattern (phase-01's
+`px_inspect` safety link, phase-05's `ffi_abi.rs` link, phase-13's
+`crate::animation::Policy`), and the pattern is worth naming: every one is a link
+written for a module that did not exist when the sentence was drafted.
+
+**The key is over the output, not over the file.** `dedupe::ContentKey` is a
+domain-separated BLAKE3 digest of the decoded pixels *plus the whole request*,
+truncated to 128 bits, with the request fed in field by field and tagged.
+BLAKE3 rather than SHA-256 because nothing outside this process has to agree with
+these digests, and because it is faster over 400 files; the `cc`/SIMD feature is
+deliberately *not* enabled, so the portable implementation is what compiles on
+every shipped target and the crate adds one dependency (`constant_time_eq`) and no
+build script. `dedupe::tests::every_field_of_the_request_reaches_the_key` is the
+test that fails if a field is added to `Pipeline` or `Settings` and not hashed,
+because the merge that would then be allowed is silent.
+
+**One sentence of the prompt is not implementable as written, and the phase says
+so rather than pretending.** "Two different JPEGs of the same photo must collide"
+is true of *lossless* re-encodings and false of *lossy* ones: the same photograph
+at q95 and q40 decodes to pictures differing by up to 13 code values per channel
+in half the frame, which `a_lossy_re_encode_is_not_claimed_to_be_a_duplicate`
+measures rather than assumes. What the prompt asks for is implemented and tested
+on the shape where it is true — a flat field is the one picture a JPEG round trip
+is exact on, so `two_byte_different_encodings_of_one_picture_produce_one_output`
+really does encode one image at two qualities and assert one output. The
+alternative was an approximate key, and the reason it is not one is in
+`docs/ARCHITECTURE.md`: a missed duplicate appears in the report and a wrong merge
+does not, so the engine chooses the failure mode a user can see.
+
+**The prompt's own arithmetic is inconsistent, and the objective paragraph was
+followed.** The acceptance criterion asks for "a 200-file folder test asserting
+exactly 370 processed and 30 skipped", which cannot both hold — 200 files with 30
+duplicates is 170 outputs. The objective says 400 images with 30 the same photo
+gives 370 results, and that is asserted twice: over a job list in
+`worker::tests::four_hundred_files_with_thirty_duplicates_writes_three_hundred_and_seventy`,
+and over **400 files actually on disk** through `folder::process_folder` in
+`folder::tests::a_folder_of_four_hundred_with_thirty_duplicates_writes_three_hundred_and_seventy`,
+which also checks the plan a user would have been shown first. Both count the
+skips by reason rather than by arithmetic.
+
+**Two tests asserted which of two identical files won a race, and were fixed
+rather than left green.** `Dedup::claim` is a mutex-guarded insert reached from
+Rayon workers, and `SkipReason::Duplicate { of }` names whichever thread arrived
+first; two tests asserted `"a.jpg"` and `"one.jpg"` because the left half of a
+two-element `par_iter` usually runs first, which is a statement about the thread
+pool and fails on a loaded runner. Both now assert what is actually guaranteed —
+the reason names one of the two files, and the file it names is the one with
+bytes written. That is what gotcha 32 in `docs/ARCHITECTURE.md` is.
+
+**`would_upscale` is a skip, and the argument is in `docs/ARCHITECTURE.md`**
+rather than in a commit message: there is no fourth outcome state for "written but
+not what you asked for", the user's own `no_upscale` guard is what fired, a 64×64
+icon in a folder of 12 MP photographs is not a broken file, and the single-image
+path is deliberately untouched — `a_single_image_request_is_unchanged_by_the_skip_policy`.
+`BatchPolicy::skip_upscales = false` is the other answer, in one field.
+
+**A file the extension filter rejected is not an outcome at all.** A folder next
+to a set of photographs holds three hundred `.DS_Store` files and a
+`.thumbnails` directory; reporting those as skipped would bury the thirty lines
+that matter. They are in the `FolderPlan` — which is where "what is in this
+folder" is answered — and out of the report.
+
+**`app/` is delivered as `workspace/phase-14/shrinkray-phase-14.patch`**, for the
+same reason as phase-05/06/07/13: `app/` is `authorss81/shrinkray`, a separate
+repository this pipeline reads but cannot push to. It adds `SkipReason` and
+`BatchPolicy` to `models.dart`, the `skipped` and `duplicates` counters to
+`BatchReport`, and a `policy` argument to `PixelSmithEngine.batch` and
+`Requests.batch`. It does **not** touch the `Capabilities` constructor, so unlike
+phase-07's patch it cannot collide with that hunk. It does share the `batch`
+signature region and the `inspect` rewrite with phase-13's patch, so like every
+other pair in this series those hunks need merging by hand — stated here rather
+than worked around, as it was for phase-05/06/07.
+
+One thing in it is worth flagging: the patch also rewrites `PixelSmithEngine.inspect`
+into Dart 3.7's tall style, which is the single file `scripts/verify.sh` reports as
+`UNFIXABLE_UPSTREAM_APP`. Whoever lands it clears that note as a side effect.
+
+**Not done, and named rather than glossed:**
+
+- **The plan does not count would-upscale skips.** It reads a header for format
+  detection and not the geometry, so a user learns that number when the export is
+  running. `ImageReader::into_dimensions()` is a header read and decodes nothing,
+  so predicting it is cheap; it is the obvious next `EntryVerdict` variant.
+- **There is no perceptual matching**, by the argument above rather than by
+  omission. Two JPEGs of one photograph at two qualities are two outputs and the
+  report says so.
+- **The key needs the decoded picture**, so two copies of the same 12 MP file are
+  two decodes before the comparison. There is no cheap pre-filter on dimensions
+  and file size ahead of it, which would reject most non-duplicates without
+  hashing anything.
+- **`px_batch` is not memory-sized.** `folder::process_folder` builds its own
+  rayon pool through `folder::pool_size`, but `process_batch` — and therefore the
+  FFI path and `px_batch` — still uses rayon's global pool, so a 400-file batch
+  sent through Dart is bounded by cores and not by `MemAvailable`.
+- **There is no FFI entry point for the plan.** The prompt did not ask for one,
+  and `ffi_abi.rs` is unchanged, so the Dart side cannot show a folder preview
+  yet: it can only process a batch it has already enumerated.
+- **The 400-file test uses 48×32 pictures on purpose** — it is an accounting
+  test, and 400 photographs' worth of pixels would make it a wall-clock
+  measurement instead.
 
 ## Status values
 

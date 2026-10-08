@@ -9,6 +9,34 @@ the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Folder processing with content-hash deduplication and accounted-for skips.**
+  A folder of 400 photographs in which 30 pictures appear twice now yields **370
+  outputs and 30 named skips** rather than 400 files the user then has to compare
+  by eye. `dedupe::ContentKey` is a BLAKE3 digest of the **decoded pixels plus the
+  whole request**, not of the file bytes, so two byte-different encodings of one
+  photograph are one output and the same photograph under two pipelines is two.
+  Nothing reads a filename: two files called `IMG_0001.jpg` are two pictures, and
+  the one this engine claims to match is the one it can prove.
+  `worker::Outcome.skipped` carries a `SkipReason` for every file that was read
+  and then deliberately not written — `Duplicate`, `Unreadable`,
+  `UnsupportedFormat`, `TooLarge`, `WouldUpscale` — each with a sentence written
+  for the person whose folder it is, so no skip is silent.
+  `worker::BatchPolicy` turns the three answers off independently.
+- **`folder::FolderPlan`: what is in this folder, before the button.** One `stat`
+  and the first 4 KiB of each candidate, filtered by extension *and* by magic
+  bytes, with a verdict per file and a sentence per problem. Symlinks are not
+  followed, dot entries are skipped, and the walk stops at 8 levels and 10 000
+  files *reporting* that it did. Nothing is decoded to produce it.
+- **Parallelism sized to memory as well as cores.** `folder::pool_size` reads
+  `MemAvailable` where the platform publishes it (every Android target included)
+  and stands in with a stated 2 GiB where it does not, then takes the smaller of
+  cores, `MAX_POOL` and what memory allows. Uncapped parallelism on a phone
+  decoding 400 images is an OOM, not a slowdown.
+- **A would-upscale file is a skip with both geometries, and only in a batch.**
+  `pipeline::refused_upscale` decides it from the header, before a decode. A
+  single-image request is unchanged: pick a 64 px icon, ask for 4000 px, get
+  4000 px. The argument is in `docs/ARCHITECTURE.md`.
+
 - **Animated GIF: honest handling, and frame-preserving export.** An animated GIF
   used to be decoded to its first frame and re-encoded as a still, with the
   `has_animated` flag sitting unread on the report. Now: an animation exported as

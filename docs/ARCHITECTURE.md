@@ -9,14 +9,16 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Sixteen modules, one submodule, no circular references. Dependencies point downward:
-`lib.rs` → `worker.rs` / `pipeline.rs` / `colour.rs` / `animation.rs` → `resize.rs`
+Eighteen modules, one submodule, no circular references. Dependencies point downward:
+`lib.rs` → `worker.rs` / `folder.rs` / `pipeline.rs` / `colour.rs` / `animation.rs` → `resize.rs`
 → `validate.rs` / `heic.rs` → `error.rs`. Nothing below `error.rs` knows anything
 exists above it. `animation.rs` sits below `worker.rs` and above `validate.rs`
 because it needs the limits and the report the validation pass produces, while
 `validate.rs` must not need it — so the *container walk* lives in `validate.rs`
 (reading a header is `validate`'s stated job) and the *decision* lives in
-`animation.rs`.
+`animation.rs`. `dedupe.rs` is below `worker.rs` for the same reason it is not part
+of it: the key is a hash of the picture and the request, and `worker.rs` is the only
+thing that has both.
 
 | Module | Owns | Key types |
 | --- | --- | --- |
@@ -25,14 +27,16 @@ because it needs the limits and the report the validation pass produces, while
 | `core/src/format.rs` | What a format *is*: the `OutputFormat` enum, magic-byte detection, the encode dispatch, the per-format `EncodingOptions` (quality, progressive, chroma), JPEG APP1 splicing, and output-capacity estimation. Reading is broader than writing, which is normal. | `OutputFormat`, `ChromaSubsampling`, `EncodingOptions`, `detect_format()`, `encode()`, `append_exif()` |
 | `core/src/validate.rs` | Everything that stands between an untrusted byte slice and an allocation: the limit profiles, the header-only checks (including the GIF frame walk, which reads the container rather than decoding it), and the report the UI shows before the user commits. | `Limits`, `Limits::mobile()`, `check_header()`, `check_animation()`, `validate_bytes()`, `inspect()`, `FrameScan`, `scan_gif_frames()`, `ValidateReport` |
 | `core/src/heic.rs` | HEIC/HEIF input: brand-byte detection, a header-only geometry read, and HEVC decode behind the `heic` feature. Read-only; encoding HEIC is refused by name. | `Header`, `HeicError`, `detect()`, `header()`, `decode()`, `built()` |
-| `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
+| `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()`, `refused_upscale()` |
 | `core/src/stream.rs` | The low-peak-memory decode, behind `streaming`: decode a row at a time, resample it into the destination in the same pass. One resampling pass, one output-sized buffer. | `decode_resized()`, `working_set_bytes()`, `Axis` |
 | `core/src/resize.rs` | The single resampling pass and the two kernels that can perform it: `image`'s reference implementation (the default, and the oracle) and `fast_image_resize` behind the `simd` feature. Exists so hard rule 5 has exactly one call site and a benchmark times the same entry point production uses. | `resample()`, `resample_reference()`, `simd::try_resample()` |
 | `core/src/colour.rs` | Colour management: reading an ICC profile out of a container, naming the space, and converting Display-P3 to sRGB with the sRGB transfer function. Not an ICC engine, and says so. | `ColourSpace`, `ColourProfile`, `ColourOptions`, `ColourOutcome`, `convert()`, `apply()` |
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
 | `core/src/presets.rs` | The preset catalogue, grouped by intent and carrying a `category` so the UI can present tabs. Custom values are always allowed. | `Preset`, `PRESETS`, `all_presets()`, `find_preset()`, `to_pipeline()` |
-| `core/src/worker.rs` | The layer the UI actually calls: per-file work, Rayon parallelism, cancellation, ZIP output, per-file accounting, and filename sanitisation. | `Job`, `Settings`, `Outcome`, `BatchReport`, `CancelToken`, `process_one()`, `process_animation()`, `process_batch()`, `sanitise_stem()` |
+| `core/src/worker.rs` | The layer the UI actually calls: per-file work, Rayon parallelism, cancellation, ZIP output, per-file accounting, filename sanitisation, and the skip policy that makes every file a batch does not write account for. | `Job`, `Settings`, `Outcome`, `SkipReason`, `BatchPolicy`, `BatchReport`, `CancelToken`, `process_one()`, `process_animation()`, `process_batch()`, `sanitise_stem()` |
+| `core/src/dedupe.rs` | Deciding that two files are the same picture: a BLAKE3 key over the decoded pixels *and* the whole request, so the key is a statement about the output rather than about the file. | `ContentKey`, `Dedup`, `from_pixels()`, `from_encoded()`, `claim()` |
+| `core/src/folder.rs` | Folder traversal: enumerate, filter by extension *and* magic bytes, read 4 KiB a file, and hand back a `FolderPlan` a UI can show before the button is worth pressing. Also sizes the worker pool to memory as well as cores. | `FolderPlan`, `FolderEntry`, `EntryVerdict`, `plan()`, `process_folder()`, `pool_size()`, `read_bounded()` |
 | `core/src/animation.rs` | What happens to an animation: the policy, the decision, the refusal sentence, the outcome type, and the frame-by-frame path through the pipeline. Does not re-implement GIF composition — see `docs/GIF.md`. | `AnimationPolicy`, `AnimationAction`, `AnimationOutcome`, `decide()`, `preserve()`, `refusal_note()` |
 | `core/src/ffi.rs` | The C ABI, where Rust's safety stops protecting the caller. 15 `px_*` entry points, a tagged result struct, and buffer ownership rules. | `PxBuffer`, `PxStatus`, `PxHandle`, `px_*` |
 | `core/src/ffi_abi.rs` | The same ABI as data: one declaration per entry point, proved against `ffi.rs` at compile time and rendered into the Dart declarations `app/lib/rust/bindings.dart` must contain. | `ENTRY_POINTS`, `EntryPoint`, `px_buffer_layout()`, `dart_drift()` |
@@ -538,6 +542,168 @@ Three things about the decision that are worth knowing before changing it:
 its frame count, because the file is fine and the frames were read; everything
 else reports `AnimationOutcome::unknown()`.
 
+## Folders: the plan, the duplicates, and the skips
+
+A folder is a different question from a file. 400 inputs have to become a number a
+user can believe, and "we processed what we could" is not a number anyone can
+act on. Three pieces carry that: a plan, a key, and a reason.
+
+### The plan comes first, and reads 4 KiB a file
+
+`folder::plan` is the preview, and its cost is the reason a UI can show it for 400
+photographs without the button feeling broken: one `stat` and the first
+`folder::HEADER_BYTES` (4 KiB) of each candidate, then a verdict per file.
+Nothing is decoded and nothing is written.
+`folder::tests::the_plan_reads_a_header_per_file_rather_than_the_whole_thing`
+asserts the arithmetic against a real folder rather than describing it.
+
+The verdict is `EntryVerdict`, and the distinctions in it are the ones a user
+acts on differently:
+
+| Verdict | What it means | Becomes |
+| --- | --- | --- |
+| `Ready` | an image this build can open, within the limits | processed |
+| `NotListed` | the extension is not one this build opens, so the bytes were never read | **not an outcome at all** |
+| `NotAnImage { detected: None }` | the name said image, the bytes say otherwise | `SkipReason::Unreadable` |
+| `NotAnImage { detected: Some(f) }` | a real image in a container this build cannot decode | `SkipReason::UnsupportedFormat { format }` |
+| `TooLarge { limit }` | over `max_input_bytes`, so processing would refuse it anyway | `SkipReason::TooLarge` |
+
+**`NotListed` is not a skip, and that is deliberate.** A folder next to a set of
+photographs holds three hundred `.DS_Store` files and a `.thumbnails` directory;
+reporting those as skipped would bury the thirty lines that matter. They are in
+the plan — which is where "what is in this folder" is answered — and out of the
+report.
+
+The walk does not follow symlinks (`symlink_metadata`, and the module says why),
+skips dot entries, stops at `MAX_DEPTH` (8), and stops at `MAX_ENTRIES` (10 000)
+*reporting that it stopped* rather than truncating quietly. Every problem it cannot
+resolve is a sentence in `FolderPlan::problems`, never an error return: a folder
+with one unreadable subdirectory is still a folder the user wants.
+
+`folder::process_folder` then runs the plan's ready entries through
+`worker::process_all` with a loader that reads each file *inside its own task*.
+The alternative — handing `process_batch` a folder already resident in memory —
+is a batch that holds 400 photographs at once, which on a phone is the phase-11
+ceiling crossed 400 times before any work starts.
+
+### The pool is sized to memory as well as cores
+
+`folder::pool_size` is `min(cores, MAX_POOL, available_memory / 2 / footprint)`,
+floored at one, and it is a *pure* function underneath
+(`folder::pool_size_for(cores, available_bytes, largest_input_bytes)`) so a test
+can drive the decision without a machine of a particular shape.
+
+Cores are the obvious half and were not the binding one. Each worker holds a
+decoded picture plus `image`'s `f32` resize intermediate; `DECODE_EXPANSION` (24)
+is a deliberate over-estimate of what one worker's input costs, because the two
+errors are not symmetric — over-estimating makes the pool smaller, which costs
+time, while under-estimating makes it thrash, which costs the phone. Half of
+`MemAvailable` rather than all of it, because the workers are not the only thing
+on the device and the page cache wants room for the file being read next.
+`MAX_POOL` (8) is a responsiveness bound rather than a speed one.
+
+Where the platform publishes memory it is read (`/proc/meminfo`, which covers
+every Android target); where it does not, `FALLBACK_AVAILABLE_BYTES` (2 GiB)
+stands in, because `std` publishes nothing portable and a probe that silently
+disagreed with the page above it would be worse than a stated constant.
+
+### The key is over the output, not over the file
+
+`dedupe::ContentKey` is a BLAKE3 digest of **the decoded pixels plus the whole
+request**, truncated to 128 bits. Two consequences, both asserted:
+
+* Two byte-different encodings of one picture are **one output**. The test is
+  `two_byte_different_encodings_of_one_picture_produce_one_output`, and its
+  fixture is a flat field because that is the one shape a JPEG round trip is
+  exact on — two qualities, two different files, not one of their pixels
+  different.
+* The same picture under two pipelines is **two outputs**. The request is in the
+  key, field by field and tagged, so a caller asking for two sizes gets two files.
+  `every_field_of_the_request_reaches_the_key` is the test that catches a field
+  added to `Pipeline` or `Settings` and not hashed, which would be a silent merge.
+
+The key is computed **after** `colour::apply`, so a Display-P3 copy and an sRGB
+copy of one photograph merge: from that point on they are the same bytes. For an
+animation it is `from_encoded` over what `preserve` built, because re-deriving a
+pixel key would mean decoding the GIF a second time to save a comparison the
+encoder has already made.
+
+What the key deliberately does **not** do is match perceptually. A lossy re-encode
+of the same photograph is a different picture to an exact hash, and
+`a_lossy_re_encode_is_not_claimed_to_be_a_duplicate` holds the engine to saying
+so: a missed duplicate appears in the report, a wrong merge does not. The second
+failure mode — two files named `IMG_0001.jpg` from two cameras — is the one hard
+rule 7 is about, and it is why nothing here reads a filename.
+
+### A skip is a third thing, and it has a reason
+
+`Outcome.skipped: Option<SkipReason>` is present on every outcome and `None`
+whenever a file was written, so a caller never infers a skip from an absent
+error. `SkipReason` is `Duplicate { of }`, `Unreadable`,
+`UnsupportedFormat { format }`, `TooLarge { limit, actual, unit }` and
+`WouldUpscale { requested, actual }`, each with `note()` written for a person.
+`BatchReport` therefore reports three counts that add up — `succeeded()`,
+`skipped()`, `failed()` — and `skip_reasons()` groups them so a summary does not
+have to be re-derived by the UI.
+
+`BatchPolicy` is the switch, not a mode: `deduplicate`, `skip_unprocessable` and
+`skip_upscales` are independent, all default on, and
+`BatchPolicy::report_everything()` turns all three off for a caller that would
+rather count errors itself.
+
+### `would_upscale`: a skip, argued
+
+`pipeline::refused_upscale(src_w, src_h)` returns `Some` only when all four of
+these hold, and `None` in every other case:
+
+1. there is a resize at all, so something was asked;
+2. no crop and no orientation transform, since either is real work even when the
+   geometry comes out the same;
+3. the resolved output is the source's own size — the geometry did not change;
+4. with `no_upscale` ignored, the request asked for **more** than it got.
+
+The decision is that condition is a **skip**, not a warning and not a silent
+write. The argument:
+
+* **There is nowhere to put a warning, and inventing a channel is a bigger
+  change than making this a skip.** The engine's whole reporting surface is
+  `Outcome`, and it already carries a third state alongside success and failure:
+  `skipped`. A "written, but not what you asked for" flag would be a *fourth*,
+  and every consumer of the report — the FFI, the JSON, the Dart models — would
+  need to learn it. A skip reuses the field that is already there.
+* **The user's own guard is what fired.** `no_upscale: true` means "do not enlarge
+  this". Writing the file at 640×480 when the request said 1920×1080 does not
+  honour the guard; it quietly returns a different file than the one asked for.
+  `no_upscale: false` is the opt-in for enlargement and is not affected. So this
+  is not the engine refusing a request it could carry out — it is the request
+  contradicting itself, reported with both geometries in one sentence: *"this
+  picture is 64x64 and the request asked for 4000x3000; enlarging it adds no
+  detail, so it was left alone"*.
+* **It is a skip, not a failure, and that is the part that matters.** A 64×64 icon
+  in a folder of 12 MP photographs is not a broken file. Calling it a failure
+  tells the user to fix their folder; saying nothing tells them they have 400
+  outputs when they have 370. The skip is the only answer that is both true and
+  actionable, and `BatchPolicy::skip_upscales = false` gives the other answer —
+  write it at its own size — in one field.
+* **It never touches the single-image path.** `process_one` takes no
+  `BatchContext`, so `px_process` and a one-off request behave exactly as they did
+  before this phase: pick an icon, ask for 4000 px, get 4000 px. That is a working
+  path to compress and re-encode a small picture, and a folder is a different
+  question — with 30 of 400 files in it, the user needs to know before spending an
+  hour on the export.
+  `a_single_image_request_is_unchanged_by_the_skip_policy` holds it.
+
+The strongest argument *against*, stated: a common job is making everything the
+same size, and in that workflow "copy the small one at its own size" is exactly
+what the user wants, so a folder-wide skip is a batch that quietly fails to
+equalise. The answer is the switch above, plus a gap named honestly: **the plan
+does not count would-upscale skips**, because it reads a header for format
+detection and not the geometry, so a user still learns the number when the
+export is already running. Predicting it is possible — `ImageReader`'s
+`into_dimensions()` is a header read and decodes nothing — and it is the obvious
+next thing to add to `EntryVerdict`. It is not here, and saying otherwise would be
+claiming a preview this plan cannot give.
+
 ## The FFI boundary
 
 Hostile by default. Every Dart-supplied pointer and length is checked, and every
@@ -947,6 +1113,16 @@ named so you can check the handling rather than re-derive it.
    it would silently blank parts of the animation. Handled in
    `core/src/animation.rs` (`preserve`) by never emitting a sub-rectangle, and
    pinned by `an_animation_exported_as_gif_keeps_every_frame_and_its_delay`.
+32. **Which of two identical files gets written is the scheduler's choice, so a
+    test cannot assert it.** `Dedup::claim` is a mutex-guarded insert reached from
+    Rayon workers, and `SkipReason::Duplicate { of }` names whichever thread
+    arrived first. Two tests written for this phase asserted one name
+    (`"a.jpg"`, `"one.jpg"`) because the left half of a two-element `par_iter`
+    usually runs first — a statement about the thread pool, not about the engine,
+    and one that fails on a loaded runner. What is guaranteed, and what both tests
+    now assert, is that the reason names one of the two files and that the file it
+    names is the one with bytes written. Handled in `core/src/dedupe.rs` (`claim`)
+    and `core/src/worker.rs` (`process_all`).
 
 ## Verification
 

@@ -584,6 +584,34 @@ mod tests {
         std::fs::write(dir.join(name), bytes).unwrap();
     }
 
+    /// A picture no other seed produces.
+    ///
+    /// `jpeg` above is a smooth wave, which is compressible *and* periodic: two
+    /// seeds a whole wavelength apart give the same file. A test about how many
+    /// distinct pictures a folder holds cannot use it, because duplicates would
+    /// appear out of the fixture rather than out of the folder. This one is keyed
+    /// on a multiply-xor mix of the pixel and the seed, so the pictures are
+    /// distinct by construction and the count in the assertion is the count the
+    /// test set up.
+    fn distinct(w: u32, h: u32, seed: u32) -> Vec<u8> {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| {
+            let mut n = x
+                .wrapping_mul(0x9e37_79b9)
+                .wrapping_add(y)
+                .wrapping_add(seed.wrapping_mul(0x85eb_ca6b))
+                .wrapping_add(0x1234_5678);
+            n ^= n >> 15;
+            n = n.wrapping_mul(0x2545_f491);
+            image::Rgb([(n >> 16) as u8, (n >> 8) as u8, n as u8])
+        }));
+        crate::encode_fixed(
+            &img,
+            OutputFormat::Jpeg,
+            EncodingOptions::default().with_quality(90),
+        )
+        .unwrap()
+    }
+
     fn dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
     }
@@ -924,6 +952,88 @@ mod tests {
                 assert!(!reason.note().is_empty());
             }
         }
+    }
+
+    /// The phase's arithmetic, on a folder on disk rather than a list of jobs.
+    ///
+    /// The prompt's numbers are 400 files offered and 370 written, so that is what
+    /// is asserted here, through [`process_folder`] — the plan, the walk, the
+    /// bounded pool, the deduplication table and the report, all in one pass.
+    /// The 30 duplicates are copies of 30 of the pictures, byte for byte, which is
+    /// the shape a real folder has when a library was synced twice.
+    ///
+    /// The pictures are 48x32 because this is an *accounting* test: 400
+    /// photographs' worth of pixels would make it a wall-clock measurement, and
+    /// what is asserted is that the report adds up.
+    #[test]
+    fn a_folder_of_four_hundred_with_thirty_duplicates_writes_three_hundred_and_seventy() {
+        const TOTAL: usize = 400;
+        const DUPLICATED: usize = 30;
+        let dir = dir();
+
+        for i in 0..TOTAL - DUPLICATED {
+            write(
+                dir.path(),
+                &format!("{i:03}.jpg"),
+                &distinct(48, 32, i as u32),
+            );
+        }
+        for i in 0..DUPLICATED {
+            let original =
+                std::fs::read(dir.path().join(format!("{i:03}.jpg"))).expect("written above");
+            write(dir.path(), &format!("copy-{i:03}.jpg"), &original);
+        }
+
+        let report = process_folder(
+            &[dir.path().to_path_buf()],
+            &Pipeline::new(),
+            &Settings::default(),
+            &BatchPolicy::default(),
+            &CancelToken::new(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.outcomes.len(),
+            TOTAL,
+            "every file in the folder is accounted for, none dropped"
+        );
+        assert_eq!(report.succeeded(), TOTAL - DUPLICATED, "370 written");
+        assert_eq!(report.duplicates(), DUPLICATED, "30 skipped as duplicates");
+        assert_eq!(report.skipped(), DUPLICATED);
+        assert_eq!(report.failed(), 0, "a duplicate is not a failure");
+
+        // One reason, thirty times, and every one of them names a file that was
+        // written rather than merely named.
+        let reasons = report.skip_reasons();
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert_eq!(reasons[0].1, DUPLICATED);
+        assert_eq!(reasons[0].0.kind(), "duplicate");
+        for outcome in report.outcomes.iter().filter(|o| o.skipped.is_some()) {
+            let Some(SkipReason::Duplicate { of }) = &outcome.skipped else {
+                panic!("expected a duplicate, got {:?}", outcome.skipped);
+            };
+            assert_eq!(outcome.output_bytes, 0);
+            assert!(outcome.error.is_none());
+            assert!(
+                report.outcomes.iter().any(|o| o.name == *of && o.ok()),
+                "{of} should be one of the files that was written"
+            );
+        }
+
+        // And the plan a user would have been shown first agrees with it.
+        let plan = plan(
+            &[dir.path().to_path_buf()],
+            &crate::validate::Limits::default(),
+        );
+        assert_eq!(plan.entries.len(), TOTAL);
+        assert_eq!(plan.ready_count(), TOTAL, "nothing in here is unreadable");
+        assert_eq!(
+            plan.ready_count() - report.duplicates(),
+            report.succeeded(),
+            "the plan's count minus the duplicates it did not know about is the \
+             number of files written"
+        );
     }
 
     /// The plan runs before anything is processed, so it is the cheap answer.
