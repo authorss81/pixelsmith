@@ -22,7 +22,7 @@ ever disagree, the marker wins and the table is a bug.
 | phase-08 | Lossy WebP via libwebp, verified on every target | DONE | `374e6ed` | See [phase-08 notes](#phase-08-notes) below. The two prior attempts failed on a pre-existing gate defect, not on their work. |
 | phase-09 | SIMD resize path behind a feature flag | DONE | `e906fa6` | See [phase-09 notes](#phase-09-notes) below. |
 | phase-10 | Benchmarks and a performance regression gate | DONE | `0ebccdf` | See [phase-10 notes](#phase-10-notes) below. **The CI workflow is delivered as a patch, as in phase-05/06/07/08 — the gate does not run until it is applied.** |
-| phase-11 | Low-peak-memory decode for very large images | DONE | (this commit) | See [phase-11 notes](#phase-11-notes) below. |
+| phase-11 | Low-peak-memory decode for very large images | DONE | `9cef389` | See [phase-11 notes](#phase-11-notes) below. |
 | phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
 | phase-13 | Animated GIF: honest handling | PENDING | | |
 | phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
