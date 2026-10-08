@@ -1,0 +1,253 @@
+diff --git a/.gitignore b/.gitignore
+index b120b05..4305021 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -6,6 +6,12 @@
+ build/
+ android/.gradle/
+ android/local.properties
++# Release signing properties. The keystore itself lives in the CI runner's
++# temporary directory and is never in this repository; this file names it, and
++# a committed one would carry the store password and the key alias with it.
++android/key.properties
++android/*.jks
++android/*.keystore
+ ios/Pods/
+ ios/.symlinks/
+ macos/Pods/
+diff --git a/README.md b/README.md
+index 621981e..adf18e7 100644
+--- a/README.md
++++ b/README.md
+@@ -21,6 +21,41 @@ interface on top of `lib/rust/`; they do not re-prove the boundary.
+ | `test/models_test.dart` | Enum serialisation, request envelopes, boundary math |
+ | `test/ffi_contract_test.dart` | Layout assertion + every entry point, skipped when the library is not built |
+ 
++## Installing it
++
++Downloads are on the [PixelSmith releases page](https://github.com/authorss81/pixelsmith/releases).
++Two shapes, and the difference matters:
++
++| Platform | What you get | How to run it |
++| --- | --- | --- |
++| **Windows** | `pixelsmith-<version>-windows-x64.zip` | Unzip anywhere — the desktop, a USB stick — and run `shrinkray.exe`. No installer, no admin rights, no registry writes. |
++| **Android** | `pixelsmith-<version>-android.apk`, and `.aab` for Play | Sideload the APK (Settings → allow installing from your browser), or install from the Play listing. |
++
++**Windows will warn you, and it is not a mistake.** The EXE is not code-signed,
++because a signing certificate is issued to an organisation and paid for by one,
++and this project has neither. SmartScreen calls an unsigned binary an
++"unrecognised app", shows a blue dialog, and — on some builds — refuses to run
++it until you click **More info → Run anyway**. Every other unsigned program gets
++the same warning. If you would rather not click through a warning about a
++program you have not read, build it yourself: it is four commands in
++[Building](#building) and the source is the whole repository.
++
++The alternative — an MSIX or an MSI — would be signed too, or would prompt for
++admin rights, or both. A portable ZIP is the honest shape for an unsigned
++project, and the README says so rather than hoping nobody notices.
++
++**Which checksum to compare.** Every release attaches a `SHA256SUMS.txt`. After
++downloading:
++
++```bash
++sha256sum -c SHA256SUMS.txt
++```
++
++And the sizes: a Windows bundle is roughly 30 MB and an APK roughly 60 MB. Both
++are larger than a photo resizer "should" be, because the Rust engine is statically
++linked into each binary and the APK carries four ABIs' worth of it. That is the
++cost of shipping no dynamic dependencies and no installer.
++
+ ## Building
+ 
+ ### The engine
+@@ -51,11 +86,21 @@ skips gracefully when nothing is built, and says so.
+ 
+ ### Release artefacts
+ 
+-`.github/workflows/build.yml` builds a debug-signed APK and a Windows release
+-bundle on every push, and asserts the APK contains `classes.dex` plus
+-`lib/*/libpixelsmith_core.so` — an APK without its native library opens fine
+-and crashes on first tap. Signed releases are cut by hand; see the PixelSmith
+-`phase-16` prompt for the checklist.
++`.github/workflows/build.yml` builds a release APK and a Windows release bundle
++on every push and **opens each one to assert what is inside it**: a
++`classes.dex`, an `libpixelsmith_core.so` for every ABI that ships a
++`libflutter.so`, and — for Windows — `pixelsmith_core.dll` sitting *next to* the
++EXE. An APK with no native library opens fine and throws on the first resize, and
++no build log says so.
++
++The signing workflow is `.github/workflows/release.yml`, which cuts a **draft**
++release from a tag, attaches the artefacts, their SHA-256 sums and the SBOM. It is
++signing-optional by design: with the four Actions secrets in
++[docs/RELEASE.md §4](https://github.com/authorss81/pixelsmith/blob/main/docs/RELEASE.md)
++it signs with a Play upload key; without them it produces a release-mode APK
++signed with the standard Android debug key and says so in the release body. The
++release runbook, including what a release is and is not, is
++[docs/RELEASE.md](https://github.com/authorss81/pixelsmith/blob/main/docs/RELEASE.md).
+ 
+ ## The contract
+ 
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index 3ee10dd..6af453b 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -1,9 +1,38 @@
++// `java` is the Gradle java extension in a build script, so `java.util.Properties`
++// does not resolve without the import — and it resolved fine in an ad-hoc
++// snippet, which is why this is written down rather than discovered.
++import java.util.Properties
++
+ plugins {
+     id("com.android.application")
+     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
+     id("dev.flutter.flutter-gradle-plugin")
+ }
+ 
++// Release signing.
++//
++// A keystore is never committed to this repository and never will be: a release
++// key that is in git is a release key that is in every clone, every fork and
++// every CI log. Instead the workflow decodes one out of an Actions secret into
++// RUNNER_TEMP and writes android/key.properties, which is gitignored. See
++// docs/RELEASE.md §4 in the PixelSmith repository.
++//
++// When key.properties is absent — a contributor's machine, a fork, any CI run
++// without the secrets — the release build falls back to the standard Android
++// debug key and says so. That is deliberate: it produces an installable APK
++// (with USB debugging on) so every contributor can install the change they just
++// made, and it is not what Google Play accepts, which is stated rather than
++// discovered. Failing closed instead would mean the only person who can fix it
++// gets a red run.
++val keystorePropertiesFile = rootProject.file("key.properties")
++val keystoreProperties = Properties().apply {
++    if (keystorePropertiesFile.exists()) {
++        keystorePropertiesFile.inputStream().use { load(it) }
++    }
++}
++val hasReleaseSigning = keystorePropertiesFile.exists() &&
++    keystoreProperties.getProperty("storeFile")?.let { file(it).exists() } == true
++
+ android {
+     namespace = "dev.pixelsmith.shrinkray"
+     compileSdk = flutter.compileSdkVersion
+@@ -15,21 +44,61 @@ android {
+     }
+ 
+     defaultConfig {
+-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
++        // Reverse-DNS and stable: this is the identity the OS uses to tell one
++        // installable from another, and changing it after publication means the
++        // next release is a different app to every device already holding this
++        // one. `dev.pixelsmith.shrinkray` is the project's, not a template
++        // default (Flutter's generated one is com.example.<project>).
+         applicationId = "dev.pixelsmith.shrinkray"
+-        // You can update the following values to match your application needs.
+-        // For more information, see: https://flutter.dev/to/review-gradle-config.
++
+         minSdk = flutter.minSdkVersion
+         targetSdk = flutter.targetSdkVersion
+         versionCode = flutter.versionCode
+         versionName = flutter.versionName
++
++        ndk {
++            // The ABIs the engine is actually built for, written down in one
++            // place. Gradle packages a jniLibs directory for every ABI it finds,
++            // so an undeclared set is how an APK ends up shipping an ABI the
++            // build never produced a library for — "works on my device" is the
++            // symptom, and the cause is a list that exists twice and is compared
++            // by nobody.
++            //
++            // The release workflow reads this list out of this file rather than
++            // repeating it, and scripts/verify-release-artifact.sh compares the
++            // built APK against it, so a disagreement is a red build instead of
++            // a bug report. `x86` is deliberately absent: Flutter ships
++            // libflutter.so for it, but there is no device worth 60 MB of APK
++            // for that uses it, and an ABI with no engine library is an ABI that
++            // installs and then crashes.
++            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
++        }
++    }
++
++    signingConfigs {
++        if (hasReleaseSigning) {
++            create("release") {
++                storeFile = file(keystoreProperties.getProperty("storeFile"))
++                storePassword = keystoreProperties.getProperty("storePassword")
++                keyAlias = keystoreProperties.getProperty("keyAlias")
++                keyPassword = keystoreProperties.getProperty("keyPassword")
++                    ?: keystoreProperties.getProperty("storePassword")
++            }
++        }
+     }
+ 
+     buildTypes {
+         release {
+-            // TODO: Add your own signing config for the release build.
+-            // Signing with the debug keys for now, so `flutter run --release` works.
+-            signingConfig = signingConfigs.getByName("debug")
++            signingConfig = if (hasReleaseSigning) {
++                signingConfigs.getByName("release")
++            } else {
++                logger.warn(
++                    "pixelsmith: no android/key.properties, so the release APK is " +
++                        "DEBUG-SIGNED. It installs with USB debugging on and Google " +
++                        "Play will not accept it. See docs/RELEASE.md §4."
++                )
++                signingConfigs.getByName("debug")
++            }
+         }
+     }
+ }
+@@ -42,4 +111,4 @@ kotlin {
+ 
+ flutter {
+     source = "../.."
+-}
++}
+\ No newline at end of file
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 713476d..996184b 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -1,6 +1,6 @@
+ <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+     <application
+-        android:label="shrinkray"
++        android:label="ShrinkRay"
+         android:name="${applicationName}"
+         android:icon="@mipmap/ic_launcher">
+         <activity
+diff --git a/pubspec.yaml b/pubspec.yaml
+index 6728e06..dcbbceb 100644
+--- a/pubspec.yaml
++++ b/pubspec.yaml
+@@ -1,5 +1,5 @@
+ name: shrinkray
+-description: "ShrinkRay - a local-first image resizer. Flutter UI over the PixelSmith Rust engine. Zero network I/O."
++description: "ShrinkRay resizes, converts and strips images on your own device. The Rust engine it runs on has no HTTP, TLS, socket or DNS crate in its dependency tree, so it cannot upload your photographs even if a future version of it wanted to."
+ # The following line prevents the package from being accidentally published to
+ # pub.dev using `flutter pub publish`. This is preferred for private packages.
+ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
+diff --git a/windows/runner/Runner.rc b/windows/runner/Runner.rc
+index 4b6e222..f131d5b 100644
+--- a/windows/runner/Runner.rc
++++ b/windows/runner/Runner.rc
+@@ -89,13 +89,13 @@ BEGIN
+     BEGIN
+         BLOCK "040904e4"
+         BEGIN
+-            VALUE "CompanyName", "dev.pixelsmith" "\0"
+-            VALUE "FileDescription", "shrinkray" "\0"
++            VALUE "CompanyName", "PixelSmith" "\0"
++            VALUE "FileDescription", "ShrinkRay - a local-first image resizer that never uploads anything" "\0"
+             VALUE "FileVersion", VERSION_AS_STRING "\0"
+             VALUE "InternalName", "shrinkray" "\0"
+-            VALUE "LegalCopyright", "Copyright (C) 2026 dev.pixelsmith. All rights reserved." "\0"
++            VALUE "LegalCopyright", "Copyright (C) 2026 the PixelSmith authors. MIT OR Apache-2.0." "\0"
+             VALUE "OriginalFilename", "shrinkray.exe" "\0"
+-            VALUE "ProductName", "shrinkray" "\0"
++            VALUE "ProductName", "ShrinkRay" "\0"
+             VALUE "ProductVersion", VERSION_AS_STRING "\0"
+         END
+     END

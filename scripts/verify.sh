@@ -415,6 +415,56 @@ check "vet/ audits present for the crates the advisory DB cannot answer for" \
   "[ -f vet/config.toml ] && grep -q 'libwebp-sys' vet/config.toml && grep -q 'heic-rs' vet/config.toml"
 
 # -----------------------------------------------------------------------------
+# Release identity and release secrets.
+#
+# These are hygiene checks in the same sense the rest of section 5 is: nothing in
+# the build depends on them, they are cheap to get wrong by accident, and both
+# mistakes are silent until a user is holding the file.
+
+# One version, in core/Cargo.toml, app/pubspec.yaml and CHANGELOG.md. Three
+# places to update is three places to forget, and px_version() reporting 0.1.0
+# next to a store listing that says 0.2.0 is a bug nobody notices until a bug
+# report quotes the wrong one.
+check "core/Cargo.toml, app/pubspec.yaml and CHANGELOG.md agree on the version" \
+  "bash scripts/check-version.sh"
+
+# No signing material in the tree, ever. .gitignore lists the extensions, and a
+# gitignore is a request rather than a guarantee — this is the guarantee. The
+# release key is the one secret this project genuinely cannot lose, and a
+# committed one cannot be un-committed from every clone already made.
+check "no keystore, .jks or key.properties is tracked" \
+  "! git ls-files | grep -Ei '\\.(jks|keystore)$|(^|/)key\\.properties$'"
+
+# A changelog whose newest entry is not the shipped version is a release nobody
+# wrote down, and the section that makes this one worth reading is the one about
+# what is still missing.
+check "CHANGELOG.md names this version and its gaps" \
+  "[ -f CHANGELOG.md ] && grep -qE '^## +\\[?[0-9]+\\.[0-9]+\\.[0-9]+' CHANGELOG.md && grep -q 'Still missing' CHANGELOG.md"
+
+check "docs/RELEASE.md exists and says which secrets make a Play build" \
+  "[ -f docs/RELEASE.md ] && grep -q 'ANDROID_KEYSTORE_BASE64' docs/RELEASE.md && grep -q 'SHA-256' docs/RELEASE.md"
+
+# One row per artefact, including the ones that were not built. `grep -c` counts
+# lines, so this is the number of rows and not something else.
+check "scripts/RELEASE-SHA256.txt has a row per release artefact" \
+  "[ -f scripts/RELEASE-SHA256.txt ] && [ \"\$(grep -cE '^pixelsmith-[0-9]+\\.[0-9]+\\.[0-9]+-' scripts/RELEASE-SHA256.txt)\" -ge 3 ]"
+
+# -----------------------------------------------------------------------------
+# The release tooling, proved able to fail.
+#
+# Every check a phase adds into this file gets run with a passing input before
+# it is believed. This repository has five recorded instances of a gate that
+# could not report the truth — phase-01's `check()`, phase-08's `| head -n 40`,
+# phase-10's `--test`, phase-15's target-triple regex and its `spdx_licenses`
+# typo — and two of those cost a phase whose actual work was already complete.
+# The three scripts below are the ones phase-16 adds, so each carries its own
+# `--self-test` and each is exercised here rather than trusted.
+head1 "5b. Release tooling can report failure"
+for tool in check-version verify-release-artifact release-checksums; do
+  check "scripts/${tool}.sh --self-test" "bash scripts/${tool}.sh --self-test"
+done
+
+# -----------------------------------------------------------------------------
 head1 "6. Result"
 say "  checks run: ${CHECKS}"
 say "  failures:   ${FAILURES}"

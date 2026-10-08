@@ -1124,6 +1124,136 @@ named so you can check the handling rather than re-derive it.
     names is the one with bytes written. Handled in `core/src/dedupe.rs` (`claim`)
     and `core/src/worker.rs` (`process_all`).
 
+## Release artefacts
+
+The engine is a library and the app is a shell, so "the product" exists only
+once somebody packages both and checks the package. This section is about the
+packaging, and there are three decisions in it that are not obvious from the file
+names.
+
+### The version is one number in four places, and a check
+
+`core/Cargo.toml`'s `[package] version` is the source of truth, because
+`px_version()` returns `CARGO_PKG_VERSION` and that is the version the compiled
+binary reports to whoever runs it. The other three are compared against it:
+
+| Where | Form | Why it is there |
+| --- | --- | --- |
+| `core/Cargo.toml` | `0.1.0` | what the binary says (`lib::ENGINE_VERSION`) |
+| `app/pubspec.yaml` | `0.1.0+1` | Android `versionCode` and the Windows build suffix |
+| `CHANGELOG.md` | `## [0.1.0]` | what shipped, and what did not |
+| the tag | `v0.1.0` | what the release is named |
+
+**The scheme is SemVer and this phase did not choose it.** Both manifests already
+said `0.1.0` when phase-16 started — `core/Cargo.toml` from phase-01,
+`app/pubspec.yaml` from the phase-05 scaffolding — and the phase prompt says
+explicitly not to invent one. So `scripts/check-version.sh` reads the two
+manifests, the changelog and the tag, and refuses to let them disagree, and
+`v0.1.0` is the tag that falls out of files that were already written. Recording
+it here is what makes it a decision rather than a coincidence.
+
+**The build number after `+` is deliberately excluded from the comparison.** It is
+the Android `versionCode`, it must increase on every Play upload, and a script
+that compared the whole `version:` string would fail on every upload after the
+first. `0.1.0+1` and `0.1.0+99` are the same release.
+
+The extractor is scoped to the `[package]` table rather than grepping the file,
+because `Cargo.toml` carries `version =` lines for path dependencies too and an
+extractor that read whichever came last would be reading the wrong one.
+`check-version.sh --self-test` has a case for exactly that.
+
+### The artefact is opened, not trusted
+
+`scripts/verify-release-artifact.sh` is the phase's real deliverable. The reason
+is in this repository's own history: an earlier revision of `build.yml` wrote the
+`.so` files to `app/src/rust/jniLibs`, which is where the desktop builds look and
+where **Gradle does not read**. The comment it left says *"The APK built fine and
+contained no native library — it opened and would have crashed on first tap."*
+That is a failure no build log reports, so it has to be asserted:
+
+* a `classes.dex`, and an `AndroidManifest.xml`;
+* an `libpixelsmith_core.so` for **every ABI that carries a `libflutter.so`** —
+  and the ABI list is taken from the archive's own Flutter libraries rather than
+  from the build's intent, because the archive's list is what a device can
+  actually load;
+* each engine library's ELF `e_machine` against the ABI it is filed under, and
+  `px_version` in its symbol table, because a 32-bit library under `arm64-v8a` and
+  an empty stub both pass every name-based check;
+* the archive's ABI set against `abiFilters` in `android/app/build.gradle.kts`,
+  **in both directions** — a declared ABI with no library is an install that
+  crashes, and an undeclared ABI is the classic "works on my device";
+* `minSdkVersion` at or above the engine's floor of 21, read with `aapt2`;
+* for Windows: `pixelsmith_core.dll` **next to** the EXE, not merely in the
+  archive, plus `data/app.so` (the Dart AOT snapshot) and no installer.
+
+Three of those assertions cost something to get right, and each is worth knowing
+about:
+
+* **`e_machine` is compared as raw file-order bytes, not as a number.** AArch64 is
+  the value `0x00B7`, which little-endian stores as the bytes `b7 00`, so `od
+  -tx1` prints `b700`. An earlier revision "corrected" the comparison table to
+  the reassembled form and the self-test went green, because the synthetic
+  fixtures were generated from the same wrong table. **A synthetic fixture cannot
+  tell you your convention is wrong when it is built with the convention.** It
+  took a real AArch64 library out of a real APK to catch it.
+* **`abiFilters` is parsed with balanced parentheses.** The idiomatic form is
+  `abiFilters += listOf("arm64-v8a", ...)`, whose closer is a paren; a range that
+  ended at the next `]` ran on into `signingConfigs` and reported `release
+  release debug` as three more ABIs.
+* **The EXE size floor is 40 KB, not the 100 KB the prompt suggested.** A
+  Flutter release launcher genuinely weighs about that much — the Dart AOT
+  snapshot ships separately as `data/app.so` — so 100 KB is a coin flip rather
+  than a guard, and a floor that flips is worse than no floor. The assertions that
+  catch a broken build are the DLL and the snapshot, both of which fail loudly;
+  the size floor is only there to catch a truncated file.
+
+### Nothing secret is in this repository, and signing does not fail closed
+
+No keystore, no `.jks`, no `key.properties`, no password. `.gitignore` lists them
+and `scripts/verify.sh` fails if one is ever tracked — a `.gitignore` is a
+request, and the check is the guarantee.
+
+The release workflow reads the keystore from an Actions secret into `RUNNER_TEMP`
+and writes `android/key.properties` only for the build. **With the secrets it
+signs with a Play upload key; without them it produces a release-mode,
+debug-signed APK and says so in the job summary, in an issue and in the draft
+release body.** That is the direction the failure should go: the repository owner
+is the only person who can add a secret, and a pipeline that fails closed on a
+missing one hands them a red run instead of a release. A debug-signed release
+APK still installs on a device with USB debugging on, which means every
+contributor can install the change they just made.
+
+### Portable ZIP, not MSIX and not an installer
+
+`ROADMAP.md` asks for a portable ZIP and this phase does that. An EXE is not a
+file here — a Flutter Windows release is a *directory* of the EXE, the Flutter
+engine DLLs, `data/` and `pico/*.dll` — so the release attaches the whole
+directory zipped. No installer means no admin rights, no registry writes and no
+`Program Files`, so it runs from a USB stick.
+
+The cost is stated where a user will meet it: the binary is not code-signed,
+because a signing certificate is issued to an organisation and paid for by one.
+Windows SmartScreen shows "unrecognised app" and on some builds refuses to run
+it until *More info → Run anyway*. An MSIX would need the same certificate; an
+MSI would additionally want admin rights. The unsigned ZIP is the honest shape,
+and both READMEs say so rather than hoping nobody notices.
+
+### What is a patch
+
+`workspace/phase-16/release-ci.patch` carries `release.yml` and the release-grade
+jobs in `build.yml`, and `workspace/phase-16/shrinkray-phase-16.patch` carries the
+`abiFilters`, the signing config, the app name and the app README. Neither can be
+pushed from the pipeline that wrote it — the workflow one because a GitHub App
+without the `workflows` permission may not touch `.github/workflows/`, and the app
+one because `app/` is `authorss81/shrinkray` and only `authorss81/pixelsmith` is
+writable. Same wall as phase-05/06/07/08/10/13/14/15, same answer.
+
+So **the release artefacts in `scripts/RELEASE-SHA256.txt` are the ones this
+phase actually built**, on a Linux runner, and the Windows row is `NOT-BUILT`
+with the reason in the row. That table is a fact about a release rather than a
+file that only existed on somebody's machine, which is why the absence is
+recorded in it instead of being left as a gap.
+
 ## Verification
 
 `bash scripts/verify.sh` is the gate, and it is what decides whether a phase

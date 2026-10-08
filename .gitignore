@@ -54,12 +54,24 @@ workspace/.stop
 workspace/*/.session
 workspace/*/.checkpoint
 
-# Secrets — belt and braces; the workflow uses Actions secrets
+# Secrets — belt and braces; the workflow uses Actions secrets.
+# The guarantee is the `git ls-files` check in scripts/verify.sh, not this file:
+# a .gitignore is a request, and a request is not a control.
 *.keystore
 *.jks
+*.p12
+*.pem
+/app/android/key.properties
+key.properties
 .env
 .env.*
 secrets/
+
+# Release artefacts. Built by .github/workflows/release.yml and attached to the
+# GitHub Release; a 58 MB APK has no business in a source tree, and its hash
+# lives in scripts/RELEASE-SHA256.txt.
+/artifacts/
+/app/artifacts/
 
 # Editors and OS
 .idea/

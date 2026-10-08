@@ -1,0 +1,51 @@
+# Release artefact checksums — version 0.1.0.
+#
+#     <artefact>  <sha256 | NOT-BUILT>  <bytes>  — <what it is, or why it is absent>
+#
+# Written by
+#     bash scripts/release-checksums.sh --write scripts/RELEASE-SHA256.txt \
+#         --version 0.1.0 <files...>
+#
+# This is NOT scripts/BUILD-SHA256.txt. That table is the engine library per Rust
+# target triple and answers "does the build reproduce". This one is the shipped
+# artefact and answers "is the file you downloaded the file we built". Neither is
+# derived from the other.
+#
+# A row reading NOT-BUILT is not a placeholder. It is an artefact the release was
+# supposed to contain and did not, with the reason stated in the row — a Windows
+# bundle cannot be produced on a Linux runner, a Play-signed AAB needs an upload
+# key the repository does not hold. Leaving the row out instead would make the
+# table read as a complete list of the release, which is the one thing a
+# checksum table must not do.
+#
+# Verify a download with:
+#     sha256sum -c <(grep -v '^#' scripts/RELEASE-SHA256.txt)
+pixelsmith-0.1.0-android-universal.apk               d4d9ee91b772f6dc0265019fa1a10c3b4a88872e96c8001952ff94ee26b6656b  58109122
+pixelsmith-0.1.0-android.aab                         dcc646b4b9acca45ac6fd11de425397383b221f7ed104a443c9ad9424df9a1ab  57394493
+pixelsmith-0.1.0-windows-x64.zip                     NOT-BUILT  -  — flutter build windows is MSBuild-based and does not cross-compile from Linux; the portable ZIP is the windows-bundle job in release.yml, which is workspace/phase-16/release-ci.patch for the credential reason every other workflow change here is a patch
+
+#
+# Provenance of the two rows that carry a hash, recorded because a hash without
+# a builder is an unfalsifiable claim. Reproduce with docs/RELEASE.md §3.
+#
+#   runner          GitHub Actions ubuntu-latest container, Linux x86-64
+#   flutter         3.47.6 stable (engine b8c8d3d8d5d0095127057f8a29ca8cc53da2167f8)
+#   dart            3.13.5
+#   gradle          the one `flutter build` resolved; see app/android/gradle/wrapper
+#   android sdk     build-tools 34.0.0 for aapt2; NDK 27.3.13750724 for the linker
+#   engine          rustc 1.99.0 (b940084d7 2026-09-28), --release, default features
+#                   (avif, webp-lossy), via cargo-ndk for all three ABIs
+#   app             submodule authorss81/shrinkray at 5d0e9cc PLUS
+#                   workspace/phase-16/shrinkray-phase-16.patch
+#                   (abiFilters, signing config, app name). The patch is not in
+#                   the app repository, so this APK is not reproducible from
+#                   5d0e9cc alone — it is reproducible from 5d0e9cc plus the patch.
+#   signing         DEBUG key. No ANDROID_KEYSTORE_BASE64 is set on this
+#                   repository, so nothing here is Play-distributable. See
+#                   docs/RELEASE.md §4.
+#
+# The engine libraries inside both archives are the same bytes as the
+# aarch64/armeabi/x86_64 rows would be, and are NOT covered by
+# scripts/BUILD-SHA256.txt: that table is a host-target reproducibility
+# measurement and cross-compiled Android binaries have never been hashed there.
+# Filling those three rows is the first thing to do on a runner with an NDK.

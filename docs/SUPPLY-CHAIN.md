@@ -296,6 +296,57 @@ already produces one per push in `supply-chain.yml`. The per-release steps are i
 
 ---
 
+## 5b. Release artefact checksums
+
+`scripts/BUILD-SHA256.txt` answers *"does this build reproduce?"* — one row per
+Rust target triple, and seven of eight are `NOT-MEASURED` because the runners do
+not exist (§1). It says nothing about the file a user downloads.
+
+`scripts/RELEASE-SHA256.txt` answers the other question: *"is the file you
+downloaded the file we built?"* It has one row per artefact in the release.
+
+| File | Question | Row key | Can be `NOT-MEASURED`? |
+| --- | --- | --- | --- |
+| `scripts/BUILD-SHA256.txt` | does the build reproduce | Rust target triple | yes — a target with no runner |
+| `scripts/RELEASE-SHA256.txt` | is this the published file | artefact filename | no — a missing artefact is a **failure of the release**, and the row says why |
+
+The difference in that last column is the whole design. A release artefact is
+either published or it is not; there is no state in which its absence is a
+measurement pending. So the second table records `NOT-BUILT` with the reason in
+the row, and a script refuses to write a `NOT-BUILT` row with no reason at all —
+silence one column over is the thing this table exists to avoid.
+
+**What is in it today.** Two rows with hashes and one without:
+
+| Artefact | State |
+| --- | --- |
+| `pixelsmith-0.1.0-android-universal.apk` | built, 58,109,122 bytes, 14 assertions passed |
+| `pixelsmith-0.1.0-android.aab` | built, 57,394,493 bytes, 14 assertions passed |
+| `pixelsmith-0.1.0-windows-x64.zip` | `NOT-BUILT` — `flutter build windows` does not cross-compile from Linux |
+
+Those two Android artefacts were built on a phase-16 runner and their provenance
+is recorded in the table's own footer: the Flutter, Dart, Gradle, Android NDK and
+`rustc` versions, and — the part that matters for reproduction — **the fact that
+the app half is `authorss81/shrinkray` at `5d0e9cc` plus
+`workspace/phase-16/shrinkray-phase-16.patch`**, because the patch is not in that
+repository. A hash whose inputs cannot be reconstructed is not a reproducibility
+claim, and saying so is cheaper than discovering it.
+
+**They are not signed.** The APK is release-mode and debug-signed: no
+`ANDROID_KEYSTORE_BASE64` is configured on this repository. It installs with USB
+debugging on and Google Play will not take it. `docs/RELEASE.md` §4 names the
+four secrets.
+
+**The checksums are also in the release body.** A published hash that lives only
+in this file is a hash a downloader has to have found. `.github/workflows/release.yml`
+attaches a `SHA256SUMS.txt` next to the artefacts and inlines the checksums in the
+release notes, so `sha256sum -c SHA256SUMS.txt` works on the download directory
+without visiting this repository.
+
+---
+
+---
+
 ## 6. What is a patch, and why
 
 `.github/workflows/build.yml` and `.github/workflows/supply-chain.yml` cannot be
@@ -330,6 +381,18 @@ git apply workspace/phase-15/supply-chain-ci.patch
 git add -A && git commit -m 'phase-15: enforce the supply-chain policy in CI' && git push
 ```
 
+**`workspace/phase-16/release-ci.patch` adds, on the same terms:**
+
+| Job | What it does |
+| --- | --- |
+| `release.yml` in full | Triggered by a `v*` tag. Proves `check-version.sh --tag`, builds the release APK and the `.aab` on Linux, zips the Windows bundle on a Windows runner, verifies each artefact by opening it, writes the checksums, pulls the SBOM down from the `supply-chain` run for the same SHA, and creates a **draft** release |
+| `identity` job | Reports whether the signing secrets are present, and if not opens (once) an issue naming the four to add |
+| Android jobs in `build.yml` | `abiFilters` read out of the Gradle config instead of repeated, `--split-per-abi`, and both artefact checks |
+| Windows job in `build.yml` | Zips the bundle and runs the portable-bundle check, which asserts `pixelsmith_core.dll` is **next to** the EXE |
+
+Draft on purpose: the release body's second half is CHANGELOG.md's "still missing"
+section, and the person who should read it is the person who decides to publish.
+
 **So what is claimed today is what is in the tree.** `deny.toml` is committed and
 `cargo deny check` runs in the `deny` job, which is in the tree today. The
 negative control, the SBOM-per-release steps and the reproducible-build job are
@@ -348,6 +411,8 @@ same about `webp-lossy-matrix` and `docs/phase-status.md` about `bench.yml`.
 | §4, the policy verdict | `bash scripts/deny-check.sh --negative-control` | same |
 | §4, which duplicates exist | `cargo tree --manifest-path core/Cargo.toml --duplicates -e normal,build` | same |
 | §5, the SBOM | the two commands in §5 | same |
+| §5b, the artefact hashes | `bash scripts/release-checksums.sh --check scripts/RELEASE-SHA256.txt artifacts/*` | the runner named in the table's footer |
+| §5b, what is inside them | `bash scripts/verify-release-artifact.sh apk <file> --abi-source app/android/app/src/main/jniLibs` | same |
 | the no-network claim | `bash scripts/no-network-report.sh --build` | same |
 
 The `-e normal,build` on the duplicate-versions command is not decoration:

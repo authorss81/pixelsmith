@@ -1,0 +1,457 @@
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+new file mode 100644
+index 0000000..e35bbaf
+--- /dev/null
++++ b/.github/workflows/release.yml
+@@ -0,0 +1,450 @@
++name: release
++
++# Builds the shipped artefacts for a version tag, verifies each one by opening
++# it, publishes SHA-256 checksums, and creates a DRAFT GitHub Release.
++#
++# Draft on purpose. Publishing is a human decision, and the thing a human should
++# read before deciding is the "still missing" section of CHANGELOG.md — which is
++# the release body's second half. A workflow that publishes on tag push makes
++# that section something nobody reads until after it ships.
++#
++# The signing secrets are OPTIONAL, deliberately:
++#
++#   ANDROID_KEYSTORE_BASE64  base64 of the Play upload keystore
++#   ANDROID_KEYSTORE_PASSWORD
++#   ANDROID_KEY_ALIAS
++#   ANDROID_KEY_PASSWORD      optional; defaults to ANDROID_KEYSTORE_PASSWORD
++#
++# Without them the Android artefacts are produced release-mode and debug-signed,
++# which installs on a device with USB debugging and is NOT accepted by Google
++# Play. That is the right failure direction: the repository owner is the only
++# person who can add a secret, and a pipeline that fails closed on a missing one
++# hands them a red run instead of a release. The `signing` job reports which of
++# the two happened, in the job summary and in an issue, so "debug-signed" is
++# never something a reader has to discover.
++#
++# Nothing secret is written into the tree. The keystore is decoded into
++# RUNNER_TEMP and android/key.properties is created there and removed after the
++# build; both paths are outside the repository.
++#
++# This file could not be pushed by the pipeline that wrote it (a GitHub App
++# without `workflows` permission), so it ships as
++# workspace/phase-16/release-ci.patch. See docs/RELEASE.md §6.
++
++on:
++  push:
++    tags: ["v*"]
++  workflow_dispatch:
++    inputs:
++      tag:
++        description: "Existing tag to build a draft release for"
++        required: true
++        type: string
++
++permissions:
++  contents: write
++  issues: write
++
++env:
++  # One place, so the three jobs cannot disagree about what version they are
++  # building. check-version.sh then proves the tag and both manifests agree.
++  PX_VERSION: ${{ inputs.tag || github.ref_name }}
++
++jobs:
++  # ---------------------------------------------------------------------------
++  # Prove the tag and the manifests say the same thing before spending an hour
++  # building. A release tagged v0.2.0 out of a tree whose engine says 0.1.0 is a
++  # release whose own diagnostics report the wrong version.
++  identity:
++    name: version and provenance
++    runs-on: ubuntu-latest
++    outputs:
++      version: ${{ steps.v.outputs.version }}
++      signed: ${{ steps.sign.outputs.signed }}
++    steps:
++      - uses: actions/checkout@v5
++        with:
++          submodules: recursive
++
++      - name: The tag, the engine and the app agree
++        run: |
++          bash scripts/check-version.sh --tag "${PX_VERSION}"
++          echo "version=${PX_VERSION#v}" >> "$GITHUB_OUTPUT"
++
++      - name: Are the signing secrets present?
++        id: sign
++        run: |
++          if [ -n "${ANDROID_KEYSTORE_BASE64:-}" ] && [ -n "${ANDROID_KEYSTORE_PASSWORD:-}" ] \
++             && [ -n "${ANDROID_KEY_ALIAS:-}" ]; then
++            echo "signed=true" >> "$GITHUB_OUTPUT"
++            echo "### Android artefacts will be signed with the Play upload key." >> "$GITHUB_STEP_SUMMARY"
++          else
++            echo "signed=false" >> "$GITHUB_OUTPUT"
++            echo "### NOT SIGNED. The Android artefacts will be debug-signed:" >> "$GITHUB_STEP_SUMMARY"
++            echo "### installable with USB debugging on, NOT acceptable to Google Play." >> "$GITHUB_STEP_SUMMARY"
++            echo "### See docs/RELEASE.md §4 for the four secrets to add." >> "$GITHUB_STEP_SUMMARY"
++          fi
++
++      - name: Explain the missing secrets, once, as an issue
++        if: steps.sign.outputs.signed == 'false'
++        run: |
++          TITLE="Play-distributable Android build: four secrets to add"
++          BODY=$(cat <<'MD'
++          The release workflow built release-mode Android artefacts and signed them with the
++          **standard Android debug key**, because the upload keystore secrets are not set on
++          this repository. They install on a device with USB debugging enabled and Google Play
++          will not accept them.
++
++          To make `v${{ env.PX_VERSION }}` Play-distributable, add these four secrets under
++          **Settings → Secrets and variables → Actions**, then re-run the release workflow:
++
++          | Secret | What it is |
++          | --- | --- |
++          | `ANDROID_KEYSTORE_BASE64` | `base64 -w0 upload-keystore.jks` |
++          | `ANDROID_KEYSTORE_PASSWORD` | its password |
++          | `ANDROID_KEY_ALIAS` | usually `upload` |
++          | `ANDROID_KEY_PASSWORD` | only if it differs from the store password |
++
++          Generate the upload key once and keep it somewhere that is not this repository:
++
++          ```bash
++          keytool -genkey -v -keystore upload-keystore.jks \
++                  -keyalg RSA -keysize 2048 -validity 10000 -alias upload
++          ```
++
++          Nothing about this is checked into the repository, and
++          `scripts/verify.sh` fails the build if a keystore, a `.jks` or a
++          `key.properties` is ever tracked.
++          MD
++          )
++          if gh issue list --search "$TITLE in:title" --state all --json number \
++               | grep -q '"number"'; then
++            echo "issue already open; not duplicating it"
++          else
++            gh issue create --title "$TITLE" --body "$BODY"
++          fi
++
++      - name: Publish the SBOM alongside the artefacts
++        # The SBOM is produced by the sbom job in supply-chain.yml, which runs
++        # on the same push. A release with an SBOM attached is a release whose
++        # contents are enumerable; without it the only list is Cargo.lock.
++        continue-on-error: true
++        run: |
++          RUN=$(gh api "repos/${{ github.repository }}/actions/runs?event=push&per_page=30" \
++                --jq '[.workflow_runs[] | select(.name == "supply-chain" and .head_sha == env.GITHUB_SHA)] | first | .id // empty')
++          if [ -z "${RUN}" ]; then
++            echo "::notice::no supply-chain run found for this SHA; the release will have no SBOM"
++            exit 0
++          fi
++          mkdir -p artifacts
++          gh run download "${RUN}" --name pixelsmith-sbom-cyclonedx -D artifacts || {
++            echo "::notice::supply-chain run ${RUN} produced no SBOM artefact"
++            exit 0
++          }
++          ls -la artifacts
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: release-metadata
++          path: artifacts/
++          if-no-files-found: ignore
++
++  # ---------------------------------------------------------------------------
++  android:
++    name: Android APK and AAB
++    needs: identity
++    runs-on: ubuntu-latest
++    timeout-minutes: 60
++    steps:
++      - uses: actions/checkout@v5
++        with:
++          submodules: recursive
++
++      - uses: actions/setup-java@v5
++        with:
++          distribution: temurin
++          java-version: "21"
++
++      - name: Accept Android SDK licences
++        run: |
++          SDKMGR="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
++          yes | "$SDKMGR" --licenses >/dev/null 2>&1 || true
++          "$SDKMGR" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
++
++      - uses: dtolnay/rust-toolchain@stable
++        with:
++          # The exact set the Gradle config's abiFilters declares. A Rust target
++          # here that is not in abiFilters is built and discarded; one missing
++          # is an APK that installs and crashes on a whole class of devices.
++          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
++
++      - name: Install cargo-ndk
++        run: cargo install cargo-ndk
++
++      - uses: subosito/flutter-action@v2
++        with:
++          channel: stable
++          cache: true
++
++      - name: Resolve dependencies
++        working-directory: app
++        run: flutter pub get
++
++      - name: Build the Rust engine for every declared ABI
++        working-directory: core
++        run: |
++          mkdir -p ../app/android/app/src/main/jniLibs
++          # The ABI list is read out of the Gradle config rather than repeated
++          # here. Two hard-coded lists is how a build ends up shipping an ABI it
++          # never declared — and scripts/verify-release-artifact.sh compares
++          # the archive against abiFilters, so a disagreement is a red build
++          # rather than a "works on my device" bug report.
++          ABIS=$(sed -n '/abiFilters/,/]/p' ../app/android/app/build.gradle.kts \
++                 | grep -oE '"[a-z0-9_-]+"' | tr -d '"' | tr '\n' ' ')
++          echo "declared abiFilters: ${ABIS}"
++          NDK_ABIS=""
++          for abi in ${ABIS}; do
++            case "${abi}" in
++              arm64-v8a)   NDK_ABIS="${NDK_ABIS} arm64-v8a" ;;
++              armeabi-v7a) NDK_ABIS="${NDK_ABIS} armeabi-v7a" ;;
++              x86_64)      NDK_ABIS="${NDK_ABIS} x86_64" ;;
++              x86)         NDK_ABIS="${NDK_ABIS} x86" ;;
++              *) echo "::error::abiFilters names an ABI cargo-ndk does not: ${abi}"; exit 1 ;;
++            esac
++          done
++          cargo ndk -t ${NDK_ABIS} -o ../app/android/app/src/main/jniLibs build --release --lib
++          find ../app/android/app/src/main/jniLibs -name '*.so' -exec ls -la {} \;
++
++      - name: Decode the upload keystore
++        if: needs.identity.outputs.signed == 'true'
++        env:
++          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
++        run: |
++          # Never into the repository: the whole point of the check in verify.sh
++          # is that nothing secret is ever tracked, and a file under RUNNER_TEMP
++          # cannot be committed by accident.
++          KEYSTORE_PATH="${RUNNER_TEMP}/upload-keystore.jks"
++          printf '%s' "${KEYSTORE}" | base64 --decode > "${KEYSTORE_PATH}"
++          cat > app/android/key.properties <<EOF
++          storeFile=${KEYSTORE_PATH}
++          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
++          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
++          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD || secrets.ANDROID_KEYSTORE_PASSWORD }}
++          EOF
++          echo "key.properties written; it is untracked and gitignored"
++          git status --porcelain app/android/key.properties
++
++      - name: Build the release APK
++        working-directory: app
++        run: flutter build apk --release
++
++      - name: Build the release app bundle
++        working-directory: app
++        # Play requires an .aab. An APK alone cannot be published there, no
++        # matter how it is signed.
++        run: flutter build appbundle --release
++
++      - name: Verify the APK
++        working-directory: app
++        run: bash ../scripts/verify-release-artifact.sh apk \
++             "$(find build/app/outputs -name '*.apk' | head -n1)" \
++             --abi-source android/app/src/main/jniLibs \
++             --label "release APK"
++
++      - name: Verify the app bundle
++        working-directory: app
++        run: bash ../scripts/verify-release-artifact.sh aab \
++             "$(find build/app/outputs/bundle -name '*.aab' | head -n1)" \
++             --label "release app bundle"
++
++      - name: Remove the keystore
++        if: always() && needs.identity.outputs.signed == 'true'
++        run: rm -f "${RUNNER_TEMP}/upload-keystore.jks" app/android/key.properties
++
++      - name: Collect the artefacts
++        run: |
++          mkdir -p artifacts
++          cp "$(find app/build/app/outputs -name 'app-release.apk' | head -n1)" \
++             "artifacts/pixelsmith-${PX_VERSION}-android-universal.apk"
++          cp "$(find app/build/app/outputs/bundle -name '*.aab' | head -n1)" \
++             "artifacts/pixelsmith-${PX_VERSION}-android.aab"
++          ls -la artifacts
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: android-artefacts
++          path: artifacts/
++          if-no-files-found: error
++
++  # ---------------------------------------------------------------------------
++  # `flutter build windows` is MSBuild-based and does not cross-compile, so this
++  # job can only exist on a Windows runner. A portable ZIP rather than an MSI:
++  # no installer, no admin rights, no registry writes, runs from a USB stick.
++  windows:
++    name: Windows portable ZIP
++    needs: identity
++    runs-on: windows-latest
++    timeout-minutes: 60
++    steps:
++      - uses: actions/checkout@v5
++        with:
++          submodules: recursive
++
++      - uses: dtolnay/rust-toolchain@stable
++
++      - uses: subosito/flutter-action@v2
++        with:
++          channel: stable
++          cache: true
++
++      - name: Resolve dependencies
++        working-directory: app
++        run: flutter pub get
++
++      - name: Build the Rust engine for Windows
++        working-directory: core
++        shell: pwsh
++        run: |
++          cargo build --release --lib
++          # CMake installs the DLL from windows/runner, and `flutter build
++          # windows` ignores one that is merely sitting in src/rust/.
++          New-Item -ItemType Directory -Force -Path ..\app\windows\runner | Out-Null
++          Copy-Item target\release\pixelsmith_core.dll ..\app\windows\runner\ -Force
++          New-Item -ItemType Directory -Force -Path ..\app\src\rust | Out-Null
++          Copy-Item target\release\pixelsmith_core.dll ..\app\src\rust\ -Force
++
++      - name: Build the Windows bundle
++        working-directory: app
++        run: flutter build windows --release
++
++      - name: Zip it, flat and without an installer
++        working-directory: app
++        shell: pwsh
++        run: |
++          New-Item -ItemType Directory -Force -Path ..\artifacts | Out-Null
++          $zip = "..\artifacts\pixelsmith-$env:PX_VERSION-windows-x64.zip"
++          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath $zip
++          Get-Item $zip | ForEach-Object { Write-Output "### $zip ($($_.Length) bytes)" }
++
++      - name: Verify the portable bundle
++        working-directory: app
++        run: bash ../scripts/verify-release-artifact.sh windows \
++             "$(find ../artifacts -name '*.zip' | head -n1)" \
++             --label "Windows portable bundle"
++
++      - uses: actions/upload-artifact@v4
++        with:
++          name: windows-artefacts
++          path: artifacts/
++          if-no-files-found: error
++
++  # ---------------------------------------------------------------------------
++  # The release itself. Draft, with checksums and the SBOM attached.
++  publish:
++    name: draft GitHub Release
++    needs: [identity, android, windows]
++    runs-on: ubuntu-latest
++    permissions:
++      contents: write
++      issues: write
++    steps:
++      - uses: actions/checkout@v5
++        with:
++          submodules: recursive
++
++      - name: Download the artefacts
++        run: |
++          mkdir -p artifacts
++          gh run download "${{ github.run_id }}" --name android-artefacts -D artifacts
++          gh run download "${{ github.run_id }}" --name windows-artefacts -D artifacts
++          gh run download "${{ github.run_id }}" --name release-metadata -D artifacts || true
++          ls -la artifacts
++
++      - name: Verify every artefact one last time, from the downloaded copy
++        # The build jobs verified their own output. This verifies the bytes that
++        # are actually about to be published, which is a different file: an
++        # upload-artifact step that globs too much, or a path that resolves
++        # somewhere else on a fresh runner, produces an artefact nobody opened.
++        run: |
++          set -e
++          for apk in artifacts/*.apk; do
++            bash scripts/verify-release-artifact.sh apk "${apk}" --label "published $(basename "${apk}")"
++          done
++          for aab in artifacts/*.aab; do
++            bash scripts/verify-release-artifact.sh aab "${aab}" --label "published $(basename "${aab}")"
++          done
++          for zip in artifacts/*.zip; do
++            bash scripts/verify-release-artifact.sh windows "${zip}" --label "published $(basename "${zip}")"
++          done
++
++      - name: SHA-256 for every artefact
++        run: |
++          bash scripts/release-checksums.sh --write scripts/RELEASE-SHA256.txt \
++            --version "${PX_VERSION#v}" \
++            --reason "an artefact in this release was not produced; see the release body" \
++            artifacts/*.apk artifacts/*.aab artifacts/*.zip
++          ( cd artifacts && sha256sum *.apk *.aab *.zip > SHA256SUMS.txt )
++          cat scripts/RELEASE-SHA256.txt
++          echo "---"
++          cat artifacts/SHA256SUMS.txt
++
++      - name: Build the release body
++        run: |
++          {
++            echo "Draft release for \`${PX_VERSION}\`. Publishing is a human decision;"
++            echo "read the second half of this page before making it."
++            echo
++            echo "## What is in this release"
++            echo
++            echo "The \`Still missing\` section of CHANGELOG.md for \`${PX_VERSION#v}\`"
++            echo "is reproduced verbatim below, because it is the part that decides whether"
++            echo "this is the right thing to ship."
++            echo
++            echo '```'
++            awk '/^### Still missing/{f=1} /^### Security/{f=0} f' CHANGELOG.md
++            echo '```'
++            echo
++            if [ "${{ needs.identity.outputs.signed }}" = "true" ]; then
++              echo "The Android artefacts are signed with the Play upload key."
++            else
++              echo "> **The Android artefacts are debug-signed.** No upload keystore is"
++              echo "> configured on this repository, so they install only with USB debugging"
++              echo "> on and Google Play will not accept them. The four secrets that change"
++              echo "> that are named in docs/RELEASE.md §4 and in the issue this run opened."
++            fi
++            echo
++            echo "## Verify a download"
++            echo
++            echo '```'
++            echo "sha256sum -c SHA256SUMS.txt"
++            echo '```'
++          } > artifacts/RELEASE-NOTES.md
++          cat artifacts/RELEASE-NOTES.md
++
++      - name: Create the draft release
++        run: |
++          ATTACHMENTS=$(ls artifacts/*.apk artifacts/*.aab artifacts/*.zip \
++                             artifacts/SHA256SUMS.txt artifacts/RELEASE-SHA256.txt \
++                             2>/dev/null | tr '\n' ' ')
++          SBOM=$(ls artifacts/*.cdx.json 2>/dev/null | head -n1)
++          if [ -n "${SBOM}" ]; then
++            ATTACHMENTS="${ATTACHMENTS} ${SBOM}"
++          else
++            echo "::notice::no SBOM attached — the supply-chain job produced none for this SHA"
++          fi
++          # --draft. See the header.
++          gh release create "${PX_VERSION}" ${ATTACHMENTS} \
++            --draft --verify-tag --title "${PX_VERSION}" \
++            --notes-file artifacts/RELEASE-NOTES.md
++
++      - name: Record the artefact hashes on main
++        # Committed so that scripts/RELEASE-SHA256.txt is a fact about a release
++        # rather than a file that only ever existed on a runner.
++        run: |
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++          git add scripts/RELEASE-SHA256.txt
++          git diff --cached --quiet && {
++            echo "hashes unchanged; nothing to commit"; exit 0; }
++          git commit -m "release ${PX_VERSION}: artefact checksums"
++          git push origin HEAD:main
+\ No newline at end of file
