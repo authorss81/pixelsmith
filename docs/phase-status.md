@@ -23,8 +23,8 @@ ever disagree, the marker wins and the table is a bug.
 | phase-09 | SIMD resize path behind a feature flag | DONE | `e906fa6` | See [phase-09 notes](#phase-09-notes) below. |
 | phase-10 | Benchmarks and a performance regression gate | DONE | `0ebccdf` | See [phase-10 notes](#phase-10-notes) below. **The CI workflow is delivered as a patch, as in phase-05/06/07/08 — the gate does not run until it is applied.** |
 | phase-11 | Low-peak-memory decode for very large images | DONE | `9cef389` | See [phase-11 notes](#phase-11-notes) below. |
-| phase-12 | Colour management: sRGB, Display-P3 and ICC | PENDING | | |
-| phase-13 | Animated GIF: honest handling | PENDING | | |
+| phase-12 | Colour management: sRGB, Display-P3 and ICC | DONE | `7dc119d` | See [phase-12 notes](#phase-12-notes) below. The `app/` half was never delivered as a patch — see the notes. |
+| phase-13 | Animated GIF: honest handling | DONE | (this commit) | See [phase-13 notes](#phase-13-notes) below. **The previous attempt had finished the work and failed on one broken doc link.** The `app/` half is a patch, as in phase-05/06/07. |
 | phase-14 | Content-hash deduplication and a folder pipeline | PENDING | | |
 | phase-15 | Supply-chain policy and reproducible builds | PENDING | | |
 | phase-16 | Release artefacts: the APK and the EXE | PENDING | | Publishes the installable binaries |
@@ -991,8 +991,163 @@ matrix is what stops the two paths from drifting apart about it.
   rather than attempted. What a real phone does about a 120 MP panorama is the
   judgement call this phase cannot make from a runner.
 - **The peak test is a debug-build measurement**, which is fine for allocation and
-  says nothing about time. It also takes 83 s, so only the 120 MP row runs by
+  says nothing about time. It also takes 83 s, so only the 120 MP rows run by
   default; `PX_MEASURE_BEFORE=1` produces the whole table.
+
+## phase-12 notes
+
+**This row said `PENDING` and the marker said done. It was corrected by phase-13,
+which is not the phase that should have written it, and the reason is recorded
+here rather than left as a silent fix.**
+
+`workspace/phase-12/.done` was written by the workflow, which writes it only
+after it has run `scripts/verify.sh` and seen it pass. The row said `PENDING`
+anyway, because that phase's agent committed its work and never came back to
+update the table. The preamble to this file says which of the two is the bug when
+they disagree — "the marker wins and the table is a bug" — so the table was wrong
+and is now `DONE`.
+
+This is recorded rather than quietly corrected because a status table is only
+worth reading if it is true, and a reader who found `PENDING` next to a `.done`
+marker has grounds to distrust every other row. The `Commit` cell cites `7dc119d`,
+the commit carrying the work; `b4db7f8` is the workflow's rename of `.attempted`
+to `.done` and carries nothing of its own.
+
+**One thing is genuinely outstanding on phase-12, and it is not in the tree: the
+`app/` half.** Phase-12 changed the JSON contract in three places —
+`ValidateReport.colour`, `Pipeline.colour.{working_space,keep_source_pixels,
+embed_profile}` and `Outcome.colour.{source,output,converted,profile_embedded}` —
+and `app/lib/rust/models.dart` at `5d0e9cc` has no `colour` field on any of them.
+Dart's `fromJson` ignores keys it does not know, so this is **silent**: nothing
+crashes, the app simply cannot show the one sentence phase-12 exists to enable
+("Display-P3 — this will be converted to sRGB"). Unlike phase-05/06/07, no patch
+was captured for it.
+
+Phase-13 did not fix this, because the `Capabilities` constructor hunk that
+phase-07's patch touches is not involved here but the `ProcessResult` and
+`BatchOutcome` ones are, and stacking a second hand-merged patch on a tree that
+nobody can push to is a worse answer than naming it. **The colour fields need a
+patch before the app can render a colour conversion.** `AGENTS.md` requires it in
+the same phase as the contract change, which is a rule this pipeline cannot
+currently satisfy for `app/` at all, and the honest form of that is a patch per
+phase rather than a silent omission.
+
+## phase-13 notes
+
+`bash scripts/verify.sh` exits 0 and prints `VERIFY: PASS` with `--all-features`
+(247 lib tests, 20 hostile, 19 property, 27 sandbox, 17 Flutter tests, none
+skipped).
+
+**The previous attempt had finished the work and failed on one broken intra-doc
+link.** `6d84aec` is the whole phase — `animation.rs`, `docs/GIF.md`, the FFI
+fields, the tests — and `6dd24d9` records `verification failed (1)` eight
+minutes later, which is too fast for `cargo test` to have run. Running the gate
+over the tree it left behind found exactly one failing check:
+
+```
+--- cargo doc ---
+  FAIL: cargo doc produced warnings (missing docs or broken links)
+error: unresolved link to `crate::animation::Policy`
+```
+
+`error.rs:90` documented the new `Error::AnimationRefused` variant by linking to
+`crate::animation::Policy`, and the type is called `AnimationPolicy`. It was
+proved rather than assumed: reverting the one-line fix and re-running
+`RUSTDOCFLAGS="-D warnings" cargo doc` reproduces that single error and nothing
+else, and every other check — fmt, clippy, all 247 tests, the release build,
+`flutter analyze`, all 17 Flutter tests — passed as they stood.
+
+**This is the third time this exact defect has cost a phase**, and the pattern is
+worth naming because it is not a coincidence: phase-01 (`px_inspect`'s `# Safety`
+link), phase-05 (`ffi_abi.rs` linking `[`ffi`]`) and now this are all
+intra-doc links in *documentation written for a module that did not exist when the
+sentence was drafted*. A link is only checked by rustdoc, and rustdoc is the
+**last** Rust check in the gate — after a five-minute test run — so it is the one
+failure that lands with the least context and the least time to react. Nothing
+was weakened to get past it: the link now names the type that exists.
+
+**The policy is preserve-where-possible, refuse-where-not, and it is not the easy
+one.** `docs/GIF.md` is the argument. In short: an animation exported as a GIF
+loses nothing, so refusing it would mean the app cannot resize an animation at
+all; an animation exported into JPEG or PNG cannot be written without dropping
+frames, so it is refused in a sentence naming the count, the fact and the format
+that would have kept them. `AnimationPolicy::FirstFrame` is the explicit opt-in
+for a still, and it reports what the decision cost.
+
+**The expensive half was affordable for a reason worth checking rather than
+believing.** The prompt warns that disposal is where naive GIF implementations
+break. This one does not implement composition at all: `image`'s
+`GifFrameIterator` already blends each frame against a `non_disposed_frame`
+canvas honouring the disposal method and the transparent index, and returns the
+full canvas at `(0, 0)`. So the input side is the decoder's job and doing it twice
+is how a resizer produces doubled or half-erased frames. On the output side every
+frame written is a complete canvas, so there is no disposal method to get right —
+`image`'s encoder writes `Background` for every frame regardless, and for a
+full-canvas frame that is correct rather than lossy. This was read in
+`image-0.25.10/src/codecs/gif.rs`, not assumed, and it is the whole difference
+between the preserve path being a day's work and a month's.
+
+**A container walk replaced a decode in the folder scan, and it was the other
+thing that was quietly wrong.** `validate::count_frames` counted GIF frames with
+`into_frames().count()`, which *decodes every frame* — and `validate_bytes` runs
+over a whole folder before the user has committed to anything, so the cheap scan
+was materialising every animation in the folder. `validate::scan_gif_frames` walks
+the block stream counting image descriptors instead, and `FrameScan` adds the
+second field the old code could not express: `truncated`. The old code also had
+`unwrap_or(1)`, which silently reported "a still" for a container too damaged to
+read at all.
+
+**`frames_truncated` is load-bearing rather than diagnostic.** A GIF whose block
+stream runs out mid-file still decodes: `image`'s decoder stops at end-of-file
+and hands back the frames it managed, which is right for a viewer and wrong for
+an exporter. So `animation::preserve` refuses a truncated animation rather than
+writing one that is quietly shorter than the original, and `a_corrupt_frame_structure_returns_err_rather_than_panicking`
+covers six corrupt shapes, including the trailer-less one where every frame is
+still readable.
+
+**`Limits::check_animation` applies the pixel budget to the whole animation, not
+per frame.** Every resized frame is resident at once while the encoder writes
+them, so a per-frame `check_header` would pass all two hundred of them. It runs
+*before* the first frame is decoded, from `Pipeline::output_dimensions` and the
+container's frame count, so a refusal costs the header walk and nothing else.
+
+**`app/` is delivered as `workspace/phase-13/shrinkray-phase-13.patch`**, for the
+same reason as phase-05/06/07: `app/` is `authorss81/shrinkray`, a separate
+repository this pipeline reads but cannot push to. It adds `AnimationPolicy`,
+`AnimationAction` and `AnimationOutcome` to `models.dart`, `frames` and
+`framesTruncated` to `ValidateReport`, `animation` to `ProcessResult` and
+`BatchOutcome`, and an `animation` argument to both request builders on
+`PixelSmithEngine.process`/`batch`. It applies cleanly to `5d0e9cc` and was run
+through `dart format`, `flutter analyze` (zero issues) and `flutter test` (**26
+passed, none skipped**, against 17 before) before being captured.
+
+**The patch deliberately does not stack with phase-07's.** Both add a field to
+`ProcessResult.fromJson` and to `BatchOutcome.fromJson`; whichever lands second
+needs that hunk merged by hand. This is stated rather than worked around, as it
+was for phase-05/06/07.
+
+**Not done, and named rather than glossed:**
+
+- **Animated WebP and APNG are still reported as single-frame stills.** This is
+  the same bug this phase just fixed, for two formats with multi-frame decoders
+  sitting in the same crate. It is named rather than hidden because the fix is the
+  same container walk over a different container, and the place to put it is
+  `validate::scan_gif_frames`, whose name is honest about being GIF-only.
+- **Nothing but GIF is written animated.** WebP and AVIF both carry animation and
+  neither is, so a GIF input exported to WebP under the default policy is
+  *refused* rather than flattened — correct, and stricter than a user may expect.
+- **The streaming path does not handle animations.** `stream.rs` has no frame
+  concept, so `streamed_resize` returns `None` and a preserved animation takes the
+  in-memory path. Correct, and it costs the memory `streaming` exists to save.
+- **`quality_used` is 0 for a preserved animation**, which is the honest report:
+  GIF is palette-quantised and `OutputFormat::is_lossless(Gif)` already says so.
+  A byte ceiling on a GIF is refused by `Settings::validate` before this point.
+- **A frame-count ceiling was not added.** Time is bounded by the input byte limit
+  and memory by `check_animation`, so a 40 000-frame GIF of 4×4 pictures is inside
+  both and will take a while. It is not a bomb.
+- **phase-12's `app/` colour drift is still undelivered** — see the phase-12 notes
+  above. It is the one contract change in this project with no patch behind it.
+
 
 ## Status values
 

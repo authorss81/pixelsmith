@@ -87,7 +87,7 @@ pub enum Error {
     /// exporting it would have dropped every frame but the first. The message
     /// is written for a person and names the frame count, what was not written
     /// and the format that would keep them — see
-    /// [`crate::animation::Policy`].
+    /// [`crate::animation::AnimationPolicy`].
     ///
     /// Its own variant because the file is fine, the frames are readable, and
     /// the request is the thing this build will not carry out. Reporting it as a

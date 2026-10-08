@@ -1,0 +1,446 @@
+diff --git a/lib/rust/engine.dart b/lib/rust/engine.dart
+index cd5b9d9..e8ef81d 100644
+--- a/lib/rust/engine.dart
++++ b/lib/rust/engine.dart
+@@ -57,8 +57,12 @@ final class PixelSmithEngine {
+   /// [mobileLimits] picks the tighter phone profile. The app sets it from the
+   /// device rather than hard-coding it, so a tablet is not held to a phone's
+   /// ceiling.
+-  Future<ValidateReport> inspect(List<int> bytes, {bool mobileLimits = false}) =>
+-      Isolate.run(() => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)));
++  Future<ValidateReport> inspect(
++    List<int> bytes, {
++    bool mobileLimits = false,
++  }) => Isolate.run(
++    () => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)),
++  );
+ 
+   /// The engine's own view of `PxBuffer`'s layout, from the loaded library.
+   ///
+@@ -84,6 +88,7 @@ final class PixelSmithEngine {
+     int? targetBytes,
+     bool? stripMetadata,
+     bool mobileLimits = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) {
+     final request = Requests.process(
+       pipeline: pipeline,
+@@ -94,6 +99,7 @@ final class PixelSmithEngine {
+       targetBytes: targetBytes,
+       stripMetadata: stripMetadata,
+       mobileLimits: mobileLimits,
++      animation: animation,
+     );
+     return Isolate.run(() => _processStatic(request));
+   }
+@@ -108,6 +114,7 @@ final class PixelSmithEngine {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) {
+     final request = Requests.batch(
+       pipeline: pipeline,
+@@ -116,7 +123,7 @@ final class PixelSmithEngine {
+       quality: quality,
+       targetBytes: targetBytes,
+       cancelHandle: cancelHandle,
+-      mobileLimits: mobileLimits,
++      animation: animation,
+     );
+     return Isolate.run(() => _batchStatic(request));
+   }
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 77c9800..a497741 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -22,6 +22,132 @@ enum OutputFormat {
+       OutputFormat.values.byName(value.toLowerCase());
+ }
+ 
++/// What to do when the output format cannot hold every frame of an animation.
++///
++/// Mirrors `AnimationPolicy` in `core/src/animation.rs` (`snake_case`).
++///
++/// [keep] is the default and the reason `docs/GIF.md` exists: an animation the
++/// format *can* hold goes through the pipeline frame by frame, and one it cannot
++/// is refused rather than quietly reduced. [firstFrame] is the explicit opt-in
++/// for a caller who has decided a still is what they want, and it reports what
++/// the decision cost.
++enum AnimationPolicy {
++  keep,
++  firstFrame;
++
++  String toJson() => switch (this) {
++    AnimationPolicy.keep => 'keep',
++    AnimationPolicy.firstFrame => 'first_frame',
++  };
++
++  static AnimationPolicy fromJson(String value) =>
++      AnimationPolicy.values.byName(_camelCase(value));
++}
++
++/// What happened to one file's frames.
++///
++/// Mirrors `AnimationAction` in `core/src/animation.rs` (`snake_case`).
++///
++/// A word rather than a pair of counts, because the counts alone cannot tell
++/// "this was never an animation" from "we could not read it", and that
++/// difference is the difference between a report and a guess.
++enum AnimationAction {
++  /// The file failed, was cancelled, or was refused before its frames were
++  /// read. Zero frames in *and* out, which is the only honest count for "we
++  /// never got that far".
++  unknown,
++
++  /// One frame in, one frame out. The file was a still, and nothing was lost.
++  still,
++
++  /// Every frame was carried through the pipeline with its delay.
++  preserved,
++
++  /// One frame was written out of several, deliberately, because the caller
++  /// asked for that with [AnimationPolicy.firstFrame].
++  flattened,
++
++  /// Nothing was written, because the format could not hold the frames and the
++  /// caller had not asked for them to be dropped.
++  refused;
++
++  String toJson() => name;
++
++  static AnimationAction fromJson(String value) =>
++      AnimationAction.values.byName(value.toLowerCase());
++}
++
++/// The animation half of a file's report.
++///
++/// Mirrors `AnimationOutcome` in `core/src/animation.rs`. A caller reads this to
++/// find out whether the animation survived without decoding the output and
++/// without parsing the error string.
++final class AnimationOutcome {
++  const AnimationOutcome({
++    required this.framesIn,
++    required this.framesOut,
++    required this.policy,
++    required this.action,
++  });
++
++  /// How many frames the input had.
++  final int framesIn;
++
++  /// How many the written file has. Zero when nothing was written, which covers
++  /// both a refusal and a failure.
++  final int framesOut;
++
++  /// The policy the request was made under.
++  final AnimationPolicy policy;
++
++  /// What was done.
++  final AnimationAction action;
++
++  /// How many frames the user did not get.
++  int get dropped => framesIn > framesOut ? framesIn - framesOut : 0;
++
++  /// Whether the file had more than one frame.
++  bool get animated => framesIn > 1;
++
++  /// Whether the whole animation went through the pipeline frame by frame.
++  bool get isPreserved => action == AnimationAction.preserved;
++
++  /// What to tell a person about this file's frames, or null when there is
++  /// nothing to say.
++  ///
++  /// Only a flattening has anything to say: it is the one case where a file was
++  /// written and something the user gave us is not in it. The sentence names the
++  /// count, what the file actually is, and what would have kept the rest.
++  String? get note {
++    if (action != AnimationAction.flattened) return null;
++    return 'This file was an animation of $framesIn frames. The exported image '
++        'is the first frame; the other $dropped were not written. '
++        'Choose GIF output to keep every frame.';
++  }
++
++  static AnimationOutcome fromJson(Map<String, Object?> json) =>
++      AnimationOutcome(
++        framesIn: (json['frames_in'] as num?)?.toInt() ?? 0,
++        framesOut: (json['frames_out'] as num?)?.toInt() ?? 0,
++        policy: AnimationPolicy.fromJson(json['policy'] as String? ?? 'keep'),
++        action: AnimationAction.fromJson(
++          json['action'] as String? ?? 'unknown',
++        ),
++      );
++}
++
++/// `snake_case` to `lowerCamelCase`, for the enum names serde emits.
++///
++/// Only the enums whose Rust names are multi-word need it; `keep` and `still`
++/// come through unchanged.
++String _camelCase(String value) {
++  final parts = value.split('_');
++  return [
++    parts.first,
++    for (final part in parts.skip(1)) part[0].toUpperCase() + part.substring(1),
++  ].join();
++}
++
+ /// How the source image fills the requested box.
+ ///
+ /// Matches `FitMode` in `core/src/pipeline.rs` (`snake_case`).
+@@ -184,6 +310,8 @@ final class ValidateReport {
+     required this.sensitiveTags,
+     required this.orientation,
+     required this.suspicious,
++    required this.frames,
++    required this.framesTruncated,
+   });
+ 
+   final OutputFormat format;
+@@ -195,6 +323,15 @@ final class ValidateReport {
+   final List<String> sensitiveTags;
+   final int? orientation;
+ 
++  /// How many frames the file's container claims. 1 for a still, and 1 for
++  /// every format this build cannot see frames in.
++  final int frames;
++
++  /// Whether the frame walk stopped before the trailer, which makes [frames] a
++  /// lower bound rather than a count. A file that says "at least 3" cannot be
++  /// checked against a write of 3, so the animation path refuses it.
++  final bool framesTruncated;
++
+   /// Human-readable warning, or null when the file looks ordinary.
+   final String? suspicious;
+ 
+@@ -208,6 +345,8 @@ final class ValidateReport {
+     sensitiveTags: (json['sensitive_tags'] as List).cast<String>(),
+     orientation: (json['orientation'] as num?)?.toInt(),
+     suspicious: json['suspicious'] as String?,
++    frames: (json['frames'] as num?)?.toInt() ?? 1,
++    framesTruncated: json['frames_truncated'] as bool? ?? false,
+   );
+ }
+ 
+@@ -294,6 +433,7 @@ final class ProcessResult {
+     required this.qualityUsed,
+     required this.targetMet,
+     required this.detectedFormat,
++    required this.animation,
+   });
+ 
+   final String outputName;
+@@ -311,6 +451,11 @@ final class ProcessResult {
+   final bool targetMet;
+   final OutputFormat detectedFormat;
+ 
++  /// What happened to this file's frames. Present on every result, including
++  /// failures, so a preview can say whether an animation survived without
++  /// decoding the bytes it was handed.
++  final AnimationOutcome animation;
++
+   double get savedPercent =>
+       inputBytes == 0 ? 0.0 : (1.0 - outputBytes / inputBytes) * 100.0;
+ 
+@@ -324,6 +469,9 @@ final class ProcessResult {
+     qualityUsed: (json['quality_used'] as num).toInt(),
+     targetMet: json['target_met'] as bool,
+     detectedFormat: OutputFormat.fromJson(json['detected_format'] as String),
++    animation: AnimationOutcome.fromJson(
++      (json['animation'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
+   );
+ }
+ 
+@@ -340,6 +488,7 @@ final class BatchOutcome {
+     required this.qualityUsed,
+     required this.targetMet,
+     required this.error,
++    required this.animation,
+   });
+ 
+   final String id;
+@@ -352,6 +501,11 @@ final class BatchOutcome {
+   final int qualityUsed;
+   final bool targetMet;
+ 
++  /// What happened to this file's frames. An [AnimationAction.refused] here is
++  /// the one failure that still knows how many frames the file had, because the
++  /// file was fine and the *format* could not hold them.
++  final AnimationOutcome animation;
++
+   /// Set when this file failed. Every failure carries a reason.
+   final String? error;
+ 
+@@ -368,6 +522,9 @@ final class BatchOutcome {
+     qualityUsed: (json['quality_used'] as num).toInt(),
+     targetMet: json['target_met'] as bool,
+     error: json['error'] as String?,
++    animation: AnimationOutcome.fromJson(
++      (json['animation'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
+   );
+ }
+ 
+@@ -430,6 +587,7 @@ abstract final class Requests {
+     int? targetBytes,
+     bool? stripMetadata,
+     bool mobileLimits = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) => jsonEncode({
+     'pipeline': pipeline.toJson(),
+     'format': format.toJson(),
+@@ -439,6 +597,7 @@ abstract final class Requests {
+     'data_base64': base64Encode(imageBytes),
+     'strip_metadata': stripMetadata,
+     'mobile_limits': mobileLimits,
++    'animation': animation.toJson(),
+   });
+ 
+   static String batch({
+@@ -449,6 +608,7 @@ abstract final class Requests {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) => jsonEncode({
+     ...pipeline.toJson(),
+     'format': format.toJson(),
+@@ -456,6 +616,7 @@ abstract final class Requests {
+     'target': targetBytes,
+     'mobile_limits': mobileLimits,
+     'cancel': cancelHandle,
++    'animation': animation.toJson(),
+     'files': [
+       for (final f in files)
+         {
+diff --git a/test/models_test.dart b/test/models_test.dart
+index 949c83d..d9f848d 100644
+--- a/test/models_test.dart
++++ b/test/models_test.dart
+@@ -92,6 +92,110 @@ void main() {
+       expect(body, contains('"quality":85'));
+       // [1, 2, 3] as base64.
+       expect(body, contains('"data_base64":"AQID"'));
++      // The animation policy travels with every request, defaulting to the one
++      // that refuses rather than flattens. The engine's `AnimationPolicy` is
++      // `#[serde(default)]`, so an older app that omits it still means "keep".
++      expect(body, contains('"animation":"keep"'));
++    });
++
++    test('first_frame is the only way to ask for a still of an animation', () {
++      const pipeline = Pipeline(
++        resize: ResizeSpec(width: 400, fit: FitMode.width),
++      );
++      final body = Requests.process(
++        pipeline: pipeline,
++        format: OutputFormat.jpeg,
++        imageBytes: [1, 2, 3],
++        name: 'meme.gif',
++        animation: AnimationPolicy.firstFrame,
++      );
++      expect(body, contains('"animation":"first_frame"'));
++    });
++  });
++
++  group('AnimationPolicy', () {
++    test('serialises snake_case, matching the Rust serde convention', () {
++      expect(AnimationPolicy.keep.toJson(), 'keep');
++      expect(AnimationPolicy.firstFrame.toJson(), 'first_frame');
++    });
++
++    test('round-trips every value', () {
++      for (final p in AnimationPolicy.values) {
++        expect(AnimationPolicy.fromJson(p.toJson()), p);
++      }
++    });
++
++    test('rejects an unknown policy rather than guessing', () {
++      expect(
++        () => AnimationPolicy.fromJson('keep_everything'),
++        throwsArgumentError,
++      );
++    });
++  });
++
++  group('AnimationOutcome', () {
++    test('reads the four fields the engine sends', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 240,
++        'policy': 'keep',
++        'action': 'preserved',
++      });
++      expect(o.framesIn, 240);
++      expect(o.framesOut, 240);
++      expect(o.policy, AnimationPolicy.keep);
++      expect(o.action, AnimationAction.preserved);
++      expect(o.animated, isTrue);
++      expect(o.isPreserved, isTrue);
++      expect(o.dropped, 0);
++    });
++
++    test('a single-frame GIF is a still, not a one-frame animation', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 1,
++        'frames_out': 1,
++        'policy': 'keep',
++        'action': 'still',
++      });
++      expect(o.animated, isFalse);
++      expect(o.isPreserved, isFalse);
++      expect(o.note, isNull);
++    });
++
++    test('a refusal wrote nothing and knows how many frames it refused', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 0,
++        'policy': 'keep',
++        'action': 'refused',
++      });
++      expect(o.dropped, 240);
++      expect(o.isPreserved, isFalse);
++      // Its explanation is the error the caller already has, so `note` is silent.
++      expect(o.note, isNull);
++    });
++
++    test('a flattening is the one case that owes the user a sentence', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 1,
++        'policy': 'first_frame',
++        'action': 'flattened',
++      });
++      expect(o.dropped, 239);
++      final note = o.note!;
++      expect(note, contains('240'));
++      expect(note, contains('first frame'));
++      expect(note, contains('GIF'));
++    });
++
++    test('a response from an older engine does not crash the parse', () {
++      final o = AnimationOutcome.fromJson(const {});
++      expect(o.action, AnimationAction.unknown);
++      expect(o.framesIn, 0);
++      expect(o.framesOut, 0);
++      expect(o.dropped, 0);
++      expect(o.note, isNull);
+     });
+   });
+ 
+@@ -108,6 +212,7 @@ void main() {
+             qualityUsed: 80,
+             targetMet: true,
+             detectedFormat: OutputFormat.jpeg,
++            animation: AnimationOutcome.fromJson(const {}),
+           );
+       expect(base(input: 100, output: 25).savedPercent, 75.0);
+       expect(base(input: 0, output: 0).savedPercent, 0.0);
+@@ -128,6 +233,7 @@ void main() {
+         qualityUsed: 80,
+         targetMet: true,
+         error: error,
++        animation: AnimationOutcome.fromJson(const {}),
+       );
+       final report = BatchReport(
+         outcomes: [
