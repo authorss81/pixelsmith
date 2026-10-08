@@ -14,6 +14,7 @@ pub mod error;
 pub mod exif;
 pub mod ffi;
 pub mod ffi_abi;
+pub mod ffi_json;
 pub mod folder;
 pub mod format;
 pub mod heic;

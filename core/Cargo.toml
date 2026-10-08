@@ -30,6 +30,15 @@ crate-type = ["lib", "cdylib", "staticlib"]
 bench = false
 
 [[bin]]
+name = "px-json-dump"
+path = "src/bin/px-json-dump.rs"
+# Same `bench = false` reasoning as px-abi-dump below: `cargo bench` runs every
+# `bench = true` binary target through libtest, forwards `--` to it, and libtest
+# rejects the flags the benchmark harness passes. This target holds no `#[bench]`
+# function and never will — it prints the JSON contract — so it costs nothing.
+bench = false
+
+[[bin]]
 name = "px-abi-dump"
 path = "src/bin/px-abi-dump.rs"
 # `cargo bench` builds and *runs* a libtest harness for every binary target as
@@ -298,6 +307,7 @@ default-features = false
 features = ["std"]
 
 [dev-dependencies]
+syn = { version = "3", features = ["full"] }
 proptest = "1"
 tempfile = "3"
 # The performance regression gate's harness. `default-features = false` with

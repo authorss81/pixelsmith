@@ -251,7 +251,7 @@ fn request_failure(e: serde_json::Error) -> PxBuffer {
 /// the running total are all still within budget. Each refusal names which of
 /// the three it was, because "too big" is not something a user can act on and
 /// "this folder has more files in it than one request holds" is.
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct BoundedFiles(Vec<BatchFile>);
 
 impl<'de> serde::Deserialize<'de> for BoundedFiles {
@@ -434,7 +434,15 @@ pub extern "C" fn px_presets() -> PxBuffer {
 // ---------------------------------------------------------------------------
 
 /// JSON request for [`px_process`].
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived for [`sample_process_request`] and nothing else. The
+/// app writes this document and the engine only ever reads it, so a writer for it
+/// would be a second way to build a request that has to stay in step with the
+/// real one; what the derive buys is that `ffi_json` can ask serde for these field
+/// names instead of parsing this file, and that adding a field here without
+/// updating the sample is a compile error rather than a silently-missing contract
+/// line. No field is added, renamed or removed by deriving it.
+#[derive(Debug, Deserialize, Serialize)]
 struct ProcessRequest {
     pipeline: Pipeline,
     format: OutputFormat,
@@ -631,7 +639,13 @@ pub extern "C" fn px_cancel_free(handle: PxHandle) -> bool {
 }
 
 /// JSON request for [`px_batch`].
-#[derive(Debug, Deserialize)]
+///
+/// `Serialize` is derived for [`sample_batch_request`] — see
+/// [`ProcessRequest`] for why, and for why it is not a second supported way to
+/// build a request. `#[serde(flatten)]` on `pipeline` means the serialised form
+/// has the pipeline's fields at the top level, which is what `ffi_json` reads
+/// and what the Dart side has to send.
+#[derive(Debug, Deserialize, Serialize)]
 struct BatchRequest {
     #[serde(flatten)]
     pipeline: Pipeline,
@@ -664,10 +678,88 @@ struct BatchRequest {
     files: BoundedFiles,
 }
 
-#[derive(Debug, Deserialize)]
+/// One entry of a batch or ZIP request. `Serialize` for the contract dump; see
+/// [`ProcessRequest`].
+#[derive(Debug, Deserialize, Serialize)]
 struct BatchFile {
     name: String,
     bytes: Vec<u8>,
+}
+
+/// Representative instances of the four envelopes, for the JSON contract dump.
+///
+/// `ffi_json` has to read the *names* of the fields in these structs, and it
+/// reads them out of serde's own data model rather than by parsing this file's
+/// source — see that module for why a source parser would be the wrong answer.
+///
+/// The request envelopes are written by Dart and read by Rust, so they derive
+/// `Deserialize` and nothing in the engine needs to write one. They are built
+/// here with every field spelled out, which serves two purposes: the dump sees
+/// the real field set, and a field added to a struct is a **compile error** in
+/// this function rather than a line the dump silently stops reporting. That
+/// second property is the one that matters — a generator which reports fewer
+/// fields than exist is worse than no check, because it looks like a pass.
+///
+/// These structs are private to this module, so the samples are not part of the
+/// crate's public API and cannot be mistaken for a supported way to build a
+/// request. `bytes` is empty rather than absent so the key is recorded: a field
+/// skipped when empty is exactly what this check has to notice, and it cannot
+/// notice it if no sample carries one.
+/// These return `serde_json::Value` rather than the structs, because the structs
+/// are private to this module and handing them to `ffi_json` would make them
+/// part of the crate's internal API for no benefit. The construction is what
+/// matters and it is here, in one place, spelling out every field.
+pub(crate) fn sample_batch_file() -> serde_json::Value {
+    serde_json::to_value(BatchFile { name: String::new(), bytes: Vec::new() })
+        .expect("a BatchFile is serialisable")
+}
+
+pub(crate) fn sample_process_request() -> serde_json::Value {
+    let request = ProcessRequest {
+        pipeline: Pipeline::new(),
+        format: OutputFormat::Jpeg,
+        quality: 85,
+        progressive: false,
+        target: None,
+        name: String::new(),
+        data_base64: String::new(),
+        strip_metadata: None,
+        animation: AnimationPolicy::Keep,
+        mobile_limits: false,
+    };
+    serde_json::to_value(request).expect("a ProcessRequest is serialisable")
+}
+
+pub(crate) fn sample_batch_request() -> serde_json::Value {
+    let request = BatchRequest {
+        pipeline: Pipeline::new(),
+        format: OutputFormat::Jpeg,
+        quality: 85,
+        progressive: false,
+        animation: AnimationPolicy::Keep,
+        target: None,
+        mobile_limits: false,
+        policy: crate::worker::BatchPolicy::default(),
+        cancel: None,
+        files: BoundedFiles(vec![BatchFile { name: String::new(), bytes: Vec::new() }]),
+    };
+    serde_json::to_value(request).expect("a BatchRequest is serialisable")
+}
+
+pub(crate) fn sample_process_response() -> serde_json::Value {
+    let response = ProcessResponse {
+        output_name: String::new(),
+        bytes: Vec::new(),
+        input_bytes: 0,
+        output_bytes: 0,
+        width: 1,
+        height: 1,
+        quality_used: 0,
+        target_met: true,
+        detected_format: OutputFormat::Jpeg,
+        animation: AnimationOutcome::unknown(),
+    };
+    serde_json::to_value(response).expect("a ProcessResponse is serialisable")
 }
 
 /// Run a batch in parallel. Always returns a report, never a hard failure, so

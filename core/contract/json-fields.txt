@@ -1,0 +1,337 @@
+# core/contract/json-fields.txt — the engine's JSON contract, and the Dart member
+# that carries each of its fields.
+#
+# THE COMMITTED SIDE OF THE JSON DRIFT CHECK. Read this before editing it.
+#
+# Every row is one field or enum variant the engine emits across the FFI, and the
+# Dart symbol in the second column that models it. `scripts/check-json-contract.sh`
+# runs `cargo run --bin px-json-dump -- --check` against this file, and that is
+# wired into `scripts/verify.sh` as a FAILURE — not a note, which is what
+# `check-dart-bindings.sh` gets in section 3b.
+#
+# WHY THE COMMITTED SIDE LIVES HERE AND NOT IN app/.
+#
+# `app/` is the `authorss81/shrinkray` submodule: a separate repository this
+# pipeline can read and cannot push to. A check whose answer depends on what that
+# repository contains is a check that cannot fail, because the only available
+# response to a red result is a commit nobody can make. Five phases of drift
+# (06, 07, 12, 13, 14) accumulated behind exactly that, while the C ABI check
+# reported "15 entry points match". This file is landable, so the check is a hard
+# gate; the Dart half it describes is delivered as a patch under
+# `workspace/phase-20/`.
+#
+# FORMAT
+#
+#   <engine path> TAB <Dart symbol>
+#
+# The engine path is what `px-json-dump` prints: `Owner.field` for a struct field,
+# `Owner.outer.inner` for a nested one, `Owner::variant` for an enum variant. A
+# second tab and free text are allowed and ignored; use them to say why a
+# surprising row is what it is.
+#
+# A row with nothing after the tab is a FAILURE. A row naming a path the engine
+# no longer emits is a FAILURE. Both directions are checked, so this file cannot
+# rot into a claim nobody maintains.
+#
+# WHY THE NAMES COME FROM SERDE, NOT FROM PARSING THE SOURCE
+#
+# `core/src/ffi_json.rs` asks serde by serialising a representative instance of
+# each type and reading the keys back, so `rename_all`, `tag`, `flatten` and
+# `Option` are applied by the same code that applies them on the wire. A source
+# parser would have to re-implement all four and would eventually disagree with
+# serde — reporting drift that is not there, which is the failure mode a drift
+# check must not have. Note `ColourSpace::display_p3` and not `DisplayP3`: that
+# spelling is the engine's, and a Dart side that guessed `displayP3` would get a
+# refusal naming a space that does not exist.
+#
+# TO ADD A ROW
+#
+# 1. Add the field to the engine struct. `ffi_json` picks it up on the next run.
+# 2. Run `bash scripts/check-json-contract.sh --write` to append the new row.
+# 3. Add the Dart member, in `app/lib/rust/models.dart`, and land the patch in
+#    the app repository.
+# 4. Run `bash scripts/check-json-contract.sh` again. It passes when every engine
+#    field has a Dart member named here.
+#
+# The 278 rows below are the whole of the JSON that crosses the boundary. A new
+# one appearing in column one with nothing in column two is the phase-21
+# equivalent of the defect this file exists to catch.
+
+AnimationAction::flattened	AnimationAction.flattened
+AnimationAction::preserved	AnimationAction.preserved
+AnimationAction::refused	AnimationAction.refused
+AnimationAction::still	AnimationAction.still
+AnimationAction::unknown	AnimationAction.unknown
+AnimationOutcome.action	AnimationOutcome.action
+AnimationOutcome.frames_in	AnimationOutcome.framesIn
+AnimationOutcome.frames_out	AnimationOutcome.framesOut
+AnimationOutcome.policy	AnimationOutcome.policy
+AnimationPolicy::first_frame	AnimationPolicy.firstFrame
+AnimationPolicy::keep	AnimationPolicy.keep
+BatchFile.bytes	BatchFile.bytes
+BatchFile.name	BatchFile.name
+BatchPolicy.deduplicate	BatchPolicy.deduplicate
+BatchPolicy.skip_unprocessable	BatchPolicy.skipUnprocessable
+BatchPolicy.skip_upscales	BatchPolicy.skipUpscales
+BatchReport.cancelled	BatchReport.cancelled
+BatchReport.outcomes	BatchReport.outcomes
+BatchReport.outcomes.animation	BatchOutcome.animation
+BatchReport.outcomes.animation.action	AnimationOutcome.action
+BatchReport.outcomes.animation.frames_in	AnimationOutcome.framesIn
+BatchReport.outcomes.animation.frames_out	AnimationOutcome.framesOut
+BatchReport.outcomes.animation.policy	AnimationOutcome.policy
+BatchReport.outcomes.colour	BatchOutcome.colour
+BatchReport.outcomes.colour.converted	ColourOutcome.converted
+BatchReport.outcomes.colour.output	ColourOutcome.output
+BatchReport.outcomes.colour.profile_embedded	ColourOutcome.profileEmbedded
+BatchReport.outcomes.colour.source	ColourOutcome.source
+BatchReport.outcomes.error	BatchOutcome.error
+BatchReport.outcomes.height	BatchOutcome.height
+BatchReport.outcomes.id	BatchOutcome.id
+BatchReport.outcomes.input_bytes	BatchOutcome.inputBytes
+BatchReport.outcomes.name	BatchOutcome.name
+BatchReport.outcomes.output_bytes	BatchOutcome.outputBytes
+BatchReport.outcomes.output_name	BatchOutcome.outputName
+BatchReport.outcomes.quality_used	BatchOutcome.qualityUsed
+BatchReport.outcomes.skipped	BatchOutcome.skipped
+BatchReport.outcomes.skipped.kind	SkipReason.kind
+BatchReport.outcomes.target_met	BatchOutcome.targetMet
+BatchReport.outcomes.width	BatchOutcome.width
+BatchRequest.animation	Requests.batch
+BatchRequest.cancel	Requests.batch
+BatchRequest.chroma_subsampling	Pipeline.chromaSubsampling
+BatchRequest.colour	Pipeline.colour
+BatchRequest.colour.embed_profile	ColourOptions.embedProfile
+BatchRequest.colour.keep_source_pixels	ColourOptions.keepSourcePixels
+BatchRequest.colour.working_space	ColourOptions.workingSpace
+BatchRequest.crop	CropSpec.x
+BatchRequest.files	BatchFile.bytes
+BatchRequest.files.bytes	BatchFile.bytes
+BatchRequest.files.name	BatchFile.name
+BatchRequest.format	OutputFormat.toJson
+BatchRequest.mobile_limits	Requests.batch
+BatchRequest.orientation	Orientation.toJson
+BatchRequest.policy	Requests.batch
+BatchRequest.policy.deduplicate	BatchPolicy.deduplicate
+BatchRequest.policy.skip_unprocessable	BatchPolicy.skipUnprocessable
+BatchRequest.policy.skip_upscales	BatchPolicy.skipUpscales
+BatchRequest.progressive	Requests.batch
+BatchRequest.quality	Requests.batch
+BatchRequest.resize	ResizeSpec.width
+BatchRequest.strip_metadata	Pipeline.stripMetadata
+BatchRequest.target	Requests.batch
+Capabilities.avif_decode	Capabilities.avifDecode
+Capabilities.avif_encode	Capabilities.avifEncode
+Capabilities.bmp	Capabilities.bmp
+Capabilities.gif	Capabilities.gif
+Capabilities.heic_decode	Capabilities.heicDecode
+Capabilities.ico	Capabilities.ico
+Capabilities.jpeg	Capabilities.jpeg
+Capabilities.jpeg_chroma_subsampling	Capabilities.jpegChromaSubsampling
+Capabilities.jpeg_progressive	Capabilities.jpegProgressive
+Capabilities.max_input_bytes	Capabilities.maxInputBytes
+Capabilities.max_pixels	Capabilities.maxPixels
+Capabilities.png	Capabilities.png
+Capabilities.tiff	Capabilities.tiff
+Capabilities.webp_lossless	Capabilities.webpLossless
+Capabilities.webp_lossy	Capabilities.webpLossy
+Category::developer	Preset.category
+Category::device	Preset.category
+Category::email	Preset.category
+Category::print	Preset.category
+Category::social	Preset.category
+Category::web	Preset.category
+ChromaSubsampling::luma420	ChromaSubsampling.luma420
+ChromaSubsampling::luma422	ChromaSubsampling.luma422
+ChromaSubsampling::luma444	ChromaSubsampling.luma444
+ColourOptions.embed_profile	ColourOptions.embedProfile
+ColourOptions.keep_source_pixels	ColourOptions.keepSourcePixels
+ColourOptions.working_space	ColourOptions.workingSpace
+ColourOutcome.converted	ColourOutcome.converted
+ColourOutcome.output	ColourOutcome.output
+ColourOutcome.profile_embedded	ColourOutcome.profileEmbedded
+ColourOutcome.source	ColourOutcome.source
+ColourProfile.declared	ColourProfile.declared
+ColourProfile.description	ColourProfile.description
+ColourProfile.icc_bytes	ColourProfile.iccBytes
+ColourProfile.icc_present	ColourProfile.iccPresent
+ColourProfile.source	ColourProfile.source
+ColourSpace::display_p3	ColourSpace.displayP3
+ColourSpace::other	ColourSpace.other
+ColourSpace::srgb	ColourSpace.srgb
+ColourSpace::untagged	ColourSpace.untagged
+CropSpec.height	CropSpec.height
+CropSpec.width	CropSpec.width
+CropSpec.x	CropSpec.x
+CropSpec.y	CropSpec.y
+ExifEntry.tag	ExifEntry.tag
+ExifEntry.value	ExifEntry.value
+ExifInfo.camera	ExifInfo.camera
+ExifInfo.captured_at	ExifInfo.capturedAt
+ExifInfo.colour	ExifInfo.colour
+ExifInfo.colour.declared	ColourProfile.declared
+ExifInfo.colour.description	ColourProfile.description
+ExifInfo.colour.icc_bytes	ColourProfile.iccBytes
+ExifInfo.colour.icc_present	ColourProfile.iccPresent
+ExifInfo.colour.source	ColourProfile.source
+ExifInfo.entries	ExifInfo.entries
+ExifInfo.entries.tag	ExifEntry.tag
+ExifInfo.entries.value	ExifEntry.value
+ExifInfo.has_gps	ExifInfo.hasGps
+ExifInfo.orientation	ExifInfo.orientation
+ExifInfo.sensitive_tags	ExifInfo.sensitiveTags
+FieldLayout.name	AbiField.name
+FieldLayout.offset	AbiField.offset
+FieldLayout.size	AbiField.size
+FitMode::contain	FitMode.contain
+FitMode::cover	FitMode.cover
+FitMode::fill	FitMode.fill
+FitMode::height	FitMode.height
+FitMode::width	FitMode.width
+Orientation::mirror_horizontal	Orientation.mirrorHorizontal
+Orientation::mirror_horizontal_rotate270	Orientation.mirrorHorizontalRotate270
+Orientation::mirror_horizontal_rotate90	Orientation.mirrorHorizontalRotate90
+Orientation::mirror_vertical	Orientation.mirrorVertical
+Orientation::normal	Orientation.normal
+Orientation::rotate180	Orientation.rotate180
+Orientation::rotate270	Orientation.rotate270
+Orientation::rotate90	Orientation.rotate90
+Outcome.animation	BatchOutcome.animation
+Outcome.animation.action	AnimationOutcome.action
+Outcome.animation.frames_in	AnimationOutcome.framesIn
+Outcome.animation.frames_out	AnimationOutcome.framesOut
+Outcome.animation.policy	AnimationOutcome.policy
+Outcome.colour	BatchOutcome.colour
+Outcome.colour.converted	ColourOutcome.converted
+Outcome.colour.output	ColourOutcome.output
+Outcome.colour.profile_embedded	ColourOutcome.profileEmbedded
+Outcome.colour.source	ColourOutcome.source
+Outcome.error	BatchOutcome.error
+Outcome.height	BatchOutcome.height
+Outcome.id	BatchOutcome.id
+Outcome.input_bytes	BatchOutcome.inputBytes
+Outcome.name	BatchOutcome.name
+Outcome.output_bytes	BatchOutcome.outputBytes
+Outcome.output_name	BatchOutcome.outputName
+Outcome.quality_used	BatchOutcome.qualityUsed
+Outcome.skipped	BatchOutcome.skipped
+Outcome.skipped.kind	SkipReason.kind
+Outcome.target_met	BatchOutcome.targetMet
+Outcome.width	BatchOutcome.width
+OutputFormat::avif	OutputFormat.avif
+OutputFormat::bmp	OutputFormat.bmp
+OutputFormat::gif	OutputFormat.gif
+OutputFormat::heic	OutputFormat.heic
+OutputFormat::heif	OutputFormat.heif
+OutputFormat::ico	OutputFormat.ico
+OutputFormat::jpeg	OutputFormat.jpeg
+OutputFormat::png	OutputFormat.png
+OutputFormat::tiff	OutputFormat.tiff
+OutputFormat::webp	OutputFormat.webp
+Pipeline.chroma_subsampling	Pipeline.chromaSubsampling
+Pipeline.colour	Pipeline.colour
+Pipeline.colour.embed_profile	ColourOptions.embedProfile
+Pipeline.colour.keep_source_pixels	ColourOptions.keepSourcePixels
+Pipeline.colour.working_space	ColourOptions.workingSpace
+Pipeline.crop	Pipeline.crop
+Pipeline.orientation	Pipeline.orientation
+Pipeline.resize	Pipeline.resize
+Pipeline.strip_metadata	Pipeline.stripMetadata
+Preset.category	Preset.category
+Preset.chroma	Preset.chroma
+Preset.crops	Preset.crops
+Preset.filter	Preset.filter
+Preset.fit	Preset.fit
+Preset.format	Preset.formatName
+Preset.height	Preset.height
+Preset.id	Preset.id
+Preset.label	Preset.label
+Preset.max_bytes	Preset.maxBytes
+Preset.quality	Preset.quality
+Preset.width	Preset.width
+ProcessRequest.animation	Requests.process
+ProcessRequest.data_base64	Requests.process
+ProcessRequest.format	OutputFormat.toJson
+ProcessRequest.mobile_limits	Requests.process
+ProcessRequest.name	BatchFile.name
+ProcessRequest.pipeline	Requests.process
+ProcessRequest.pipeline.chroma_subsampling	Pipeline.chromaSubsampling
+ProcessRequest.pipeline.colour	Pipeline.colour
+ProcessRequest.pipeline.colour.embed_profile	ColourOptions.embedProfile
+ProcessRequest.pipeline.colour.keep_source_pixels	ColourOptions.keepSourcePixels
+ProcessRequest.pipeline.colour.working_space	ColourOptions.workingSpace
+ProcessRequest.pipeline.crop	CropSpec.x
+ProcessRequest.pipeline.orientation	Orientation.toJson
+ProcessRequest.pipeline.resize	ResizeSpec.width
+ProcessRequest.pipeline.strip_metadata	Pipeline.stripMetadata
+ProcessRequest.progressive	Requests.process
+ProcessRequest.quality	Requests.process
+ProcessRequest.strip_metadata	Requests.process
+ProcessRequest.target	Requests.process
+ProcessResponse.animation	ProcessResult.animation
+ProcessResponse.animation.action	AnimationOutcome.action
+ProcessResponse.animation.frames_in	AnimationOutcome.framesIn
+ProcessResponse.animation.frames_out	AnimationOutcome.framesOut
+ProcessResponse.animation.policy	AnimationOutcome.policy
+ProcessResponse.bytes	ProcessResult.bytes
+ProcessResponse.detected_format	ProcessResult.detectedFormatName
+ProcessResponse.height	ProcessResult.height
+ProcessResponse.input_bytes	ProcessResult.inputBytes
+ProcessResponse.output_bytes	ProcessResult.outputBytes
+ProcessResponse.output_name	ProcessResult.outputName
+ProcessResponse.quality_used	ProcessResult.qualityUsed
+ProcessResponse.target_met	ProcessResult.targetMet
+ProcessResponse.width	ProcessResult.width
+ResampleFilter::box	ResampleFilter.box
+ResampleFilter::catmull_rom	ResampleFilter.catmullRom
+ResampleFilter::lanczos3	ResampleFilter.lanczos3
+ResampleFilter::nearest	ResampleFilter.nearest
+ResampleFilter::triangle	ResampleFilter.triangle
+ResizeSpec.filter	ResizeSpec.filter
+ResizeSpec.fit	ResizeSpec.fit
+ResizeSpec.height	ResizeSpec.height
+ResizeSpec.no_upscale	ResizeSpec.noUpscale
+ResizeSpec.width	ResizeSpec.width
+SizeUnit::bytes	SkipReasonTooLarge.pixels
+SizeUnit::pixels	SkipReasonTooLarge.pixels
+SkipReason.Duplicate.kind	SkipReason.kind
+SkipReason.Duplicate.of	SkipReasonDuplicate.of
+SkipReason.TooLarge.actual	SkipReasonTooLarge.actual
+SkipReason.TooLarge.kind	SkipReason.kind
+SkipReason.TooLarge.limit	SkipReasonTooLarge.limit
+SkipReason.TooLarge.unit	SkipReasonTooLarge.pixels
+SkipReason.Unreadable.kind	SkipReason.kind
+SkipReason.UnsupportedFormat.format	SkipReasonUnsupportedFormat.formatName
+SkipReason.UnsupportedFormat.kind	SkipReason.kind
+SkipReason.WouldUpscale.actual	SkipReasonWouldUpscale.actualWidth
+SkipReason.WouldUpscale.kind	SkipReason.kind
+SkipReason.WouldUpscale.requested	SkipReasonWouldUpscale.requestedWidth
+SkipReason::duplicate	SkipReasonDuplicate.kind
+SkipReason::too_large	SkipReasonTooLarge.kind
+SkipReason::unreadable	SkipReasonUnreadable.kind
+SkipReason::unsupported_format	SkipReasonUnsupportedFormat.kind
+SkipReason::would_upscale	SkipReasonWouldUpscale.kind
+StructLayout.align	AbiLayout.align
+StructLayout.fields	AbiLayout.fields
+StructLayout.fields.name	AbiField.name
+StructLayout.fields.offset	AbiField.offset
+StructLayout.fields.size	AbiField.size
+StructLayout.name	AbiLayout.name
+StructLayout.size	AbiLayout.size
+ValidateReport.colour	ValidateReport.colour
+ValidateReport.colour.declared	ColourProfile.declared
+ValidateReport.colour.description	ColourProfile.description
+ValidateReport.colour.icc_bytes	ColourProfile.iccBytes
+ValidateReport.colour.icc_present	ColourProfile.iccPresent
+ValidateReport.colour.source	ColourProfile.source
+ValidateReport.format	ValidateReport.formatName
+ValidateReport.frames	ValidateReport.frames
+ValidateReport.frames_truncated	ValidateReport.framesTruncated
+ValidateReport.has_animated	ValidateReport.hasAnimated
+ValidateReport.has_exif	ValidateReport.hasExif
+ValidateReport.height	ValidateReport.height
+ValidateReport.megapixels	ValidateReport.megapixels
+ValidateReport.orientation	ValidateReport.orientation
+ValidateReport.sensitive_tags	ValidateReport.sensitiveTags
+ValidateReport.suspicious	ValidateReport.suspicious
+ValidateReport.width	ValidateReport.width

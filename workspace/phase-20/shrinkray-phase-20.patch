@@ -1,0 +1,2319 @@
+diff --git a/lib/rust/engine.dart b/lib/rust/engine.dart
+index cd5b9d9..b2bcb78 100644
+--- a/lib/rust/engine.dart
++++ b/lib/rust/engine.dart
+@@ -57,8 +57,12 @@ final class PixelSmithEngine {
+   /// [mobileLimits] picks the tighter phone profile. The app sets it from the
+   /// device rather than hard-coding it, so a tablet is not held to a phone's
+   /// ceiling.
+-  Future<ValidateReport> inspect(List<int> bytes, {bool mobileLimits = false}) =>
+-      Isolate.run(() => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)));
++  Future<ValidateReport> inspect(
++    List<int> bytes, {
++    bool mobileLimits = false,
++  }) => Isolate.run(
++    () => _inspectStatic((bytes: bytes, mobileLimits: mobileLimits)),
++  );
+ 
+   /// The engine's own view of `PxBuffer`'s layout, from the loaded library.
+   ///
+@@ -84,6 +88,8 @@ final class PixelSmithEngine {
+     int? targetBytes,
+     bool? stripMetadata,
+     bool mobileLimits = false,
++    bool progressive = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) {
+     final request = Requests.process(
+       pipeline: pipeline,
+@@ -94,6 +100,8 @@ final class PixelSmithEngine {
+       targetBytes: targetBytes,
+       stripMetadata: stripMetadata,
+       mobileLimits: mobileLimits,
++      progressive: progressive,
++      animation: animation,
+     );
+     return Isolate.run(() => _processStatic(request));
+   }
+@@ -108,6 +116,9 @@ final class PixelSmithEngine {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    bool progressive = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
++    BatchPolicy policy = BatchPolicy.all,
+   }) {
+     final request = Requests.batch(
+       pipeline: pipeline,
+@@ -117,6 +128,9 @@ final class PixelSmithEngine {
+       targetBytes: targetBytes,
+       cancelHandle: cancelHandle,
+       mobileLimits: mobileLimits,
++      progressive: progressive,
++      animation: animation,
++      policy: policy,
+     );
+     return Isolate.run(() => _batchStatic(request));
+   }
+@@ -194,10 +208,23 @@ List<Preset> _presetsStatic() {
+ 
+ ProcessResult _processStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  // Encode once and pass *that* length.
++  //
++  // `request.length` is the number of UTF-16 code units, which is what a Dart
++  // `String` counts, and it is not the number of bytes the engine reads. For
++  // ASCII — every request whose file name is ASCII — the two happen to agree,
++  // which is why this survived every run of every test. They part company the
++  // moment a name carries a non-ASCII character: `photo-über.jpg` is 13 code
++  // units and 15 bytes, so the engine would read two bytes past the JSON
++  // document. Today that is an under-read and fails as a JSON syntax error; the
++  // moment anything appended those two bytes it would be an out-of-bounds read
++  // of memory this process does not own. A non-ASCII filename is not exotic on
++  // Android or Windows.
++  final encoded = utf8.encode(request);
++  final ptr = _copyToNative(encoded);
+   try {
+     return ProcessResult.fromJson(
+-      _takeJson(px, px.process(ptr, request.length)),
++      _takeJson(px, px.process(ptr, encoded.length)),
+     );
+   } finally {
+     _freeNative(ptr);
+@@ -206,9 +233,10 @@ ProcessResult _processStatic(String request) {
+ 
+ BatchReport _batchStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  final encoded = utf8.encode(request);
++  final ptr = _copyToNative(encoded);
+   try {
+-    return BatchReport.fromJson(_takeJson(px, px.batch(ptr, request.length)));
++    return BatchReport.fromJson(_takeJson(px, px.batch(ptr, encoded.length)));
+   } finally {
+     _freeNative(ptr);
+   }
+@@ -216,16 +244,17 @@ BatchReport _batchStatic(String request) {
+ 
+ List<int> _zipStatic(String request) {
+   final px = PxBindings(loadEngineLibrary());
+-  final ptr = _copyToNative(utf8.encode(request));
++  final encoded = utf8.encode(request);
++  final ptr = _copyToNative(encoded);
+   try {
+-    final buffer = px.zip(ptr, request.length);
++    final buffer = px.zip(ptr, encoded.length);
+     try {
+       if (buffer.status != PxStatus.ok) {
+         throw EngineProcessingException(_readError(buffer));
+       }
+       return buffer.data.asTypedList(buffer.len).toList();
+     } finally {
+-      px.bufferFree(buffer);
++      _freeBuffer(px, buffer);
+     }
+   } finally {
+     _freeNative(ptr);
+@@ -272,8 +301,34 @@ Object? _takeDecoded(PxBindings px, PxBuffer buffer) {
+       message.isEmpty ? 'engine failed without explanation' : message,
+     );
+   } finally {
+-    px.bufferFree(buffer);
++    // Both owned pointers, not one.
++    //
++    // `PxBuffer.error` is a `CString::into_raw` handed to Dart, and Rust frees
++    // it only when something calls `px_string_free` — a function that was
++    // declared in `bindings.dart` and called from nowhere. `px_buffer_free`
++    // frees `data` alone, because the two are separate allocations with separate
++    // lifetimes. So every failed call leaked one `CString` for the life of the
++    // process, and `Isolate.run` guarantees a fresh isolate — hence a fresh
++    // allocator — per call, so nothing was ever reused either.
++    //
++    // It only showed on the error path, which is why the leak is invisible to a
++    // happy-path test and to a Rust test: `ffi.rs`'s own leak test calls
++    // `px_string_free` explicitly, so the suite is green over a leak the Dart
++    // side has.
++    _freeBuffer(px, buffer);
++  }
++}
++
++/// Frees both owned pointers in a returned buffer.
++///
++/// Safe to call with a null `data`: `px_buffer_free` returns immediately for a
++/// null pointer, and an error buffer always has one, so a failure to free is
++/// never a failure to free anything.
++void _freeBuffer(PxBindings px, PxBuffer buffer) {
++  if (buffer.error != ffi.nullptr) {
++    px.stringFree(buffer.error);
+   }
++  px.bufferFree(buffer);
+ }
+ 
+ String _readError(PxBuffer buffer) =>
+diff --git a/lib/rust/models.dart b/lib/rust/models.dart
+index 77c9800..1bbb73a 100644
+--- a/lib/rust/models.dart
++++ b/lib/rust/models.dart
+@@ -1,11 +1,17 @@
+ import 'dart:convert';
+ 
+-/// Output formats the engine can write.
++/// Output formats the engine can write, and recognise on input.
+ ///
+ /// Serialised lowercase to match `OutputFormat` in `core/src/format.rs`, which
+ /// carries `#[serde(rename_all = "lowercase")]`. A mismatch here is a silent
+ /// "bad request" from the engine, so `models_test.dart` round-trips every
+ /// value.
++///
++/// [heic] and [heif] are read-only. The engine recognises them on input — and
++/// does so *without* a feature gate, so a build with no HEIC codec still names
++/// the format rather than calling an iPhone photograph "unknown format" — and
++/// then refuses to write them. They are here for the same reason they are in
++/// the Rust enum: a `detectedFormat` has to be able to carry them.
+ enum OutputFormat {
+   jpeg,
+   png,
+@@ -14,12 +20,60 @@ enum OutputFormat {
+   tiff,
+   bmp,
+   ico,
+-  avif;
++  avif,
++  heic,
++  heif,
++
++  /// A format name this build has no value for.
++  ///
++  /// Deliberately the last variant, and deliberately **never sent in a
++  /// request**: `toJson` would put `"unknown"` on the wire and the engine would
++  /// answer "bad request", which is a worse failure than showing a raw name. It
++  /// exists so a report can *carry* a format it cannot name instead of refusing
++  /// to parse — see [unknownFormat], which is how you get one.
++  unknown;
+ 
+   String toJson() => name;
+ 
+-  static OutputFormat fromJson(String value) =>
+-      OutputFormat.values.byName(value.toLowerCase());
++  /// Parses a wire name, or returns null when this build of the app has never
++  /// heard of it.
++  ///
++  /// **Never throws.** `Enum.byName` throws on an unrecognised name, and the
++  /// engine gained two read-only variants (HEIC, HEIF) in one phase without the
++  /// Dart side being told — so a user picking an iPhone photograph took the app
++  /// down with an unhandled `ArgumentError`. A format the engine reports but
++  /// this build does not know is an ordinary situation, not a programming
++  /// error, and the answer to it is the name: every caller pairs this with the
++  /// raw string from the JSON so it can still say "HEIC" to the user.
++  ///
++  /// [unknownFormat] is the other way to spell the same decision, for callers
++  /// that would rather have the enum carry the case.
++  static OutputFormat? tryFromJson(String value) {
++    final name = value.toLowerCase();
++    for (final candidate in OutputFormat.values) {
++      if (candidate.name == name) return candidate;
++    }
++    return null;
++  }
++
++  /// The enum value for [name], or [unknown].
++  ///
++  /// Read this when the name is about to be *displayed* and the enum is
++  /// incidental. Display only — never send the result back in a request.
++  static OutputFormat unknownFormat(String name) =>
++      tryFromJson(name) ?? OutputFormat.unknown;
++
++  /// The name to show for something the engine sent, whatever this build knows.
++  ///
++  /// The one place a format name is turned into text, so "show the name the
++  /// engine sent" is a single decision rather than a per-caller guess — and so
++  /// an unrecognised name cannot be rendered as the empty string by a caller
++  /// that pattern-matched on a nullable.
++  static String describe(String name) => tryFromJson(name)?.name ?? name;
++
++  /// Whether this value is the placeholder for a name the engine sent that this
++  /// build has no value for.
++  bool get isUnknown => this == OutputFormat.unknown;
+ }
+ 
+ /// How the source image fills the requested box.
+@@ -63,6 +117,139 @@ enum ResampleFilter {
+   };
+ }
+ 
++/// Chroma resolution. Matches `ChromaSubsampling` in `core/src/format.rs`,
++/// which is `snake_case`, so the wire names are `luma444`, `luma422` and
++/// `luma420`.
++///
++/// This is not a quality slider wearing a different hat. Luma resolution never
++/// changes, so sharpness is identical at all three; what changes is how finely
++/// colour is stored. 4:2:0 keeps a quarter of the colour samples and is the
++/// right default for a photograph; 4:2:2 is the middle; 4:4:4 is the only level
++/// that keeps colour detail on hard edges, which is what text on a coloured
++/// background is. The argument, with the measurements, is in
++/// `docs/ARCHITECTURE.md`.
++enum ChromaSubsampling {
++  luma444,
++  luma422,
++  luma420;
++
++  String toJson() => name;
++
++  static ChromaSubsampling fromJson(String value) =>
++      ChromaSubsampling.values.byName(value);
++}
++
++/// The colour space a file's pixels are in.
++///
++/// Matches `ColourSpace` in `core/src/colour.rs` (`snake_case`). [other] is a
++/// profile the engine can identify and refuses rather than guess at — CMYK,
++/// ProPhoto, Lab, grayscale — so it exists here so the refusal can name the
++/// space instead of saying "unknown".
++enum ColourSpace {
++  untagged,
++  srgb,
++  displayP3,
++  other;
++
++  // An explicit mapping rather than `name`, for the same reason
++  // `ResampleFilter` has one: the Rust side is
++  // `#[serde(rename_all = "snake_case")]`, so `DisplayP3` is `display_p3` and
++  // not `displayP3`. `name` would put a string on the wire the engine has never
++  // heard of, and the failure would be a refusal in `colour::parse` naming a
++  // space that does not exist.
++  String toJson() => switch (this) {
++    ColourSpace.untagged => 'untagged',
++    ColourSpace.srgb => 'srgb',
++    ColourSpace.displayP3 => 'display_p3',
++    ColourSpace.other => 'other',
++  };
++
++  static ColourSpace fromJson(String value) => switch (value.toLowerCase()) {
++    'untagged' => ColourSpace.untagged,
++    'srgb' => ColourSpace.srgb,
++    'display_p3' => ColourSpace.displayP3,
++    'other' => ColourSpace.other,
++    // An unrecognised space is `other`, which is what it is: a profile this
++    // build cannot act on. Throwing here would make a colour-managed file from a
++    // newer engine un-openable rather than merely un-convertible.
++    _ => ColourSpace.other,
++  };
++
++  /// What to tell a person about this space, or null when there is nothing to
++  /// say. Written here rather than in the engine because it is the sentence the
++  /// *user* reads: the engine's own wording is in `colour::unsupported_note` and
++  /// the two are allowed to differ.
++  String? get note => switch (this) {
++    ColourSpace.untagged => null,
++    ColourSpace.srgb => null,
++    ColourSpace.displayP3 =>
++      'this photo is Display-P3, so its colours are wider than this export can '
++          'carry; they will be converted to sRGB',
++    ColourSpace.other =>
++      'this photo is in a colour space this build cannot convert from, so the '
++          'colours in the export are the ones in the file, unchanged',
++  };
++}
++
++/// What to do with an animation the output format cannot hold every frame of.
++///
++/// Matches `AnimationPolicy` in `core/src/animation.rs` (`snake_case`).
++///
++/// [keep] is the default and the reason `docs/GIF.md` exists: an animation the
++/// format *can* hold goes through the pipeline frame by frame, and one it cannot
++/// is refused rather than quietly reduced. [firstFrame] is the explicit opt-in
++/// for a caller who has decided a still is what they want, and it reports what
++/// the decision cost.
++enum AnimationPolicy {
++  keep,
++  firstFrame;
++
++  String toJson() => switch (this) {
++    AnimationPolicy.keep => 'keep',
++    AnimationPolicy.firstFrame => 'first_frame',
++  };
++
++  static AnimationPolicy fromJson(String value) =>
++      switch (value.toLowerCase()) {
++        'keep' => AnimationPolicy.keep,
++        'first_frame' => AnimationPolicy.firstFrame,
++        _ => throw ArgumentError('unknown animation policy: $value'),
++      };
++}
++
++/// What happened to one file's frames.
++///
++/// Matches `AnimationAction` in `core/src/animation.rs` (`snake_case`).
++///
++/// A word rather than a pair of counts, because the counts alone cannot tell
++/// "this was never an animation" from "we could not read it", and that
++/// difference is the difference between a report and a guess.
++enum AnimationAction {
++  /// The file failed, was cancelled, or was refused before its frames were
++  /// read. Zero frames in *and* out, which is the only honest count for "we
++  /// never got that far".
++  unknown,
++
++  /// One frame in, one frame out. The file was a still, and nothing was lost.
++  still,
++
++  /// Every frame was carried through the pipeline with its delay.
++  preserved,
++
++  /// One frame was written out of several, deliberately, because the caller
++  /// asked for that with [AnimationPolicy.firstFrame].
++  flattened,
++
++  /// Nothing was written, because the format could not hold the frames and the
++  /// caller had not asked for them to be dropped.
++  refused;
++
++  String toJson() => name;
++
++  static AnimationAction fromJson(String value) =>
++      AnimationAction.values.byName(value.toLowerCase());
++}
++
+ /// EXIF orientation correction. Matches `Orientation` in `core/src/pipeline.rs`.
+ enum Orientation {
+   normal,
+@@ -142,6 +329,47 @@ final class ResizeSpec {
+   };
+ }
+ 
++/// The colour half of a pipeline.
++///
++/// Matches `ColourOptions` in `core/src/colour.rs`. Three answers rather than
++/// one boolean, because "what should happen to the profile" has three genuinely
++/// different answers and picking the default for the user is only right for one
++/// of them.
++///
++/// The default — every field at its default value — is "convert to sRGB and drop
++/// the profile", which is right almost always and is *not* the same as leaving
++/// the pixels alone. An untagged file and a tagged one both take this path; the
++/// second is converted.
++final class ColourOptions {
++  const ColourOptions({
++    this.workingSpace = ColourSpace.srgb,
++    this.keepSourcePixels = false,
++    this.embedProfile = false,
++  });
++
++  /// The space the pixels are converted into before encoding. sRGB by default,
++  /// because a JPEG with no profile means sRGB to every reader that will ever
++  /// open it.
++  final ColourSpace workingSpace;
++
++  /// Keep the source values exactly as they decoded: no conversion, and no
++  /// profile in the output either. The pixels then carry values whose meaning is
++  /// whatever the source profile said, and nothing in the file says so.
++  final bool keepSourcePixels;
++
++  /// Do not convert; carry the source ICC profile into the output instead, so
++  /// the values keep their meaning and a colour-managed viewer renders them
++  /// correctly. Only JPEG and PNG can hold one — the engine refuses WebP by
++  /// name rather than writing a file nothing here can check.
++  final bool embedProfile;
++
++  Map<String, Object?> toJson() => {
++    'working_space': workingSpace.toJson(),
++    'keep_source_pixels': keepSourcePixels,
++    'embed_profile': embedProfile,
++  };
++}
++
+ /// The complete, ordered transform: crop, then orient, then resize.
+ ///
+ /// The order is fixed engine-side. This class mirrors it so the UI cannot
+@@ -152,6 +380,8 @@ final class Pipeline {
+     this.orientation,
+     this.resize,
+     this.stripMetadata = true,
++    this.chromaSubsampling = ChromaSubsampling.luma420,
++    this.colour = const ColourOptions(),
+   });
+ 
+   final CropSpec? crop;
+@@ -162,11 +392,409 @@ final class Pipeline {
+   /// GPS coordinates, and keeping them silently would publish that.
+   final bool stripMetadata;
+ 
++  /// Chroma resolution of the output. Lives on the pipeline rather than beside
++  /// the format because it describes the *picture*, not the file container: it
++  /// is a decision about what is in the image that a UI makes once and applies
++  /// whichever encoder it ends up with.
++  ///
++  /// The default is 4:2:0 because this is a photo resizer. Switch to
++  /// [ChromaSubsampling.luma444] for screenshots, logos and anything with text
++  /// on a coloured background, where 4:2:0 visibly fringes the glyphs.
++  final ChromaSubsampling chromaSubsampling;
++
++  /// What to do with the file's colour profile.
++  final ColourOptions colour;
++
+   Map<String, Object?> toJson() => {
+     'crop': crop?.toJson(),
+     'orientation': orientation?.toJson(),
+     'resize': resize?.toJson(),
+     'strip_metadata': stripMetadata,
++    'chroma_subsampling': chromaSubsampling.toJson(),
++    'colour': colour.toJson(),
++  };
++}
++
++/// The colour profile a file's container says it carries.
++///
++/// Matches `ColourProfile` in `core/src/colour.rs`. Read rather than written:
++/// every engine response that describes a *file* carries one of these, and it is
++/// what lets the UI say "Display-P3: this will be converted to sRGB" before the
++/// user exports, which is the whole difference between colour management and
++/// colour management by surprise.
++final class ColourProfile {
++  const ColourProfile({
++    required this.iccPresent,
++    required this.source,
++    required this.declared,
++    required this.description,
++    required this.iccBytes,
++  });
++
++  /// The profile of a file that carries none, which is most files.
++  static const ColourProfile untagged = ColourProfile(
++    iccPresent: false,
++    source: ColourSpace.untagged,
++    declared: null,
++    description: null,
++    iccBytes: 0,
++  );
++
++  /// Whether the file carries an ICC profile at all. Distinct from [source]
++  /// being [ColourSpace.srgb]: "an sRGB file with a profile" and "an untagged
++  /// file" are different facts about the file even though they are the same
++  /// conversion.
++  final bool iccPresent;
++
++  /// The space the pixel values are in.
++  final ColourSpace source;
++
++  /// The ICC header's declared data colour space, as a name from a fixed
++  /// vocabulary.
++  final String? declared;
++
++  /// The profile's own description tag, when it has a readable one.
++  final String? description;
++
++  /// How many bytes of profile the container carried.
++  final int iccBytes;
++
++  static ColourProfile fromJson(Map<String, Object?> json) => ColourProfile(
++    iccPresent: json['icc_present'] as bool? ?? false,
++    source: ColourSpace.fromJson(json['source'] as String? ?? 'untagged'),
++    declared: json['declared'] as String?,
++    description: json['description'] as String?,
++    iccBytes: (json['icc_bytes'] as num?)?.toInt() ?? 0,
++  );
++}
++
++/// What the engine did about colour, reported next to the file it produced.
++///
++/// Matches `ColourOutcome` in `core/src/colour.rs`. On every per-file outcome,
++/// including failures, where [converted] is false and [source] is
++/// [ColourSpace.untagged] because that is the only honest answer for a file the
++/// engine never got as far as reading.
++final class ColourOutcome {
++  const ColourOutcome({
++    required this.source,
++    required this.output,
++    required this.converted,
++    required this.profileEmbedded,
++  });
++
++  /// What a failed or cancelled file reports: nothing known.
++  static const ColourOutcome unknown = ColourOutcome(
++    source: ColourSpace.untagged,
++    output: ColourSpace.untagged,
++    converted: false,
++    profileEmbedded: false,
++  );
++
++  /// The space the source pixels were in, as the file reported it.
++  final ColourSpace source;
++
++  /// The space the output pixels are in.
++  final ColourSpace output;
++
++  /// Whether the pixels were actually moved. False for an untagged source, which
++  /// is the point: nothing happened and the numbers are the file's own.
++  final bool converted;
++
++  /// Whether an ICC profile was written into the output.
++  final bool profileEmbedded;
++
++  static ColourOutcome fromJson(Map<String, Object?> json) => ColourOutcome(
++    source: ColourSpace.fromJson(json['source'] as String? ?? 'untagged'),
++    output: ColourSpace.fromJson(json['output'] as String? ?? 'untagged'),
++    converted: json['converted'] as bool? ?? false,
++    profileEmbedded: json['profile_embedded'] as bool? ?? false,
++  );
++}
++
++/// The animation half of a file's report.
++///
++/// Matches `AnimationOutcome` in `core/src/animation.rs`. A caller reads this to
++/// find out whether the animation survived without decoding the output and
++/// without parsing the error string.
++final class AnimationOutcome {
++  const AnimationOutcome({
++    required this.framesIn,
++    required this.framesOut,
++    required this.policy,
++    required this.action,
++  });
++
++  /// What a failed, cancelled or unknown file reports.
++  static const AnimationOutcome unknown = AnimationOutcome(
++    framesIn: 0,
++    framesOut: 0,
++    policy: AnimationPolicy.keep,
++    action: AnimationAction.unknown,
++  );
++
++  /// How many frames the input had.
++  final int framesIn;
++
++  /// How many the written file has. Zero when nothing was written, which covers
++  /// both a refusal and a failure.
++  final int framesOut;
++
++  /// The policy the request was made under.
++  final AnimationPolicy policy;
++
++  /// What was done.
++  final AnimationAction action;
++
++  /// How many frames the user did not get.
++  int get dropped => framesIn > framesOut ? framesIn - framesOut : 0;
++
++  /// Whether the file had more than one frame.
++  bool get animated => framesIn > 1;
++
++  /// Whether the whole animation went through the pipeline frame by frame.
++  bool get isPreserved => action == AnimationAction.preserved;
++
++  /// What to tell a person about this file's frames, or null when there is
++  /// nothing to say.
++  ///
++  /// Only a flattening has anything to say: it is the one case where a file was
++  /// written and something the user gave us is not in it. The sentence names the
++  /// count, what the file actually is, and what would have kept the rest.
++  String? get note {
++    if (action != AnimationAction.flattened) return null;
++    return 'This file was an animation of $framesIn frames. The exported image '
++        'is the first frame; the other $dropped were not written. '
++        'Choose GIF output to keep every frame.';
++  }
++
++  static AnimationOutcome fromJson(Map<String, Object?> json) =>
++      AnimationOutcome(
++        framesIn: (json['frames_in'] as num?)?.toInt() ?? 0,
++        framesOut: (json['frames_out'] as num?)?.toInt() ?? 0,
++        policy: AnimationPolicy.fromJson(json['policy'] as String? ?? 'keep'),
++        action: AnimationAction.fromJson(
++          json['action'] as String? ?? 'unknown',
++        ),
++      );
++}
++
++/// Why a file produced no output on purpose.
++///
++/// Mirrors `SkipReason` in `core/src/worker.rs`, which carries
++/// `#[serde(tag = "kind", rename_all = "snake_case")]`. A skip is not a failure:
++/// the engine read the file, decided, and can say why. What it must never do is
++/// decide quietly, which is why this is one type per answer rather than a
++/// boolean.
++sealed class SkipReason {
++  const SkipReason();
++
++  /// Which answer this is, matching the engine's `kind` tag.
++  String get kind;
++
++  /// A sentence for the person whose folder this is, built here rather than
++  /// parsed out of an error string. Each one names what happened and what to do
++  /// about it, because "too big" is not something a user can act on.
++  String get note;
++
++  static SkipReason fromJson(Map<String, Object?> json) {
++    final String kind = json['kind'] as String? ?? 'unreadable';
++    return switch (kind) {
++      'duplicate' => SkipReasonDuplicate(
++        json['of'] as String? ?? 'another file',
++      ),
++      'unreadable' => const SkipReasonUnreadable(),
++      'unsupported_format' => SkipReasonUnsupportedFormat(
++        json['format'] as String? ?? 'an unrecognised format',
++      ),
++      'too_large' => SkipReasonTooLarge(
++        limit: (json['limit'] as num?)?.toInt() ?? 0,
++        actual: (json['actual'] as num?)?.toInt() ?? 0,
++        pixels: json['unit'] == 'pixels',
++      ),
++      'would_upscale' => SkipReasonWouldUpscale(
++        requestedWidth: _pairAt(json['requested'], 0),
++        requestedHeight: _pairAt(json['requested'], 1),
++        actualWidth: _pairAt(json['actual'], 0),
++        actualHeight: _pairAt(json['actual'], 1),
++      ),
++      // An engine newer than this app can name an answer we do not know. Refusing
++      // to parse would turn "one new reason" into a crash on every file in the
++      // folder, which is exactly the sort of small contract drift the capability
++      // list is meant to prevent. One unreadable line is strictly better than a
++      // dialog with no dismiss button.
++      _ => SkipReasonUnrecognised(kind),
++    };
++  }
++
++  static int _pairAt(Object? pair, int index) {
++    if (pair is List && index < pair.length && pair[index] is num) {
++      return (pair[index] as num).toInt();
++    }
++    return 0;
++  }
++}
++
++/// Another file in this batch already exported this picture. `of` is that
++/// file's name.
++final class SkipReasonDuplicate extends SkipReason {
++  const SkipReasonDuplicate(this.of);
++
++  final String of;
++
++  @override
++  String get kind => 'duplicate';
++
++  @override
++  String get note => 'the same picture is already exported as $of';
++}
++
++/// The bytes are not a picture this build can open, or it would not decode.
++final class SkipReasonUnreadable extends SkipReason {
++  const SkipReasonUnreadable();
++
++  @override
++  String get kind => 'unreadable';
++
++  @override
++  String get note =>
++      'this file could not be read as an image; it may be damaged, or not the '
++      'kind of file its name says';
++}
++
++/// A real image in a container this build cannot decode. The file is fine; the
++/// limitation is the engine's.
++///
++/// The format is carried as the raw string the engine sent rather than as an
++/// [OutputFormat], because this is exactly the case where the two can disagree:
++/// an engine that reports HEIC skips against an app that predates the HEIC
++/// variants would otherwise fail to parse every report in the folder rather than
++/// render one line of it.
++final class SkipReasonUnsupportedFormat extends SkipReason {
++  const SkipReasonUnsupportedFormat(this.formatName);
++
++  /// The name as the engine sent it.
++  final String formatName;
++
++  /// The enum value if this build knows the format, null if it does not.
++  OutputFormat? get format => OutputFormat.tryFromJson(formatName);
++
++  @override
++  String get kind => 'unsupported_format';
++
++  @override
++  String get note =>
++      'this build cannot open $formatName files; convert them to JPEG, PNG, '
++      'WebP or GIF, or use a build with that decoder';
++}
++
++/// Over a ceiling the engine's limit profile states. [pixels] says which.
++final class SkipReasonTooLarge extends SkipReason {
++  const SkipReasonTooLarge({
++    required this.limit,
++    required this.actual,
++    required this.pixels,
++  });
++
++  final int limit;
++  final int actual;
++
++  /// Whether the numbers count pixels rather than bytes.
++  final bool pixels;
++
++  @override
++  String get kind => 'too_large';
++
++  @override
++  String get note => pixels
++      ? 'this picture is $actual pixels once decoded and this device accepts up '
++            'to $limit'
++      : 'this file is $actual bytes and this device accepts up to $limit';
++}
++
++/// The request asked for a bigger picture than the file has, and the engine
++/// refused to invent the detail.
++final class SkipReasonWouldUpscale extends SkipReason {
++  const SkipReasonWouldUpscale({
++    required this.requestedWidth,
++    required this.requestedHeight,
++    required this.actualWidth,
++    required this.actualHeight,
++  });
++
++  final int requestedWidth;
++  final int requestedHeight;
++  final int actualWidth;
++  final int actualHeight;
++
++  @override
++  String get kind => 'would_upscale';
++
++  @override
++  String get note =>
++      'this picture is ${actualWidth}x$actualHeight and the request asked for '
++      '${requestedWidth}x$requestedHeight; enlarging it adds no detail, so it '
++      'was left alone';
++}
++
++/// A skip reason this build has never heard of.
++///
++/// Carries the engine's `kind` verbatim so the report can show what arrived, and
++/// says plainly that the app is behind the engine — which is a thing a user can
++/// act on (update the app) rather than a thing they can only be confused by.
++final class SkipReasonUnrecognised extends SkipReason {
++  const SkipReasonUnrecognised(this.kindSent);
++
++  /// The `kind` string the engine sent.
++  final String kindSent;
++
++  @override
++  String get kind => kindSent;
++
++  @override
++  String get note =>
++      'this file was not exported for a reason this version of the app does not '
++      'recognise ($kindSent); updating the app may explain it';
++}
++
++/// What a batch does with a file it will not process.
++///
++/// Mirrors `BatchPolicy` in `core/src/worker.rs`. The three answers are
++/// independent: a caller may want duplicates collapsed and still want a corrupt
++/// file reported as a failure, or the reverse. The engine's default is all three
++/// on, because for a folder the alternatives are silently dropping a file and
++/// silently failing one.
++final class BatchPolicy {
++  const BatchPolicy({
++    this.deduplicate = true,
++    this.skipUnprocessable = true,
++    this.skipUpscales = true,
++  });
++
++  /// Collapse a file whose content is already exported.
++  final bool deduplicate;
++
++  /// Report a file that cannot be processed at all as a skip with a reason
++  /// rather than as a failure.
++  final bool skipUnprocessable;
++
++  /// Report a file whose requested geometry is larger than the picture as a skip
++  /// rather than writing it out at its own size.
++  final bool skipUpscales;
++
++  /// Every answer on, which is also what an engine predating this model means.
++  static const BatchPolicy all = BatchPolicy();
++
++  /// Every answer off: report everything as a failure.
++  static const BatchPolicy none = BatchPolicy(
++    deduplicate: false,
++    skipUnprocessable: false,
++    skipUpscales: false,
++  );
++
++  Map<String, Object?> toJson() => {
++    'deduplicate': deduplicate,
++    'skip_unprocessable': skipUnprocessable,
++    'skip_upscales': skipUpscales,
+   };
+ }
+ 
+@@ -175,7 +803,7 @@ final class Pipeline {
+ /// Mirrors `ValidateReport` in `core/src/validate.rs`.
+ final class ValidateReport {
+   const ValidateReport({
+-    required this.format,
++    required this.formatName,
+     required this.width,
+     required this.height,
+     required this.megapixels,
+@@ -184,9 +812,14 @@ final class ValidateReport {
+     required this.sensitiveTags,
+     required this.orientation,
+     required this.suspicious,
++    required this.frames,
++    required this.framesTruncated,
++    required this.colour,
+   });
+ 
+-  final OutputFormat format;
++  /// The format as the engine named it, whatever this build knows of it.
++  final String formatName;
++
+   final int width;
+   final int height;
+   final double megapixels;
+@@ -198,8 +831,29 @@ final class ValidateReport {
+   /// Human-readable warning, or null when the file looks ordinary.
+   final String? suspicious;
+ 
++  /// How many frames the file's container claims. 1 for a still, and 1 for
++  /// every format this build cannot see frames in.
++  final int frames;
++
++  /// Whether the frame walk stopped before the trailer, which makes [frames] a
++  /// lower bound rather than a count. A file that says "at least 3" cannot be
++  /// checked against a write of 3, so the animation path refuses it.
++  final bool framesTruncated;
++
++  /// The colour profile the file carries, or that it does not.
++  final ColourProfile colour;
++
++  /// [formatName] as an enum value, or null when this build has never heard of
++  /// it. Null is ordinary: the engine recognises HEIC with no feature gate on
++  /// purpose, so this build can be told about a format it cannot open.
++  OutputFormat? get format => OutputFormat.tryFromJson(formatName);
++
++  /// [format] with a placeholder rather than null, for call sites that cannot
++  /// cope with an absent enum. Display only — never send it back in a request.
++  OutputFormat get formatOrUnknown => OutputFormat.unknownFormat(formatName);
++
+   static ValidateReport fromJson(Map<String, Object?> json) => ValidateReport(
+-    format: OutputFormat.fromJson(json['format'] as String),
++    formatName: json['format'] as String,
+     width: (json['width'] as num).toInt(),
+     height: (json['height'] as num).toInt(),
+     megapixels: (json['megapixels'] as num).toDouble(),
+@@ -208,6 +862,11 @@ final class ValidateReport {
+     sensitiveTags: (json['sensitive_tags'] as List).cast<String>(),
+     orientation: (json['orientation'] as num?)?.toInt(),
+     suspicious: json['suspicious'] as String?,
++    frames: (json['frames'] as num?)?.toInt() ?? 1,
++    framesTruncated: json['frames_truncated'] as bool? ?? false,
++    colour: ColourProfile.fromJson(
++      (json['colour'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
+   );
+ }
+ 
+@@ -231,6 +890,7 @@ final class ExifInfo {
+     required this.camera,
+     required this.capturedAt,
+     required this.sensitiveTags,
++    required this.colour,
+   });
+ 
+   final List<ExifEntry> entries;
+@@ -240,6 +900,13 @@ final class ExifInfo {
+   final String? capturedAt;
+   final List<String> sensitiveTags;
+ 
++  /// The colour profile the file carries.
++  ///
++  /// Metadata in the sense a user means, not in the sense the engine's `exif`
++  /// module does: dropping it changes what the pixels mean, so it is reported
++  /// rather than quietly stripped, and the pipeline converts before it strips.
++  final ColourProfile colour;
++
+   static ExifInfo fromJson(Map<String, Object?> json) => ExifInfo(
+     entries: (json['entries'] as List)
+         .map((e) => ExifEntry.fromJson((e as Map).cast<String, Object?>()))
+@@ -249,6 +916,9 @@ final class ExifInfo {
+     camera: json['camera'] as String?,
+     capturedAt: json['captured_at'] as String?,
+     sensitiveTags: (json['sensitive_tags'] as List).cast<String>(),
++    colour: ColourProfile.fromJson(
++      (json['colour'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
+   );
+ }
+ 
+@@ -261,23 +931,59 @@ final class Preset {
+   const Preset({
+     required this.id,
+     required this.label,
++    required this.category,
+     required this.width,
+     required this.height,
+-    required this.format,
++    required this.formatName,
++    required this.chroma,
++    required this.quality,
++    required this.maxBytes,
++    required this.crops,
+   });
+ 
+   final String id;
+   final String label;
++
++  /// Which tab this preset belongs under. Matches `Category` in
++  /// `core/src/presets.rs` (`snake_case`).
++  final String category;
++
+   final int width;
+   final int? height;
+-  final OutputFormat format;
++
++  /// The preset's output format, as the engine named it.
++  final String formatName;
++
++  /// Chroma level the preset exports at. Every preset is JPEG or WebP, and
++  /// `store-screenshot` is the one at 4:4:4 — a UI capture is text on a
++  /// coloured background, which is exactly the content 4:2:0 fringes.
++  final ChromaSubsampling chroma;
++
++  /// 0..=100. Zero means "leave it to the user", so it is not a request to
++  /// export at the worst quality available.
++  final int quality;
++
++  /// The byte ceiling this preset promises, or null for none.
++  final int? maxBytes;
++
++  /// Whether the preset is a square or a hard aspect ratio, i.e. whether
++  /// cropping is expected rather than incidental.
++  final bool crops;
++
++  /// [formatName] as an enum value, null when this build does not know it.
++  OutputFormat? get format => OutputFormat.tryFromJson(formatName);
+ 
+   static Preset fromJson(Map<String, Object?> json) => Preset(
+     id: json['id'] as String,
+     label: json['label'] as String,
++    category: json['category'] as String,
+     width: (json['width'] as num).toInt(),
+     height: (json['height'] as num?)?.toInt(),
+-    format: OutputFormat.fromJson(json['format'] as String),
++    formatName: json['format'] as String,
++    chroma: ChromaSubsampling.fromJson(json['chroma'] as String),
++    quality: (json['quality'] as num?)?.toInt() ?? 0,
++    maxBytes: (json['max_bytes'] as num?)?.toInt(),
++    crops: json['crops'] as bool? ?? false,
+   );
+ }
+ 
+@@ -293,7 +999,8 @@ final class ProcessResult {
+     required this.height,
+     required this.qualityUsed,
+     required this.targetMet,
+-    required this.detectedFormat,
++    required this.detectedFormatName,
++    required this.animation,
+   });
+ 
+   final String outputName;
+@@ -304,12 +1011,26 @@ final class ProcessResult {
+   final int height;
+ 
+   /// Quality actually used. Differs from the request when a byte target forced
+-  /// a search.
++  /// a search, and is **0 when the format has no quality setting and none was
++  /// applied** — a PNG reports 0, not the 85 that was asked for, because the UI
++  /// shows this number next to the file it just wrote.
+   final int qualityUsed;
+ 
+   /// False when the byte target could not be met.
+   final bool targetMet;
+-  final OutputFormat detectedFormat;
++
++  /// The input's format, as the engine named it.
++  final String detectedFormatName;
++
++  /// What happened to this file's frames. Present on every result, including
++  /// failures, so a preview can say whether an animation survived without
++  /// decoding the bytes it was handed.
++  final AnimationOutcome animation;
++
++  /// [detectedFormatName] as an enum value, null when this build does not know
++  /// it.
++  OutputFormat? get detectedFormat =>
++      OutputFormat.tryFromJson(detectedFormatName);
+ 
+   double get savedPercent =>
+       inputBytes == 0 ? 0.0 : (1.0 - outputBytes / inputBytes) * 100.0;
+@@ -323,7 +1044,10 @@ final class ProcessResult {
+     height: (json['height'] as num).toInt(),
+     qualityUsed: (json['quality_used'] as num).toInt(),
+     targetMet: json['target_met'] as bool,
+-    detectedFormat: OutputFormat.fromJson(json['detected_format'] as String),
++    detectedFormatName: json['detected_format'] as String,
++    animation: AnimationOutcome.fromJson(
++      (json['animation'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
+   );
+ }
+ 
+@@ -339,6 +1063,9 @@ final class BatchOutcome {
+     required this.height,
+     required this.qualityUsed,
+     required this.targetMet,
++    required this.colour,
++    required this.animation,
++    required this.skipped,
+     required this.error,
+   });
+ 
+@@ -352,10 +1079,33 @@ final class BatchOutcome {
+   final int qualityUsed;
+   final bool targetMet;
+ 
++  /// What the engine did about colour, so the UI can say "this was a Display-P3
++  /// photo and is now sRGB" next to the file it just wrote.
++  final ColourOutcome colour;
++
++  /// What happened to this file's frames. An
++  /// [AnimationAction.refused] here is the one failure that still knows how many
++  /// frames the file had, because the file was fine and the *format* could not
++  /// hold them.
++  final AnimationOutcome animation;
++
++  /// Set when this file was read and then deliberately not written, with the
++  /// reason. A skip is a third thing: not a success, because there is no file,
++  /// and not a failure, because nothing went wrong.
++  final SkipReason? skipped;
++
+   /// Set when this file failed. Every failure carries a reason.
+   final String? error;
+ 
+-  bool get ok => error == null;
++  /// Whether a file was written.
++  ///
++  /// Matches `worker::Outcome::ok`, which is
++  /// `error.is_none() && skipped.is_none()`. It used to be `error == null`, and
++  /// that reported **every file in a batch of 400 as succeeded when 30 of them
++  /// were skipped** — the engine's three-state report, its grouped
++  /// `skip_reasons()` and a `BatchReport` whose counts are designed to add up,
++  /// all read by a consumer that counted two of the three states.
++  bool get ok => error == null && skipped == null;
+ 
+   static BatchOutcome fromJson(Map<String, Object?> json) => BatchOutcome(
+     id: json['id'] as String,
+@@ -367,6 +1117,15 @@ final class BatchOutcome {
+     height: (json['height'] as num).toInt(),
+     qualityUsed: (json['quality_used'] as num).toInt(),
+     targetMet: json['target_met'] as bool,
++    colour: ColourOutcome.fromJson(
++      (json['colour'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
++    animation: AnimationOutcome.fromJson(
++      (json['animation'] as Map?)?.cast<String, Object?>() ?? const {},
++    ),
++    skipped: json['skipped'] == null
++        ? null
++        : SkipReason.fromJson((json['skipped'] as Map).cast<String, Object?>()),
+     error: json['error'] as String?,
+   );
+ }
+@@ -378,8 +1137,40 @@ final class BatchReport {
+   final List<BatchOutcome> outcomes;
+   final bool cancelled;
+ 
++  /// Files written.
+   int get succeeded => outcomes.where((o) => o.ok).length;
+-  int get failed => outcomes.where((o) => !o.ok).length;
++
++  /// Files the engine read and then declined to write. Its own number rather
++  /// than `outcomes.length - succeeded - failed`, because a caller showing "370
++  /// of 400" needs to be able to say *why* the other thirty are not failures.
++  int get skipped => outcomes.where((o) => o.skipped != null).length;
++
++  /// Files that could not be processed at all. Excludes skips: a deliberate
++  /// decision reported as an error tells the user to fix something that is not
++  /// broken.
++  int get failed => outcomes.where((o) => !o.ok && o.skipped == null).length;
++
++  /// Of the skipped files, how many were pictures this batch already exported.
++  int get duplicates =>
++      outcomes.where((o) => o.skipped is SkipReasonDuplicate).length;
++
++  /// Every skip reason that occurred, grouped, with the count for each. Mirrors
++  /// `BatchReport::skip_reasons`, so a summary does not have to be re-derived
++  /// here.
++  Map<String, int> get skipReasons {
++    final counts = <String, int>{};
++    for (final outcome in outcomes) {
++      final reason = outcome.skipped;
++      if (reason == null) continue;
++      counts[reason.kind] = (counts[reason.kind] ?? 0) + 1;
++    }
++    return counts;
++  }
++
++  /// The three counts, in the order a report shows them. They add up to
++  /// `outcomes.length` by construction, which is the property a summary needs
++  /// and which a subtraction cannot promise.
++  int get total => outcomes.length;
+ 
+   static BatchReport fromJson(Map<String, Object?> json) => BatchReport(
+     outcomes: (json['outcomes'] as List)
+@@ -390,27 +1181,113 @@ final class BatchReport {
+ }
+ 
+ /// Engine capabilities. Mirrors `Capabilities` in `core/src/lib.rs`.
++///
++/// Every field is cast rather than defaulted. Reading a capability as absent is
++/// how a build that cannot open an iPhone photograph ends up offering to, so a
++/// missing key is a thrown cast here instead of a silent `false` in the UI.
+ final class Capabilities {
+   const Capabilities({
+     required this.version,
++    required this.jpeg,
++    required this.png,
+     required this.webpLossy,
++    required this.webpLossless,
+     required this.avifEncode,
++    required this.avifDecode,
++    required this.heicDecode,
++    required this.jpegProgressive,
++    required this.jpegChromaSubsampling,
++    required this.gif,
++    required this.tiff,
++    required this.bmp,
++    required this.ico,
+     required this.maxInputBytes,
+     required this.maxPixels,
+   });
+ 
+   final String version;
++
++  /// Whether JPEG can be written.
++  final bool jpeg;
++
++  /// Whether PNG can be written.
++  final bool png;
++
++  /// Whether WebP can be written *lossily*, which is what makes the quality
++  /// slider and a byte ceiling mean anything for it. False in a build without
++  /// the codec, where WebP is lossless and `is_lossless()` says so.
+   final bool webpLossy;
++
++  /// Whether WebP can be written losslessly. True in every build.
++  final bool webpLossless;
++
++  /// Whether AVIF can be *written*. True in the default build. It is not the
++  /// whole story, which is why [avifDecode] is a separate field: one boolean
++  /// for both directions would tell a user we could open the file we just
++  /// produced.
+   final bool avifEncode;
++
++  /// Whether AVIF can be *read*. False in every build of this engine, because
++  /// there is no AV1 decoder in the tree.
++  final bool avifDecode;
++
++  /// Whether HEVC-coded HEIC/HEIF can be read. False means the build refuses
++  /// iPhone photos, so the picker has to say so before the user chooses one —
++  /// not after the export fails.
++  final bool heicDecode;
++
++  /// Whether the JPEG encoder writes scan-by-scan output. Costs about 64% in
++  /// file size at q85; it belongs on "sending this over a slow link", not on
++  /// every export.
++  final bool jpegProgressive;
++
++  /// Whether the JPEG encoder honours a chroma resolution. False would mean a
++  /// chroma control in the UI that does nothing.
++  final bool jpegChromaSubsampling;
++
++  final bool gif;
++  final bool tiff;
++  final bool bmp;
++  final bool ico;
+   final int maxInputBytes;
+   final int maxPixels;
+ 
++  /// Whether [format] can be *written* by this build.
++  ///
++  /// The one predicate the format picker needs, derived from the same flags
++  /// rather than from a list somebody typed: offering a format this build
++  /// cannot produce is a failure at export time, and it is the failure hard
++  /// rule 10 exists to prevent.
++  bool canWrite(OutputFormat format) => switch (format) {
++    OutputFormat.jpeg => jpeg,
++    OutputFormat.png => png,
++    OutputFormat.webp => webpLossy || webpLossless,
++    OutputFormat.gif => gif,
++    OutputFormat.tiff => tiff,
++    OutputFormat.bmp => bmp,
++    OutputFormat.ico => ico,
++    OutputFormat.avif => avifEncode,
++    OutputFormat.heic || OutputFormat.heif => false,
++    OutputFormat.unknown => false,
++  };
++
+   static Capabilities fromJson(Map<String, Object?> json) {
+     final caps = (json['capabilities'] as Map).cast<String, Object?>();
+     return Capabilities(
+       version: json['version'] as String,
++      jpeg: caps['jpeg'] as bool,
++      png: caps['png'] as bool,
+       webpLossy: caps['webp_lossy'] as bool,
++      webpLossless: caps['webp_lossless'] as bool,
+       avifEncode: caps['avif_encode'] as bool,
++      avifDecode: caps['avif_decode'] as bool,
++      heicDecode: caps['heic_decode'] as bool,
++      jpegProgressive: caps['jpeg_progressive'] as bool,
++      jpegChromaSubsampling: caps['jpeg_chroma_subsampling'] as bool,
++      gif: caps['gif'] as bool,
++      tiff: caps['tiff'] as bool,
++      bmp: caps['bmp'] as bool,
++      ico: caps['ico'] as bool,
+       maxInputBytes: (caps['max_input_bytes'] as num).toInt(),
+       maxPixels: (caps['max_pixels'] as num).toInt(),
+     );
+@@ -430,15 +1307,23 @@ abstract final class Requests {
+     int? targetBytes,
+     bool? stripMetadata,
+     bool mobileLimits = false,
++    bool progressive = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
+   }) => jsonEncode({
+     'pipeline': pipeline.toJson(),
+     'format': format.toJson(),
+     'quality': quality,
++    // A top-level key beside `quality`, not a field on the pipeline: scan order
++    // is a property of the encoder writing the file, while chroma resolution is
++    // a property of the picture. The engine puts the same split in its own
++    // request structs, so the two cannot disagree about which is which.
++    'progressive': progressive,
+     'target': targetBytes,
+     'name': name,
+     'data_base64': base64Encode(imageBytes),
+     'strip_metadata': stripMetadata,
+     'mobile_limits': mobileLimits,
++    'animation': animation.toJson(),
+   });
+ 
+   static String batch({
+@@ -449,13 +1334,22 @@ abstract final class Requests {
+     int? targetBytes,
+     int? cancelHandle,
+     bool mobileLimits = false,
++    bool progressive = false,
++    AnimationPolicy animation = AnimationPolicy.keep,
++    BatchPolicy policy = BatchPolicy.all,
+   }) => jsonEncode({
++    // The pipeline's fields are spread at the top level because the engine's
++    // batch request inlines them; `chroma_subsampling` arrives the same way as
++    // `strip_metadata` does.
+     ...pipeline.toJson(),
+     'format': format.toJson(),
+     'quality': quality,
++    'progressive': progressive,
+     'target': targetBytes,
+     'mobile_limits': mobileLimits,
+     'cancel': cancelHandle,
++    'animation': animation.toJson(),
++    'policy': policy.toJson(),
+     'files': [
+       for (final f in files)
+         {
+diff --git a/test/ffi_contract_test.dart b/test/ffi_contract_test.dart
+index b754f98..58dca6c 100644
+--- a/test/ffi_contract_test.dart
++++ b/test/ffi_contract_test.dart
+@@ -1,9 +1,11 @@
++import 'dart:convert';
+ import 'dart:ffi' as ffi;
+ import 'dart:io';
+ 
+ import 'package:ffi/ffi.dart';
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/bindings.dart';
++import 'package:shrinkray/rust/models.dart';
+ 
+ /// The contract test: every `px_*` function the engine exports must have a
+ /// matching Dart declaration, and the `PxBuffer` layout must match byte for
+@@ -89,6 +91,76 @@ void main() {
+       calloc.free(again);
+     }
+   });
++
++  test('an error string is freed, not just the data buffer', () {
++    // `PxBuffer.error` is a separate allocation from `PxBuffer.data`, with its
++    // own free function. `px_buffer_free` frees only the data, because the two
++    // have separate lifetimes — so an app that frees only the data leaks one
++    // `CString` per failed call, forever, and `Isolate.run` guarantees a fresh
++    // allocator per call so nothing is ever reused.
++    //
++    // The Rust suite cannot catch this: `ffi.rs`'s own leak test calls
++    // `px_string_free` explicitly, which is why the leak is invisible to
++    // `cargo test` and visible only here, where Dart has to free it.
++    final lib = _tryLoad();
++    if (lib == null) {
++      markTestSkipped('native library not built');
++      return;
++    }
++    final px = PxBindings(lib);
++    for (var round = 0; round < 100; round++) {
++      final buffer = px.selftestError();
++      try {
++        expect(buffer.status, PxStatus.error);
++        // Both owned pointers are non-null on the error path, and both need a
++        // free. `data` is null because an error carries no payload.
++        expect(buffer.error, isNot(ffi.nullptr));
++      } finally {
++        px.stringFree(buffer.error);
++        px.bufferFree(buffer);
++      }
++    }
++  });
++
++  test('the capability list parses through the Dart model', () {
++    // `Capabilities.fromJson` casts every field, so a key the engine sends and
++    // the model does not name throws here rather than reading as absent in the
++    // UI. Asserted against the library that was actually loaded, not against a
++    // hand-written JSON literal, because the failure this guards against is
++    // precisely the model and the engine disagreeing.
++    final lib = _tryLoad();
++    if (lib == null) {
++      markTestSkipped(
++        'native library not built — run the native build first (see README.md)',
++      );
++      return;
++    }
++    final px = PxBindings(lib);
++    final buffer = px.version();
++    try {
++      final caps = Capabilities.fromJson(
++        jsonDecode(
++              utf8.decode(
++                buffer.data.cast<ffi.Uint8>().asTypedList(buffer.len),
++              ),
++            )
++            as Map<String, Object?>,
++      );
++      expect(caps.maxPixels, greaterThan(0));
++      expect(caps.maxInputBytes, greaterThan(0));
++      expect(caps.jpeg, isTrue);
++      expect(caps.png, isTrue);
++      // Writable and not readable: the default build has an AVIF encoder and no
++      // AV1 decoder. A model that collapsed these into one field would claim a
++      // round trip the engine cannot make.
++      expect(caps.avifEncode, isTrue);
++      expect(caps.avifDecode, isFalse);
++      expect(caps.jpegProgressive, isTrue);
++      expect(caps.jpegChromaSubsampling, isTrue);
++    } finally {
++      px.bufferFree(buffer);
++    }
++  });
+ }
+ 
+ /// Returns the engine library, or null when it has not been built.
+diff --git a/test/models_test.dart b/test/models_test.dart
+index 949c83d..e8c1806 100644
+--- a/test/models_test.dart
++++ b/test/models_test.dart
+@@ -1,6 +1,84 @@
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:shrinkray/rust/models.dart';
+ 
++Map<String, Object?> _reportJson({
++  String format = 'jpeg',
++  Map<String, Object?> extra = const {},
++}) => {
++  'format': format,
++  'width': 4000,
++  'height': 3000,
++  'megapixels': 12.0,
++  'has_exif': true,
++  'has_animated': false,
++  'sensitive_tags': ['GPS'],
++  'orientation': 6,
++  'suspicious': null,
++  'frames': 1,
++  'frames_truncated': false,
++  'colour': {
++    'icc_present': false,
++    'source': 'untagged',
++    'declared': null,
++    'description': null,
++    'icc_bytes': 0,
++  },
++  ...extra,
++};
++
++ValidateReport _report({
++  String format = 'jpeg',
++  Map<String, Object?> extra = const {},
++}) => ValidateReport.fromJson(_reportJson(format: format, extra: extra));
++
++Map<String, Object?> _capabilities({
++  bool webpLossy = true,
++  bool avifEncode = true,
++  bool avifDecode = false,
++  bool heicDecode = false,
++}) => {
++  'version': '0.1.0',
++  'capabilities': {
++    'jpeg': true,
++    'png': true,
++    'webp_lossy': webpLossy,
++    'webp_lossless': true,
++    'avif_encode': avifEncode,
++    'avif_decode': avifDecode,
++    'heic_decode': heicDecode,
++    'jpeg_progressive': true,
++    'jpeg_chroma_subsampling': true,
++    'gif': true,
++    'tiff': true,
++    'bmp': true,
++    'ico': true,
++    'max_input_bytes': 536870912,
++    'max_pixels': 128000000,
++  },
++};
++
++BatchOutcome _outcome({String? error, SkipReason? skipped}) {
++  // A written file reports dimensions and a quality; anything else reports
++  // zeros, because a size for a file that does not exist is a wrong number a UI
++  // cannot tell from a right one. Mirrors `worker::Outcome::skipped`.
++  final written = skipped == null && error == null;
++  return BatchOutcome(
++    id: '1',
++    name: 'a.jpg',
++    outputName: written ? 'a.jpg' : '',
++    inputBytes: 10,
++    outputBytes: written ? 5 : 0,
++    width: written ? 10 : 0,
++    height: written ? 10 : 0,
++    qualityUsed: written ? 80 : 0,
++    targetMet: written,
++    colour: ColourOutcome.unknown,
++    animation: AnimationOutcome.unknown,
++    skipped: skipped,
++    error: error,
++  );
++}
++
+ void main() {
+   group('OutputFormat', () {
+     test('serialises lowercase, matching the Rust serde convention', () {
+@@ -12,13 +90,75 @@ void main() {
+       expect(OutputFormat.bmp.toJson(), 'bmp');
+       expect(OutputFormat.ico.toJson(), 'ico');
+       expect(OutputFormat.avif.toJson(), 'avif');
++      expect(OutputFormat.heic.toJson(), 'heic');
++      expect(OutputFormat.heif.toJson(), 'heif');
+     });
+ 
+     test('round-trips every value', () {
+       for (final format in OutputFormat.values) {
+-        expect(OutputFormat.fromJson(format.toJson()), format);
++        expect(OutputFormat.tryFromJson(format.toJson()), format);
+       }
+     });
++
++    test('heic and heif are here, and are never sent in a request', () {
++      // `heic::detect` has no feature gate at all, precisely so a build with no
++      // HEIC codec can still name the format rather than calling an iPhone
++      // photograph "unknown format". So the engine reports `"heic"` from a build
++      // that cannot open the file, and the Dart side has to be able to hold it.
++      expect(OutputFormat.tryFromJson('heic'), OutputFormat.heic);
++      expect(OutputFormat.tryFromJson('heif'), OutputFormat.heif);
++      // They are recognised on input and refused on output, so `canWrite` says
++      // no for both — the flag the format picker greys out.
++      final caps = Capabilities.fromJson(_capabilities());
++      expect(caps.canWrite(OutputFormat.heic), isFalse);
++      expect(caps.canWrite(OutputFormat.heif), isFalse);
++    });
++
++    test('an unrecognised name does not throw', () {
++      // The bug this replaces: `OutputFormat.values.byName` throws
++      // `ArgumentError` on a name it does not know, and the engine gained two
++      // variants in one phase without the Dart side being told. Picking an
++      // iPhone photograph crashed the app.
++      expect(OutputFormat.tryFromJson('avif'), isNotNull);
++      expect(() => OutputFormat.tryFromJson('jxl'), returnsNormally);
++      expect(OutputFormat.tryFromJson('jxl'), isNull);
++    });
++
++    test('an unrecognised name survives a whole report', () {
++      // The point of returning null rather than throwing: the caller still has
++      // the string, so it can say "JXL" to the user instead of crashing on the
++      // way to finding out.
++      final report = _report(format: 'jxl');
++      expect(report.format, isNull);
++      expect(report.formatName, 'jxl');
++      expect(report.formatOrUnknown, OutputFormat.unknown);
++      expect(report.formatOrUnknown.isUnknown, isTrue);
++      expect(OutputFormat.describe('jxl'), 'jxl');
++      expect(OutputFormat.describe('heic'), 'heic');
++    });
++
++    test('an unrecognised name survives a skip reason too', () {
++      // The one place a format name arrives inside another object, and the place
++      // an `UnsupportedFormat` skip meets an app that predates the variant.
++      final reason = SkipReason.fromJson({
++        'kind': 'unsupported_format',
++        'format': 'heic',
++      });
++      expect(reason.kind, 'unsupported_format');
++      expect((reason as SkipReasonUnsupportedFormat).formatName, 'heic');
++      expect(reason.format, OutputFormat.heic);
++      expect(reason.note, contains('heic'));
++    });
++
++    test(
++      'unknownFormat never puts a name the engine does not have on the wire',
++      () {
++        // `unknown` is a display placeholder. Sending it would be a "bad request",
++        // which is worse than showing a raw string.
++        final caps = Capabilities.fromJson(_capabilities());
++        expect(caps.canWrite(OutputFormat.unknown), isFalse);
++      },
++    );
+   });
+ 
+   group('FitMode', () {
+@@ -45,6 +185,53 @@ void main() {
+     });
+   });
+ 
++  group('ChromaSubsampling', () {
++    test('serialises the names the Rust enum produces', () {
++      // `#[serde(rename_all = "snake_case")]` on `Luma444`/`Luma422`/`Luma420`
++      // gives exactly these three strings. A Dart-side `luma4_4_4` would be a
++      // silent "bad request", which is the failure this assertion exists to
++      // prevent.
++      expect(ChromaSubsampling.luma444.toJson(), 'luma444');
++      expect(ChromaSubsampling.luma422.toJson(), 'luma422');
++      expect(ChromaSubsampling.luma420.toJson(), 'luma420');
++    });
++
++    test('round-trips every value', () {
++      for (final chroma in ChromaSubsampling.values) {
++        expect(ChromaSubsampling.fromJson(chroma.toJson()), chroma);
++      }
++    });
++
++    test('rejects an unknown level rather than guessing', () {
++      expect(() => ChromaSubsampling.fromJson('luma411'), throwsArgumentError);
++    });
++  });
++
++  group('ColourSpace', () {
++    test('serialises the names the Rust enum produces', () {
++      expect(ColourSpace.untagged.toJson(), 'untagged');
++      expect(ColourSpace.srgb.toJson(), 'srgb');
++      expect(ColourSpace.displayP3.toJson(), 'display_p3');
++      expect(ColourSpace.other.toJson(), 'other');
++    });
++
++    test(
++      'a Display-P3 file has something to say and an untagged one does not',
++      () {
++        // The sentence the UI can show *before* the user exports, which is the
++        // whole difference between colour management and colour management by
++        // surprise.
++        expect(ColourSpace.untagged.note, isNull);
++        expect(ColourSpace.srgb.note, isNull);
++        expect(ColourSpace.displayP3.note, contains('Display-P3'));
++        expect(ColourSpace.displayP3.note, contains('sRGB'));
++        // An identified-but-unconvertible space names itself rather than saying
++        // "unknown".
++        expect(ColourSpace.other.note, contains('cannot convert'));
++      },
++    );
++  });
++
+   group('Pipeline', () {
+     test('serialises with the exact keys the engine expects', () {
+       const pipeline = Pipeline(
+@@ -69,6 +256,43 @@ void main() {
+       expect((pipeline.toJson())['strip_metadata'], isTrue);
+     });
+ 
++    test('chroma defaults to 4:2:0, and says so on the wire', () {
++      // A default the wire does not carry is not a default — it is a coincidence
++      // between the constructor and the engine's own `#[serde(default)]`.
++      // Asserted on the serialised map so the two cannot drift apart silently.
++      const pipeline = Pipeline();
++      expect(pipeline.chromaSubsampling, ChromaSubsampling.luma420);
++      expect((pipeline.toJson())['chroma_subsampling'], 'luma420');
++    });
++
++    test('an explicit 4:4:4 reaches the request', () {
++      const pipeline = Pipeline(chromaSubsampling: ChromaSubsampling.luma444);
++      expect((pipeline.toJson())['chroma_subsampling'], 'luma444');
++    });
++
++    test('colour defaults to converting to sRGB and dropping the profile', () {
++      // The three answers are `ColourOptions`' three fields, and the default is
++      // the one that is right almost always. Asserted on the wire because a
++      // default the engine never receives is a coincidence.
++      final colour =
++          (const Pipeline().toJson())['colour'] as Map<String, Object?>;
++      expect(colour['working_space'], 'srgb');
++      expect(colour['keep_source_pixels'], isFalse);
++      expect(colour['embed_profile'], isFalse);
++    });
++
++    test('the two opt-outs reach the request', () {
++      const pipeline = Pipeline(
++        colour: ColourOptions(
++          workingSpace: ColourSpace.displayP3,
++          keepSourcePixels: true,
++        ),
++      );
++      final colour = pipeline.toJson()['colour'] as Map<String, Object?>;
++      expect(colour['working_space'], 'display_p3');
++      expect(colour['keep_source_pixels'], isTrue);
++    });
++
+     test('noUpscale defaults to true', () {
+       // Upscaling past native resolution adds bytes and zero detail.
+       const spec = ResizeSpec(width: 8000);
+@@ -76,6 +300,84 @@ void main() {
+     });
+   });
+ 
++  group('ValidateReport', () {
++    test('reads the animation count and whether it is knowable', () {
++      // `frames` alone cannot say "3 frames" from "at least 3 frames", and the
++      // difference decides whether an animation may be written out at all.
++      final report = _report(
++        extra: {'has_animated': true, 'frames': 240, 'frames_truncated': true},
++      );
++      expect(report.frames, 240);
++      expect(report.framesTruncated, isTrue);
++    });
++
++    test('a still is one frame and a known count', () {
++      final report = _report();
++      expect(report.frames, 1);
++      expect(report.framesTruncated, isFalse);
++    });
++
++    test('reads the colour profile the file carries', () {
++      final report = _report(
++        extra: {
++          'colour': {
++            'icc_present': true,
++            'source': 'display_p3',
++            'declared': 'Display P3',
++            'description': 'Apple Display P3',
++            'icc_bytes': 3136,
++          },
++        },
++      );
++      expect(report.colour.iccPresent, isTrue);
++      expect(report.colour.source, ColourSpace.displayP3);
++      expect(report.colour.declared, 'Display P3');
++      expect(report.colour.description, 'Apple Display P3');
++      expect(report.colour.iccBytes, 3136);
++    });
++
++    test('an absent colour block reads as untagged rather than throwing', () {
++      // A response from an engine predating colour management. Reporting it as
++      // untagged is true — the pixels are the file's own — and it is the
++      // direction that does not change the picture.
++      final json = _reportJson();
++      expect(json.containsKey('colour'), isTrue);
++      final report = ValidateReport.fromJson({
++        ...json,
++        'colour': <String, Object?>{},
++      });
++      expect(report.colour.iccPresent, isFalse);
++      expect(report.colour.source, ColourSpace.untagged);
++      expect(report.colour.iccBytes, 0);
++    });
++  });
++
++  group('ExifInfo', () {
++    test('carries the colour profile beside the tags', () {
++      final info = ExifInfo.fromJson({
++        'entries': [
++          {'tag': 'Model', 'value': 'iPhone'},
++        ],
++        'has_gps': true,
++        'orientation': 6,
++        'camera': 'iPhone',
++        'captured_at': '2026-01-01T00:00:00Z',
++        'sensitive_tags': ['GPS'],
++        'colour': {
++          'icc_present': true,
++          'source': 'display_p3',
++          'declared': null,
++          'description': null,
++          'icc_bytes': 3000,
++        },
++      });
++      expect(info.entries.single.value, 'iPhone');
++      expect(info.hasGps, isTrue);
++      expect(info.colour.iccPresent, isTrue);
++      expect(info.colour.source, ColourSpace.displayP3);
++    });
++  });
++
+   group('Requests.process', () {
+     test('builds the envelope the engine parses', () {
+       const pipeline = Pipeline(
+@@ -93,6 +395,278 @@ void main() {
+       // [1, 2, 3] as base64.
+       expect(body, contains('"data_base64":"AQID"'));
+     });
++
++    test('carries chroma on the pipeline and progressive beside it', () {
++      // Two different decisions in two different places: chroma resolution
++      // describes the picture and belongs to the pipeline, scan order describes
++      // the encoder and sits beside `quality`. The engine splits them the same
++      // way, and a request that put `progressive` inside `pipeline` would be
++      // silently ignored.
++      final body = Requests.process(
++        pipeline: const Pipeline(chromaSubsampling: ChromaSubsampling.luma444),
++        format: OutputFormat.jpeg,
++        imageBytes: [1],
++        name: 'photo.jpg',
++        progressive: true,
++      );
++      expect(body, contains('"chroma_subsampling":"luma444"'));
++      expect(body, contains('"progressive":true'));
++    });
++
++    test('progressive is off unless it is asked for', () {
++      // Off by default because it costs about 64% in file size at q85. A
++      // default-on default would inflate every export for a benefit only a slow
++      // link can use.
++      final body = Requests.process(
++        pipeline: const Pipeline(),
++        format: OutputFormat.jpeg,
++        imageBytes: [1],
++        name: 'photo.jpg',
++      );
++      expect(body, contains('"progressive":false'));
++    });
++
++    test('the animation policy travels with every request', () {
++      // The engine's `AnimationPolicy` is `#[serde(default)]`, so an older app
++      // that omits it still means "keep".
++      final body = Requests.process(
++        pipeline: const Pipeline(),
++        format: OutputFormat.gif,
++        imageBytes: [1],
++        name: 'meme.gif',
++      );
++      expect(body, contains('"animation":"keep"'));
++    });
++
++    test('first_frame is the only way to ask for a still of an animation', () {
++      final body = Requests.process(
++        pipeline: const Pipeline(),
++        format: OutputFormat.jpeg,
++        imageBytes: [1],
++        name: 'meme.gif',
++        animation: AnimationPolicy.firstFrame,
++      );
++      expect(body, contains('"animation":"first_frame"'));
++    });
++
++    test('the colour options travel with the pipeline', () {
++      final body = Requests.process(
++        pipeline: const Pipeline(colour: ColourOptions(embedProfile: true)),
++        format: OutputFormat.png,
++        imageBytes: [1],
++        name: 'p3.png',
++      );
++      expect(body, contains('"embed_profile":true'));
++      expect(body, contains('"working_space":"srgb"'));
++    });
++  });
++
++  group('Requests.batch', () {
++    test('inlines the pipeline, so chroma travels with it', () {
++      final body = Requests.batch(
++        pipeline: const Pipeline(chromaSubsampling: ChromaSubsampling.luma444),
++        format: OutputFormat.jpeg,
++        files: const [
++          BatchFile(name: 'a.jpg', bytes: [1]),
++        ],
++        progressive: true,
++      );
++      expect(body, contains('"chroma_subsampling":"luma444"'));
++      expect(body, contains('"progressive":true'));
++    });
++
++    test(
++      'sends the batch policy, which a folder export needs and a single one does not',
++      () {
++        final body = Requests.batch(
++          pipeline: const Pipeline(),
++          format: OutputFormat.jpeg,
++          files: const [
++            BatchFile(name: 'a.jpg', bytes: [1]),
++          ],
++          policy: BatchPolicy.none,
++        );
++        expect(body, contains('"policy":'));
++        expect(body, contains('"deduplicate":false'));
++        expect(body, contains('"skip_upscales":false'));
++      },
++    );
++  });
++
++  group('AnimationPolicy', () {
++    test('serialises snake_case, matching the Rust serde convention', () {
++      expect(AnimationPolicy.keep.toJson(), 'keep');
++      expect(AnimationPolicy.firstFrame.toJson(), 'first_frame');
++    });
++
++    test('round-trips every value', () {
++      for (final p in AnimationPolicy.values) {
++        expect(AnimationPolicy.fromJson(p.toJson()), p);
++      }
++    });
++
++    test('rejects an unknown policy rather than guessing', () {
++      expect(
++        () => AnimationPolicy.fromJson('keep_everything'),
++        throwsArgumentError,
++      );
++    });
++  });
++
++  group('AnimationOutcome', () {
++    test('reads the four fields the engine sends', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 240,
++        'policy': 'keep',
++        'action': 'preserved',
++      });
++      expect(o.framesIn, 240);
++      expect(o.framesOut, 240);
++      expect(o.policy, AnimationPolicy.keep);
++      expect(o.action, AnimationAction.preserved);
++      expect(o.animated, isTrue);
++      expect(o.isPreserved, isTrue);
++      expect(o.dropped, 0);
++    });
++
++    test('a single-frame GIF is a still, not a one-frame animation', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 1,
++        'frames_out': 1,
++        'policy': 'keep',
++        'action': 'still',
++      });
++      expect(o.animated, isFalse);
++      expect(o.isPreserved, isFalse);
++      expect(o.note, isNull);
++    });
++
++    test('a refusal wrote nothing and knows how many frames it refused', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 0,
++        'policy': 'keep',
++        'action': 'refused',
++      });
++      expect(o.dropped, 240);
++      expect(o.isPreserved, isFalse);
++      // Its explanation is the error the caller already has, so `note` is silent.
++      expect(o.note, isNull);
++    });
++
++    test('a flattening is the one case that owes the user a sentence', () {
++      final o = AnimationOutcome.fromJson({
++        'frames_in': 240,
++        'frames_out': 1,
++        'policy': 'first_frame',
++        'action': 'flattened',
++      });
++      expect(o.dropped, 239);
++      final note = o.note!;
++      expect(note, contains('240'));
++      expect(note, contains('first frame'));
++      expect(note, contains('GIF'));
++    });
++
++    test('a response from an older engine does not crash the parse', () {
++      final o = AnimationOutcome.fromJson(const {});
++      expect(o.action, AnimationAction.unknown);
++      expect(o.framesIn, 0);
++      expect(o.framesOut, 0);
++      expect(o.dropped, 0);
++      expect(o.note, isNull);
++    });
++  });
++
++  group('ColourProfile', () {
++    test(
++      'untagged is what most files are, and is stated rather than implied',
++      () {
++        expect(ColourProfile.untagged.iccPresent, isFalse);
++        expect(ColourProfile.untagged.source, ColourSpace.untagged);
++        expect(ColourProfile.untagged.iccBytes, 0);
++      },
++    );
++
++    test(
++      'an sRGB file with a profile is not the same fact as an untagged one',
++      () {
++        // Both convert to sRGB, so both are the same *conversion* — and they are
++        // different facts about the file, which is what the field is for.
++        final tagged = ColourProfile.fromJson({
++          'icc_present': true,
++          'source': 'srgb',
++          'declared': 'RGB',
++          'description': 'sRGB IEC61966-2.1',
++          'icc_bytes': 3144,
++        });
++        expect(tagged.iccPresent, isTrue);
++        expect(tagged.source, ColourSpace.srgb);
++        expect(tagged.source.note, isNull);
++        expect(tagged.description, 'sRGB IEC61966-2.1');
++      },
++    );
++  });
++
++  group('ColourOutcome', () {
++    test('unknown is what a failed file reports, and claims nothing', () {
++      expect(ColourOutcome.unknown.source, ColourSpace.untagged);
++      expect(ColourOutcome.unknown.converted, isFalse);
++      expect(ColourOutcome.unknown.profileEmbedded, isFalse);
++    });
++
++    test('a converted P3 photo says so on both sides', () {
++      final outcome = ColourOutcome.fromJson({
++        'source': 'display_p3',
++        'output': 'srgb',
++        'converted': true,
++        'profile_embedded': false,
++      });
++      expect(outcome.source, ColourSpace.displayP3);
++      expect(outcome.output, ColourSpace.srgb);
++      expect(outcome.converted, isTrue);
++    });
++
++    test(
++      'an embedded profile reports it, because that is a different file',
++      () {
++        final outcome = ColourOutcome.fromJson({
++          'source': 'display_p3',
++          'output': 'display_p3',
++          'converted': false,
++          'profile_embedded': true,
++        });
++        expect(outcome.converted, isFalse);
++        expect(outcome.profileEmbedded, isTrue);
++      },
++    );
++  });
++
++  group('Preset', () {
++    test('reads the chroma level the engine sends', () {
++      // A preset is a promise about an export, and `store-screenshot` is the one
++      // at 4:4:4. A Dart model without this field would drop the decision the
++      // catalogue made and export the screenshot at 4:2:0.
++      final preset = Preset.fromJson(const {
++        'id': 'store-screenshot',
++        'label': 'Play Store screenshot',
++        'category': 'developer',
++        'width': 1080,
++        'height': 1920,
++        'format': 'jpeg',
++        'fit': 'cover',
++        'filter': 'lanczos3',
++        'quality': 90,
++        'max_bytes': null,
++        'crops': false,
++        'chroma': 'luma444',
++      });
++      expect(preset.chroma, ChromaSubsampling.luma444);
++      expect(preset.category, 'developer');
++      expect(preset.quality, 90);
++      expect(preset.maxBytes, isNull);
++    });
+   });
+ 
+   group('ProcessResult', () {
+@@ -107,39 +681,254 @@ void main() {
+             height: 10,
+             qualityUsed: 80,
+             targetMet: true,
+-            detectedFormat: OutputFormat.jpeg,
++            detectedFormatName: 'jpeg',
++            animation: AnimationOutcome.unknown,
+           );
+       expect(base(input: 100, output: 25).savedPercent, 75.0);
+       expect(base(input: 0, output: 0).savedPercent, 0.0);
+       expect(base(input: 100, output: 100).savedPercent, 0.0);
+     });
++
++    test(
++      'reads the animation half, so a preview need not decode the output',
++      () {
++        final result = ProcessResult.fromJson({
++          'output_name': 'a.gif',
++          'bytes': [1, 2],
++          'input_bytes': 100,
++          'output_bytes': 50,
++          'width': 10,
++          'height': 10,
++          'quality_used': 0,
++          'target_met': true,
++          'detected_format': 'gif',
++          'animation': {
++            'frames_in': 240,
++            'frames_out': 240,
++            'policy': 'keep',
++            'action': 'preserved',
++          },
++        });
++        expect(result.animation.isPreserved, isTrue);
++        expect(result.detectedFormat, OutputFormat.gif);
++      },
++    );
+   });
+ 
+   group('BatchReport', () {
+-    test('counts successes and failures', () {
+-      BatchOutcome outcome({required String? error}) => BatchOutcome(
+-        id: '1',
+-        name: 'a.jpg',
+-        outputName: 'a.jpg',
+-        inputBytes: 10,
+-        outputBytes: 5,
+-        width: 10,
+-        height: 10,
+-        qualityUsed: 80,
+-        targetMet: true,
+-        error: error,
+-      );
++    test('counts successes, skips and failures as three things', () {
+       final report = BatchReport(
+         outcomes: [
+-          outcome(error: null),
+-          outcome(error: 'broken'),
++          _outcome(),
++          _outcome(error: 'broken'),
++          _outcome(skipped: const SkipReasonDuplicate('a.jpg')),
++          _outcome(skipped: const SkipReasonUnreadable()),
+         ],
+         cancelled: false,
+       );
+       expect(report.succeeded, 1);
++      expect(report.skipped, 2);
+       expect(report.failed, 1);
+-      expect(report.outcomes.first.ok, isTrue);
+-      expect(report.outcomes.last.ok, isFalse);
++      expect(report.duplicates, 1);
++      // The three counts add up to the number of files offered, which is the
++      // property a summary needs and which a subtraction cannot promise.
++      expect(report.succeeded + report.skipped + report.failed, report.total);
++    });
++
++    test('a duplicate skip is not ok, and not a failure either', () {
++      // The defect this replaces: `BatchOutcome.ok` was `error == null`, which
++      // reported 400 succeeded out of 400 when 30 files were skipped. It has to
++      // match `worker::Outcome::ok`, which is
++      // `error.is_none() && skipped.is_none()`.
++      final skipped = _outcome(skipped: const SkipReasonDuplicate('a.jpg'));
++      expect(skipped.error, isNull);
++      expect(skipped.skipped, isNotNull);
++      expect(skipped.ok, isFalse);
++
++      final written = _outcome();
++      expect(written.ok, isTrue);
++
++      final failed = _outcome(error: 'broken');
++      expect(failed.ok, isFalse);
++    });
++
++    test('a skipped file writes nothing, and says so in its numbers', () {
++      // Reporting a size for a file that does not exist is the kind of small
++      // wrong number a UI cannot tell apart from a right one.
++      final skipped = _outcome(skipped: const SkipReasonDuplicate('a.jpg'));
++      expect(skipped.outputName, isEmpty);
++      expect(skipped.outputBytes, 0);
++      expect(skipped.qualityUsed, 0);
++    });
++
++    test('groups the skips by kind, as the engine does', () {
++      final report = BatchReport(
++        outcomes: [
++          _outcome(skipped: const SkipReasonDuplicate('a.jpg')),
++          _outcome(skipped: const SkipReasonDuplicate('b.jpg')),
++          _outcome(skipped: const SkipReasonUnreadable()),
++        ],
++        cancelled: false,
++      );
++      expect(report.skipReasons, {'duplicate': 2, 'unreadable': 1});
++    });
++  });
++
++  group('SkipReason', () {
++    test('parses every skip reason the engine can send', () {
++      final reasons = <Map<String, Object?>>[
++        {'kind': 'duplicate', 'of': 'one.jpg'},
++        {'kind': 'unreadable'},
++        {'kind': 'unsupported_format', 'format': 'avif'},
++        {'kind': 'too_large', 'limit': 1000, 'actual': 2000, 'unit': 'bytes'},
++        {
++          'kind': 'too_large',
++          'limit': 40000000,
++          'actual': 60000000,
++          'unit': 'pixels',
++        },
++        {
++          'kind': 'would_upscale',
++          'requested': [1920, 1080],
++          'actual': [640, 480],
++        },
++      ];
++      for (final json in reasons) {
++        final reason = SkipReason.fromJson(json);
++        expect(reason.kind, json['kind']);
++        // Hard rule 9 on this side too: every reason reaches the user as a
++        // sentence, not as a code.
++        expect(
++          reason.note.length,
++          greaterThan(20),
++          reason: json['kind'] as String,
++        );
++        expect(reason.note, isNot(contains('Error:')));
++      }
++    });
++
++    test(
++      'an answer this build has never heard of does not crash the report',
++      () {
++        // One new reason in the engine must not take down every report in the
++        // folder. The `kind` is carried through so the report can show what
++        // arrived.
++        final reason = SkipReason.fromJson({'kind': 'something_new'});
++        expect(reason, isA<SkipReasonUnrecognised>());
++        expect(reason.kind, 'something_new');
++        expect(reason.note, contains('something_new'));
++        expect(reason.note, contains('updating the app'));
++      },
++    );
++
++    test('every sentence names what happened and what to do', () {
++      // Read aloud, which is the test: does a user understand it?
++      expect(
++        const SkipReasonDuplicate('holiday.jpg').note,
++        'the same picture is already exported as holiday.jpg',
++      );
++      expect(const SkipReasonUnreadable().note, contains('could not be read'));
++      expect(
++        const SkipReasonUnsupportedFormat('heic').note,
++        contains('convert them to JPEG'),
++      );
++      expect(
++        const SkipReasonTooLarge(limit: 1000, actual: 2000, pixels: false).note,
++        'this file is 2000 bytes and this device accepts up to 1000',
++      );
++      expect(
++        const SkipReasonTooLarge(limit: 40, actual: 60, pixels: true).note,
++        contains('60 pixels once decoded'),
++      );
++      expect(
++        const SkipReasonWouldUpscale(
++          requestedWidth: 1920,
++          requestedHeight: 1080,
++          actualWidth: 640,
++          actualHeight: 480,
++        ).note,
++        'this picture is 640x480 and the request asked for 1920x1080; '
++        'enlarging it adds no detail, so it was left alone',
++      );
++    });
++
++    test('a would-upscale skip is a sentence a user can act on', () {
++      // The one variant a user might not understand on first reading, so it is
++      // asserted rather than assumed: it has to say what the file is, what was
++      // asked for, and that nothing was done to the picture.
++      final note = const SkipReasonWouldUpscale(
++        requestedWidth: 1920,
++        requestedHeight: 1080,
++        actualWidth: 640,
++        actualHeight: 480,
++      ).note;
++      expect(note, contains('640x480'));
++      expect(note, contains('1920x1080'));
++      expect(note, contains('no detail'));
++      expect(note, contains('left alone'));
++    });
++  });
++
++  group('BatchPolicy', () {
++    test('the default is every answer on', () {
++      final json = BatchPolicy.all.toJson();
++      expect(json['deduplicate'], isTrue);
++      expect(json['skip_unprocessable'], isTrue);
++      expect(json['skip_upscales'], isTrue);
++    });
++
++    test('every answer off is the other switch', () {
++      final json = BatchPolicy.none.toJson();
++      expect(json['deduplicate'], isFalse);
++      expect(json['skip_unprocessable'], isFalse);
++      expect(json['skip_upscales'], isFalse);
++    });
++  });
++
++  group('Capabilities', () {
++    test('reads every key the engine sends', () {
++      final caps = Capabilities.fromJson(_capabilities(heicDecode: true));
++      expect(caps.jpeg, isTrue);
++      expect(caps.png, isTrue);
++      expect(caps.webpLossy, isTrue);
++      expect(caps.webpLossless, isTrue);
++      expect(caps.gif, isTrue);
++      expect(caps.tiff, isTrue);
++      expect(caps.bmp, isTrue);
++      expect(caps.ico, isTrue);
++      expect(caps.heicDecode, isTrue);
++      expect(caps.maxInputBytes, 536870912);
++      expect(caps.maxPixels, 128000000);
++    });
++
++    test('writable and readable are separate questions', () {
++      // The default build has an AVIF encoder and no AV1 decoder. A model that
++      // collapsed these into one field would claim a round trip the engine
++      // cannot make — and the UI would offer a preview of a file it cannot open.
++      final caps = Capabilities.fromJson(_capabilities());
++      expect(caps.avifEncode, isTrue);
++      expect(caps.avifDecode, isFalse);
++      expect(caps.canWrite(OutputFormat.avif), isTrue);
++    });
++
++    test('a missing capability is an error, not a default', () {
++      // Silently reading a capability as absent is how a build that cannot do
++      // something ends up offering it, so every field is cast rather than
++      // defaulted.
++      final json = _capabilities();
++      (json['capabilities'] as Map<String, Object?>).remove('jpeg_progressive');
++      expect(() => Capabilities.fromJson(json), throwsA(isA<TypeError>()));
++    });
++
++    test('canWrite is derived from the same flags, not a typed list', () {
++      // Without the lossy WebP codec, WebP is lossless — still writable, but
++      // with no quality slider. Greying WebP out entirely would be wrong.
++      final lossless = Capabilities.fromJson(_capabilities(webpLossy: false));
++      expect(lossless.webpLossy, isFalse);
++      expect(lossless.canWrite(OutputFormat.webp), isTrue);
++
++      final noAvif = Capabilities.fromJson(_capabilities(avifEncode: false));
++      expect(noAvif.canWrite(OutputFormat.avif), isFalse);
+     });
+   });
+ }
