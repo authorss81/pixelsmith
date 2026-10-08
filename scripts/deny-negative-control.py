@@ -45,15 +45,21 @@ SPEC.loader.exec_module(LP)
 CONTROL_LICENCE = "LicenseRef-PXDENY-control"
 
 
-def evaluate(policy: dict, manifest: dict, packages: list[dict]) -> list[str]:
-    """Run every check the same way lockfile-policy.main does."""
-    for pkg in packages:
+def evaluate(policy: dict, manifest: dict, metadata: dict) -> list[str]:
+    """Run every check the same way lockfile-policy.main does.
+
+    Given the whole metadata document rather than a package list, because the two
+    scopes come out of it — and because a control that exercised a scope the real
+    checker does not use would be proving nothing.
+    """
+    for pkg in metadata.get("packages", []):
         pkg.setdefault("source", LP.LOCAL)
+    with_dev, built = LP.built_packages(metadata)
     findings: list[str] = []
-    findings += LP.check_licences(policy, packages)
-    findings += LP.check_banned(policy, packages)
-    findings += LP.check_duplicates(policy, packages)
-    findings += LP.check_sources(policy, packages)
+    findings += LP.check_licences(policy, with_dev)
+    findings += LP.check_banned(policy, with_dev)
+    findings += LP.check_duplicates(policy, built)
+    findings += LP.check_sources(policy, with_dev)
     findings += LP.check_wildcards(policy, manifest)
     return findings
 
@@ -66,27 +72,27 @@ def a_registry_package(packages: list[dict]) -> dict:
 
 
 # --- the controls ----------------------------------------------------------
-# Each returns (name, expected PXDENY code, findings, policy, manifest, packages).
+# Each returns (name, expected PXDENY code, findings, policy, manifest, metadata).
 
 
-def control_licence(policy, manifest, packages):
+def control_licence(policy, manifest, metadata):
     p = copy.deepcopy(policy)
     p["licenses"]["allow"] = [CONTROL_LICENCE]
-    return "a licence outside the allow list", "PXDENY[licence]", evaluate(p, manifest, packages)
+    return "a licence outside the allow list", "PXDENY[licence]", evaluate(p, manifest, metadata)
 
 
-def control_banned(policy, manifest, packages):
+def control_banned(policy, manifest, metadata):
     p = copy.deepcopy(policy)
-    victim = a_registry_package(packages)["name"]
+    victim = a_registry_package(metadata["packages"])["name"]
     p["bans"].setdefault("deny", []).append({"name": victim})
     return (
         f"a crate named in [bans].deny ({victim})",
         "PXDENY[banned]",
-        evaluate(p, manifest, packages),
+        evaluate(p, manifest, metadata),
     )
 
 
-def control_duplicate(policy, manifest, packages):
+def control_duplicate(policy, manifest, metadata):
     # Emptying the skip list rather than adding to `deny` is the point: the real
     # policy's own exceptions are what make it green, so a checker that ignored
     # the skip list would still be green on the unmutated policy and would go
@@ -96,30 +102,30 @@ def control_duplicate(policy, manifest, packages):
     return (
         "a duplicate crate version with no [bans].skip entry",
         "PXDENY[duplicate]",
-        evaluate(p, manifest, packages),
+        evaluate(p, manifest, metadata),
     )
 
 
-def control_source(policy, manifest, packages):
+def control_source(policy, manifest, metadata):
     p = copy.deepcopy(policy)
-    pkgs = copy.deepcopy(packages)
-    victim = a_registry_package(pkgs)
+    m = copy.deepcopy(metadata)
+    victim = a_registry_package(m["packages"])
     victim["source"] = "git+https://pxdeny-control.invalid/example.git"
     return (
         "a package from a git source",
         "PXDENY[source]",
-        evaluate(p, manifest, pkgs),
+        evaluate(p, manifest, m),
     )
 
 
-def control_wildcard(policy, manifest, packages):
+def control_wildcard(policy, manifest, metadata):
     p = copy.deepcopy(policy)
     m = copy.deepcopy(manifest)
     m.setdefault("dependencies", {})["pxdeny_control"] = {"version": "*"}
     return (
         'a wildcard version requirement ("*")',
         "PXDENY[wildcard]",
-        evaluate(p, m, packages),
+        evaluate(p, m, metadata),
     )
 
 
@@ -141,9 +147,9 @@ def main(argv: list[str]) -> int:
 
     policy = tomllib.loads(args.policy.read_text())
     manifest = tomllib.loads(args.manifest.read_text())
-    packages = json.loads(args.metadata.read_text())["packages"]
+    metadata = json.loads(args.metadata.read_text())
 
-    baseline = evaluate(copy.deepcopy(policy), manifest, copy.deepcopy(packages))
+    baseline = evaluate(copy.deepcopy(policy), manifest, copy.deepcopy(metadata))
     print(f"negative-control: the unmutated policy produces {len(baseline)} finding(s)")
     for line in baseline:
         print(f"  {line}")
@@ -156,7 +162,7 @@ def main(argv: list[str]) -> int:
     failures = 0
     print("")
     for build in CONTROLS:
-        description, expected, findings = build(policy, manifest, packages)
+        description, expected, findings = build(policy, manifest, metadata)
         hit = [line for line in findings if line.startswith(expected)]
         if hit:
             print(f"  ok    {description}")

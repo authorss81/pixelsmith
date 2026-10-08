@@ -63,17 +63,60 @@ trap 'rm -rf "${WORK}"' EXIT
 
 # -----------------------------------------------------------------------------
 say "=== dependency metadata ==="
-# --offline because this half of the check must work on a machine with no
-# network, and --locked because a policy decision taken against a dependency
-# graph other than the one that will be built is a decision about nothing. If the
+# `--locked` is not optional: a policy decision taken against a dependency graph
+# other than the one that will be built is a decision about nothing. If the
 # lockfile is stale, cargo says so and this exits 2 rather than passing.
-if ! cargo metadata --format-version 1 --offline --locked --all-features \
-      --manifest-path "${MANIFEST}" > "${WORK}/metadata.json" 2>"${WORK}/metadata.err"; then
+#
+# `--offline` is tried first, because a repository whose thesis is that it needs
+# no network should be able to answer this question without one. It is not
+# required: a warm-enough index cache is what makes it work, and on a runner
+# where one transitive crate's index entry has gone stale `--offline` fails with
+# "no matching package named X found / location searched: crates.io index" even
+# though the .crate file is sitting in the cache. Falling back rather than dying
+# is deliberate, and the fallback announces itself — a check that silently needed
+# the network is a check whose reader does not know what it measured.
+# `[graph] targets` below is what makes cargo-deny's graph and this machine's
+# `cargo metadata` graph the same graph. Without those filters, metadata resolves
+# dependencies gated on a cfg expression — `cfg(fuzzing)`, which is how `rav1e`
+# reaches `rand` and `libfuzzer-sys` — and the offline subset sees nine packages
+# cargo-deny cannot, including a second `getrandom`, both `r-efi` and a licence
+# (NCSA) the policy would then have to allow for a crate no shipped build
+# contains. The flags come out of deny.toml rather than being written here, so
+# adding a target to the policy widens both checkers at once.
+PLATFORM_FLAGS=$(python3 - "$POLICY" <<'PY'
+import sys, tomllib
+policy = tomllib.load(open(sys.argv[1], "rb"))
+targets = (policy.get("graph") or {}).get("targets") or []
+if not targets:
+    print("", end="")
+    raise SystemExit(0)
+print(" ".join(f"--filter-platform={t}" for t in targets))
+PY
+)
+if [ -z "${PLATFORM_FLAGS}" ]; then
+  die "deny.toml [graph].targets is empty, so the graph this checks would not be the one cargo-deny checks"
+fi
+
+METADATA_MODE=""
+for mode in "--offline --locked" "--locked"; do
+  # shellcheck disable=SC2086
+  if cargo metadata --format-version 1 ${mode} --all-features ${PLATFORM_FLAGS} \
+       --manifest-path "${MANIFEST}" > "${WORK}/metadata.json" 2>"${WORK}/metadata.err"; then
+    METADATA_MODE="${mode}"
+    break
+  fi
+  if [ "${mode}" = "--offline --locked" ]; then
+    say "  note: --offline could not resolve the graph from this machine's index cache."
+    sed 's/^/        /' "${WORK}/metadata.err" | head -n 3
+    say "        retrying with the registry index, which needs a network."
+  fi
+done
+if [ -z "${METADATA_MODE}" ]; then
   sed 's/^/  /' "${WORK}/metadata.err" >&2
   die "cargo metadata failed; the policy cannot be evaluated against a graph that did not resolve"
 fi
 CRATES=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["packages"]))' "${WORK}/metadata.json")
-say "  ${CRATES} packages resolved from core/Cargo.lock (offline, locked)"
+say "  ${CRATES} packages resolved from core/Cargo.lock (${METADATA_MODE}, $(printf '%s' "${PLATFORM_FLAGS}" | grep -c -- '--filter-platform') target filters from [graph].targets)"
 
 # -----------------------------------------------------------------------------
 say ""

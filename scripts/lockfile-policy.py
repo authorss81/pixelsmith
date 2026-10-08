@@ -206,51 +206,69 @@ def built_packages(metadata: dict) -> list[dict]:
     the same graph `cargo deny` does, because a checker that disagreed with the
     gate would report a clean tree while CI reported a violation.
 
-    That means:
+    The walk returns two sets, because cargo-deny's scope is not uniform and a
+    single set cannot describe it:
 
-    * dev-dependencies of the **workspace member** are included. Cargo resolves
-      them and cargo-deny evaluates them, so proptest, tempfile and criterion are
-      in scope even though `cargo build --release` never compiles them.
-    * dev-dependencies of **transitive** crates are not. `cargo metadata` lists
-      them, and a naive pass over the whole `packages` list decides on code that
-      is not in the artefact.
-    * every cfg target is followed, because `cfg(fuzzing)` is not a target
-      triple and `--filter-platform` cannot switch it off. So `libfuzzer-sys`
-      (a normal dependency of `rav1e` under `cfg(fuzzing)`) *is* in the graph,
-      and its NCSA licence really does have to be permitted for the gate to
-      pass. That is not the checker being pedantic; it is what cargo-deny sees.
+    * `with_dev` — everything cargo-deny can see, dev-dependencies of the
+      workspace member included. Proved by banning `proptest` in a copy of
+      deny.toml: cargo-deny reports `crate 'proptest = 1.11.0' is explicitly
+      banned ... (dev) pixelsmith_core`. So licences, banned names and sources
+      are decided over this set.
+    * `built` — the same walk with dev-dependency edges removed, which is the set
+      cargo-deny's *duplicate* detection uses. Proved the other way: adding
+      `[bans].skip` entries for getrandom, itertools and quick-error made
+      cargo-deny answer `warning[unnecessary-skip] applied to a crate with only
+      one version` for each, while `cargo tree --duplicates -e normal,build`
+      reported only miniz_oxide and syn — and every one of those three extra
+      pairs arrives solely through proptest, tempfile or criterion.
+
+    `cfg(fuzzing)` dependencies are excluded from this graph, and that is worth
+    writing down because phase-15 first got it wrong. `libfuzzer-sys` is a normal
+    dependency of `rav1e` under `cfg(fuzzing)`, so an unfiltered
+    `cargo metadata` resolves it — along with a second `getrandom`, `rand`, and
+    both `r-efi` — and the offline checker then needs an NCSA licence allowance
+    and four extra `[bans].skip` entries for crates no shipped build contains.
+    cargo-deny does not, because `[graph] targets` is a target filter and a cfg
+    expression is not a triple, which is why `scripts/deny-check.sh` passes those
+    same targets to `cargo metadata --filter-platform` before handing the document
+    to this script.
 
     If the metadata carries no `resolve` section there is nothing to walk and
-    every package is returned: a checker that silently checked less would be
-    worse than one that checks more.
+    every package is returned for both sets: a checker that silently checked
+    less would be worse than one that checks more.
     """
     packages = {pkg["id"]: pkg for pkg in metadata.get("packages", []) if pkg.get("id")}
     resolve = metadata.get("resolve")
     nodes = {node["id"]: node for node in (resolve or {}).get("nodes", [])}
     members = set(metadata.get("workspace_members") or [])
     if not resolve or not members or not nodes:
-        return list(packages.values())
+        everything = list(packages.values())
+        return everything, everything
 
-    seen: set[str] = set()
-    stack = list(members)
-    while stack:
-        node_id = stack.pop()
-        if node_id in seen:
-            continue
-        seen.add(node_id)
-        node = nodes.get(node_id)
-        if node is None:
-            continue
-        # A dev edge out of a workspace member is followed; a dev edge out of
-        # anything else is not.
-        allow_dev = node_id in members
-        for dep in node.get("deps", []):
-            kinds = dep.get("dep_kinds") or [{}]
-            if not allow_dev and all(kind.get("kind") == "dev" for kind in kinds):
+    def walk(follow_dev: bool) -> list[dict]:
+        seen: set[str] = set()
+        stack = list(members)
+        while stack:
+            node_id = stack.pop()
+            if node_id in seen:
                 continue
-            stack.append(dep["pkg"])
-    out = [packages[node_id] for node_id in seen if node_id in packages]
-    return out or list(packages.values())
+            seen.add(node_id)
+            node = nodes.get(node_id)
+            if node is None:
+                continue
+            # A dev edge out of a workspace member is followed; a dev edge out of
+            # anything else is not, because a transitive crate's test
+            # dependencies are not in this artefact either way.
+            allow_dev = follow_dev and node_id in members
+            for dep in node.get("deps", []):
+                kinds = dep.get("dep_kinds") or [{}]
+                if not allow_dev and all(kind.get("kind") == "dev" for kind in kinds):
+                    continue
+                stack.append(dep["pkg"])
+        out = [packages[node_id] for node_id in seen if node_id in packages]
+        return out or list(packages.values())
+
+    return walk(True), walk(False)
 
 
 # ---------------------------------------------------------------------------
@@ -450,9 +468,8 @@ def main(argv: list[str]) -> int:
     for pkg in packages:
         pkg.setdefault("source", LOCAL)
 
-    # The dev-dependencies of transitive crates are in the graph but not in the
-    # binary. See built_packages.
-    built = built_packages(metadata)
+    # Two scopes, because cargo-deny's is not uniform: see built_packages.
+    with_dev, built = built_packages(metadata)
 
     try:
         manifest = load(args.manifest)
@@ -461,22 +478,20 @@ def main(argv: list[str]) -> int:
         return 2
 
     findings: list[str] = []
-    findings += check_licences(policy, built)
-    findings += check_banned(policy, built)
+    findings += check_licences(policy, with_dev)
+    findings += check_banned(policy, with_dev)
     findings += check_duplicates(policy, built)
-    findings += check_sources(policy, built)
+    findings += check_sources(policy, with_dev)
     findings += check_wildcards(policy, manifest)
 
     for line in findings:
         print(line)
 
-    scoped = (
-        f"{len(built)} of {len(packages)} resolved packages are in cargo-deny's graph"
-        if built
-        else "no packages are in cargo-deny's graph"
-    )
     print(
-        f"lockfile-policy: {scoped}; checked against {args.policy}; {len(findings)} finding(s)."
+        f"lockfile-policy: {len(with_dev)} of {len(packages)} resolved packages are in "
+        f"cargo-deny's graph ({len(built)} without dev-dependency edges, which is the "
+        f"scope duplicate detection uses); checked against {args.policy}; "
+        f"{len(findings)} finding(s)."
     )
     if findings:
         return 1

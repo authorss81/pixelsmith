@@ -109,9 +109,21 @@ if [ "${BUILD}" = "1" ]; then
     exit 2
   fi
 fi
-LIB="${ROOT}/core/target/release/${LIBNAME}"
-if [ ! -f "${LIB}" ]; then
-  say "  skip  ${LIB} is not built."
+# Two places, because two different commands produce it and the difference is the
+# reason a stranger following docs/SECURITY.md by hand gets a different answer
+# from this script: `scripts/build-release.sh` always passes --target, so cargo
+# writes to target/<triple>/release/, while the plain `cargo build --release` in
+# the document writes to target/release/. A report that only looked in one of them
+# would either find nothing or miss the artefact it had just built.
+HOST_TARGET=$(rustc -vV 2>/dev/null | awk '/^host: /{print $2}')
+LIB=""
+for candidate in \
+  "${ROOT}/core/target/${HOST_TARGET}/release/${LIBNAME}" \
+  "${ROOT}/core/target/release/${LIBNAME}"; do
+  if [ -f "${candidate}" ]; then LIB="${candidate}"; break; fi
+done
+if [ -z "${LIB}" ]; then
+  say "  FAIL  no release library under core/target/ for ${HOST_TARGET}."
   say "        Re-run with --build, or: cargo build --manifest-path core/Cargo.toml --release"
   say "        Everything below needs the file, and this run cannot conclude anything."
   exit 2

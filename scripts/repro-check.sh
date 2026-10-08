@@ -124,6 +124,21 @@ artefact_hash() {
   echo "${H[$1]}" | tr ' ' '\n' | awk -v k="${want}" -F= '$1==k {print $2}'
 }
 
+# Where one variant's artefact actually is, so a mismatch can be localised with
+# `cmp` instead of only reported as two different hashes.
+artefact_path() {
+  local dir="${WORK}/$1/${TARGET}/release"
+  case "${2}" in
+    static) printf '%s' "${dir}/libpixelsmith_core.a" ;;
+    *)
+      for candidate in libpixelsmith_core.so libpixelsmith_core.dylib libpixelsmith_core.dll; do
+        [ -f "${dir}/${candidate}" ] && { printf '%s' "${dir}/${candidate}"; return 0; }
+      done
+      return 1
+      ;;
+  esac
+}
+
 build() {
   # $1 = variant label, $2 = source root, $3 = remap on/off, $4 = target dir
   say ""
@@ -152,9 +167,6 @@ H[A2]=$(hash_of "t-a2") || die "A2 produced no shared library"
   build B2 "${WORK}/b" 1 "t-b2" || die "B2 failed"
   H[B2]=$(hash_of "t-b2") || die "B2 produced no shared library"
 }
-
-sha_of() { echo "${H[$1]}" | cut -d' ' -f1; }
-path_of() { echo "${H[$1]}" | cut -d' ' -f2-; }
 
 for v in A1 A2 B1 B2; do
   if [ -n "${H[$v]:-}" ]; then
@@ -191,10 +203,16 @@ done
 
 # -----------------------------------------------------------------------------
 FAILURES=0
-# $1 left variant, $2 right variant, $3 question, $4 artefact kind
+# $1 left variant, $2 right variant, $3 question, $4 artefact kind.
+#
+# Both artefact kinds, for every pair. A verdict about "the release build" that
+# only covers the shared library is not a verdict about the static archive the
+# desktop CMake build links, and they answer differently: `[profile.release]
+# strip = true` removes the symbols and debug info the build path lives in from
+# the cdylib, and does not reach inside an archive at all.
 compare() {
   local left="$1" right="$2" question="$3" kind="${4:-shared}"
-  local lh rh
+  local lh rh l r
   lh=$(artefact_hash "${left}" "${kind}")
   rh=$(artefact_hash "${right}" "${kind}")
   say ""
@@ -211,37 +229,8 @@ compare() {
   fi
   FAILURES=$((FAILURES + 1))
   say "  DIFFER"
-  return 1
-}
-
-# Every kind, for every pair. A verdict about "the release build" that only
-# covers the shared library is not a verdict about the static archive the desktop
-# CMake build links.
-for kind in shared static; do
-  compare A1 A2 "same path, same toolchain, two fresh build dirs" "${kind}"
-  compare A1 B1 "different path, remapping off (a plain cargo build)" "${kind}"
-  if [ "${QUICK}" != "1" ]; then
-    compare A1 B2 "different path, --remap-path-prefix on" "${kind}"
-  fi
-done
-done
-
-# -----------------------------------------------------------------------------
-FAILURES=0
-compare() {
-  local left="$1" right="$2" question="$3"
-  say ""
-  say "--- ${question} ---"
-  say "  ${left}  $(sha_of "${left}")"
-  say "  ${right}  $(sha_of "${right}")"
-  if [ "$(sha_of "${left}")" = "$(sha_of "${right}")" ]; then
-    say "  MATCH"
-    return 0
-  fi
-  FAILURES=$((FAILURES + 1))
-  say "  DIFFER"
-  local l r
-  l=$(path_of "${left}"); r=$(path_of "${right}")
+  l=$(artefact_path "${left}" "${kind}")
+  r=$(artefact_path "${right}" "${kind}")
   if command -v cmp >/dev/null 2>&1; then
     first=$(cmp -l "${l}" "${r}" 2>/dev/null | head -n1 | awk '{print $1}')
     total=$(cmp -l "${l}" "${r}" 2>/dev/null | wc -l)
@@ -250,11 +239,13 @@ compare() {
   return 1
 }
 
-compare A1 A2 "same path, same toolchain, two fresh build dirs"
-compare A1 B1 "different path, remapping off (the default cargo build)"
-if [ "${QUICK}" != "1" ]; then
-  compare A1 B2 "different path, --remap-path-prefix on"
-fi
+for kind in shared static; do
+  compare A1 A2 "same path, same toolchain, two fresh build dirs" "${kind}"
+  compare A1 B1 "different path, remapping off (a plain cargo build)" "${kind}"
+  if [ "${QUICK}" != "1" ]; then
+    compare A1 B2 "different path, --remap-path-prefix on" "${kind}"
+  fi
+done
 
 # -----------------------------------------------------------------------------
 if [ -n "${RECORD}" ]; then
