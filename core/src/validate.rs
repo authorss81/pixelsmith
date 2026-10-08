@@ -584,16 +584,15 @@ mod tests {
         let full = jpeg(64, 64);
         let truncated = &full[..full.len() / 3];
 
-        let err = validate_bytes(truncated, &Limits::default())
-            .expect_err("a JPEG with two thirds of its entropy-coded data missing is not a picture");
+        let err = validate_bytes(truncated, &Limits::default()).expect_err(
+            "a JPEG with two thirds of its entropy-coded data missing is not a picture",
+        );
         // A strict allow-list rather than `is_err()`: a decoder that started
         // reporting `Metadata` for a file whose *pixels* are unreadable would
         // pass `is_err()` and move the blame onto the tags.
         match &err {
             Error::Decode(_) | Error::UnknownFormat | Error::Heic(_) => {}
-            other => panic!(
-                "a truncated JPEG must be refused as a decode failure, got {other:?}"
-            ),
+            other => panic!("a truncated JPEG must be refused as a decode failure, got {other:?}"),
         }
         // Nothing partial: `validate_bytes` returns either a report or an error,
         // and the error means there is no report. `inspect` is the function that

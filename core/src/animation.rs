@@ -866,7 +866,18 @@ mod tests {
             crate::format::encode_frames(std::slice::from_ref(&frame), OutputFormat::Gif).is_ok(),
             "GIF is the format that takes frames"
         );
-        // And an animation with no frames is not a valid animation.
-        assert!(crate::format::encode_frames(&[], OutputFormat::Gif).is_err());
+        // And an animation with no frames is not a valid animation. Named,
+        // because `UnsupportedFormat` also satisfies `is_err()` and this is the
+        // other case: GIF *is* the frame-carrying format, and what is wrong is
+        // that there is nothing to carry.
+        assert!(
+            matches!(
+                crate::format::encode_frames(&[], OutputFormat::Gif),
+                Err(Error::Encode(_))
+            ),
+            "an empty frame list must be refused as an encode failure: a GIF with \\
+             zero frames is not a still image, and writing one would produce a 0x0 \\
+             file rather than the picture the user picked"
+        );
     }
 }

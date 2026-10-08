@@ -363,7 +363,11 @@ mod tests {
                 },
                 &["60000x60000", "3600.0", "MP", "decompression bomb"],
             ),
-            ("ZeroDimension", Error::ZeroDimension, &["greater than zero"]),
+            (
+                "ZeroDimension",
+                Error::ZeroDimension,
+                &["greater than zero"],
+            ),
             (
                 "CropOutOfBounds",
                 Error::CropOutOfBounds {
@@ -405,9 +409,7 @@ mod tests {
             ),
             (
                 "Webp",
-                Error::Webp(
-                    "it is 20000 pixels wide and libwebp stores at most 16383 a side",
-                ),
+                Error::Webp("it is 20000 pixels wide and libwebp stores at most 16383 a side"),
                 &["WebP", "20000", "16383", "because"],
             ),
             (
@@ -421,9 +423,7 @@ mod tests {
             ),
             (
                 "ConflictingOptions",
-                Error::ConflictingOptions(
-                    conflicting_options_note(),
-                ),
+                Error::ConflictingOptions(conflicting_options_note()),
                 &["Pick one"],
             ),
             (
@@ -477,7 +477,12 @@ mod tests {
                 // One space between every word. This row exists because the string
                 // carried ten of them, mid-sentence, in text a user reads; the
                 // general property below is what stops the next one.
-                &["working memory", "402653184", "160000000", "smaller output size"],
+                &[
+                    "working memory",
+                    "402653184",
+                    "160000000",
+                    "smaller output size",
+                ],
             ),
             (
                 "TruncatedStream",
@@ -558,7 +563,10 @@ mod tests {
                 "{name} renders a run of three or more spaces, which a user reads as a \
                  sentence that stopped halfway through: {rendered:?}"
             );
-            let last = rendered.chars().next_back().expect("just checked it is not empty");
+            let last = rendered
+                .chars()
+                .next_back()
+                .expect("just checked it is not empty");
             assert!(
                 !matches!(last, ' ' | '\t' | ',' | ';' | ':'),
                 "{name} renders a message ending in {last:?}, so it is a half-sentence: \
@@ -616,9 +624,7 @@ mod tests {
             ),
             (
                 "ConflictingOptions",
-                Error::ConflictingOptions(
-                    conflicting_options_note(),
-                ),
+                Error::ConflictingOptions(conflicting_options_note()),
                 &["Pick one"],
             ),
             (
@@ -684,7 +690,9 @@ mod tests {
     fn a_wrapped_codec_error_keeps_the_codecs_own_words() {
         let cases = [
             (
-                Error::Decode(image::ImageError::IoError(io::Error::other("zlib: bad CRC"))),
+                Error::Decode(image::ImageError::IoError(io::Error::other(
+                    "zlib: bad CRC",
+                ))),
                 "zlib: bad CRC",
             ),
             (

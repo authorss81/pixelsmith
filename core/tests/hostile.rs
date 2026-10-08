@@ -701,12 +701,7 @@ fn a_raw_reader_refuses_what_the_profile_ceiling_forbids_and_would_otherwise_ope
     /// other reason — a truncated stream, an unsupported colour type, a CRC
     /// mismatch — would pass `is_err()` and mean nothing.
     #[track_caller]
-    fn assert_refused_by(
-        bytes: &[u8],
-        limits: &Limits,
-        expected: LimitErrorKind,
-        what: &str,
-    ) {
+    fn assert_refused_by(bytes: &[u8], limits: &Limits, expected: LimitErrorKind, what: &str) {
         let mut reader = raw_reader(bytes);
         reader.no_limits(); // so only `apply_to_decoder` can be doing this
         limits.apply_to_decoder(&mut reader);
@@ -801,7 +796,10 @@ fn a_raw_reader_refuses_what_the_profile_ceiling_forbids_and_would_otherwise_ope
     let mut reader = raw_reader(&small);
     generous.apply_to_decoder(&mut reader);
     assert_eq!(
-        reader.decode().expect("4_096 pixels is inside a 100k budget").dimensions(),
+        reader
+            .decode()
+            .expect("4_096 pixels is inside a 100k budget")
+            .dimensions(),
         (64, 64),
         "a generous budget must not refuse"
     );

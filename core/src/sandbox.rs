@@ -402,7 +402,12 @@ fn classify(outcome: RawOutcome, limits: &Limits, memory_limit: u64) -> Result<S
 /// Names the ceiling because the actionable things are to pick a smaller photo or
 /// raise the budget. "The image engine crashed" offers neither, which is why the
 /// signalled case below reports this instead.
-fn memory_refusal(memory_limit: u64) -> Error {
+///
+/// `pub(crate)` rather than private so `error::tests` can assert the wording of a
+/// real refusal instead of a string invented for the test. The sentences in this
+/// module are the product under hard rule 9, and a row that retypes one goes
+/// stale the moment the wording improves.
+pub(crate) fn memory_refusal(memory_limit: u64) -> Error {
     Error::Sandbox(format!(
         "this photo needs more memory than the {memory_limit} byte ceiling allows: \
          it was refused rather than risking a crash on this device"

@@ -367,9 +367,16 @@ mod tests {
         // Cut points chosen to land in different structures: the `ftyp` header,
         // the `meta` property boxes, and the coded slice at the end.
         for cut in [20, full.len() / 3, full.len() / 2, full.len() - 8] {
+            let err = decode(&full[..cut], &Limits::default())
+                .err()
+                .unwrap_or_else(|| panic!("a HEIC cut at {cut} of {} bytes decoded", full.len()));
+            // The variant, not `is_err()`: every refusal of this file is a codec
+            // failure, and a caller that saw anything else would be told the
+            // container is the problem when the bitstream is.
             assert!(
-                decode(&full[..cut], &Limits::default()).is_err(),
-                "a HEIC cut at {cut} of {} bytes decoded",
+                matches!(err, Error::Heic(_)),
+                "a HEIC cut at {cut} of {} bytes was refused as {err:?}, not as a codec \\
+                 error",
                 full.len()
             );
         }
@@ -419,8 +426,16 @@ mod tests {
         let report = crate::validate::validate_bytes(&bomb, &Limits::default()).unwrap();
         assert_eq!((report.width, report.height), (60_000, 60_000));
         assert!(report.suspicious.is_some());
-        // The tighter profile rejects it too.
-        assert!(decode(&bomb, &Limits::mobile()).is_err());
+        // The tighter profile rejects it too, by the same name: a phone is the
+        // case this whole `ispe` pre-read exists for, and a refusal that arrived
+        // as `Heic` instead would tell the user their camera is unsupported.
+        assert!(
+            matches!(
+                decode(&bomb, &Limits::mobile()),
+                Err(Error::SuspiciousDimensions { .. }) | Err(Error::PixelBudgetExceeded { .. })
+            ),
+            "the mobile profile must refuse a 60000x60000 HEIC by a limits error too"
+        );
     }
 
     #[test]

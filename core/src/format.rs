@@ -2098,19 +2098,18 @@ mod tests {
     fn exif_append_refuses_non_jpeg() {
         // A real PNG: recognised, so refusing it is a decision rather than a
         // format-detection failure.
-        let mut png = encode(
-            &sample(),
-            OutputFormat::Png,
-            EncodingOptions::default(),
-        )
-        .expect("png fixture");
+        let mut png =
+            encode(&sample(), OutputFormat::Png, EncodingOptions::default()).expect("png fixture");
         let before = png.clone();
         assert!(
             matches!(append_exif(&mut png, b"x"), Err(Error::UnknownFormat)),
             "splicing an APP1 into a PNG must be refused as an unrecognised \
              container, not merely refused"
         );
-        assert_eq!(png, before, "a refused splice must not have written anything");
+        assert_eq!(
+            png, before,
+            "a refused splice must not have written anything"
+        );
 
         // Too short to even carry SOI, which is the boundary the check has.
         let mut stub = vec![0xFFu8];

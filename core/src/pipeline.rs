@@ -577,7 +577,12 @@ mod tests {
             no_upscale: false,
             ..Default::default()
         };
-        assert!(spec.resolve(100, 100).is_err());
+        assert!(
+            matches!(spec.resolve(100, 100), Err(Error::ZeroDimension)),
+            "a zero-pixel target is ZeroDimension in both halves of resolve, and a \\
+             resize to 0x0 would divide by zero in scale_axis rather than produce a \\
+             picture"
+        );
     }
 
     #[test]
@@ -630,8 +635,21 @@ mod tests {
             }),
             ..Pipeline::new()
         };
-        assert!(p.apply(&img(400, 200)).is_err());
-        assert!(p.output_dimensions(400, 200).is_err());
+        // The variant, not merely `is_err()`: `apply` can also fail on an encode
+        // or a decode, and a user whose crop runs past the edge needs to be told
+        // that rather than told the pipeline failed. Both halves name it.
+        assert!(
+            matches!(p.apply(&img(400, 200)), Err(Error::CropOutOfBounds { .. })),
+            "apply must refuse an out-of-bounds crop by name"
+        );
+        assert!(
+            matches!(
+                p.output_dimensions(400, 200),
+                Err(Error::CropOutOfBounds { .. })
+            ),
+            "output_dimensions is what the UI predicts with, so it must refuse the \
+             same crop by the same name rather than predicting a size it cannot keep"
+        );
     }
 
     /// A crop whose `x + width` is not representable is refused by name, by both

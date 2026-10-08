@@ -278,6 +278,41 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Every test asserts a value.
+#
+# AGENTS.md: "A test asserts a specific value, not just 'it didn't panic'."
+# docs/AUDIT.md finding 20 is four tests that did not, and one of the four was the
+# only thing standing between `validate` and a decoder with no ceiling: it called
+# Limits::apply_to_decoder and then threw the result away, so deleting that
+# function's body left it green. Every phase since then shipped under a gate that
+# could not see it.
+#
+# The check is a FAILURE, not a note, because its committed side is in this
+# repository — the allow-list at the top of scripts/check-test-assertions.sh — so
+# a red result has an action attached to the person reading it: give the test a
+# value to assert, or write down which other test makes the claim instead.
+head1 "2d. Every test asserts a value"
+if [ -f core/Cargo.toml ]; then
+  say "--- scripts/check-test-assertions.sh ---"
+  ASSERT=$( bash scripts/check-test-assertions.sh 2>&1 )
+  ARC=$?
+  if [ ${ARC} -eq 0 ]; then
+    pass "$(printf '%s' "${ASSERT}" | grep -E '^ASSERTIONS:' | tail -n 1)"
+  else
+    fail "a test asserts nothing (docs/AUDIT.md finding 20):"
+    printf '%s\n' "${ASSERT}" | head -n 40
+  fi
+
+  # Proved able to fail, offline, in both directions: the self-test plants a tree
+  # whose tests assert nothing and a tree whose only test does, and it also
+  # proves the allow-list cannot be used to excuse a row nobody gave a reason for.
+  check "scripts/check-test-assertions.sh --self-test" \
+    "bash scripts/check-test-assertions.sh --self-test"
+else
+  say "  skip: core/Cargo.toml not present yet"
+fi
+
+# -----------------------------------------------------------------------------
 head1 "3. Dart / Flutter"
 if [ -f app/pubspec.yaml ]; then
   if command -v flutter >/dev/null 2>&1; then

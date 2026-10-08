@@ -7,7 +7,148 @@ phase table is treated as a claim to be checked rather than as evidence.
 
 ## Contents
 
+- [2026-10-08 — addendum at phase-21](#2026-10-08--addendum-at-phase-21)
 - [2026-10-08 — audit at phase-17](#2026-10-08--audit-at-phase-17)
+
+---
+
+## 2026-10-08 — addendum at phase-21
+
+Written while phase-21 did its work, because two of the three findings it closed
+were closed by *failing* rather than by asserting, and a reader of the original
+text cannot tell which of the claims below were measured and which were read.
+
+**Findings 19 and 20 are closed. Finding 10 is half closed and its other half
+(finding 11) is not.** Three new findings are added: 27, 28 and 29.
+
+### What was measured, and what it printed
+
+Each of finding 20's four tests was run against a deliberately broken
+implementation, because a rewritten test that has never been observed to fail is
+the same object the audit complained about.
+
+| Test | Broken how | What it printed |
+| --- | --- | --- |
+| `hostile.rs::a_raw_reader_refuses_what_the_profile_ceiling_forbids_and_would_otherwise_open` | the body of `Limits::apply_to_decoder` replaced with `let _ = reader;` | `17_000 pixels is over the mobile per-side ceiling: the decoder opened it, at 17000x2` |
+| `stream.rs::a_jpeg_goes_through_the_whole_image_arm` | `read_row`'s stride restored to `CHANNELS` | `the streamed picture differs from the in-memory kernel by 255 code values (mean 57.037)` |
+| `stream.rs::a_jpeg_with_a_non_integer_ratio_still_matches_the_in_memory_kernel` | the same | `… by 255 code values (mean 58.837)` |
+| `sandbox.rs::a_worker_run_exits_zero_with_a_decodable_response_on_stdout` | one `eprintln!("DEBUG: decoded")` on the worker's clean path | `a clean run wrote to stderr: DEBUG: decoded` |
+
+The fourth, `worker.rs::rayon_has_more_than_one_thread`, cannot be broken by
+editing a line of this crate — rayon builds its own pool — so it was run the way a
+broken pool actually happens, with `RAYON_NUM_THREADS=1`. The tautology it
+replaced passed silently. The assertion above it now announces the skip and
+names the machine, and the claim it exists to support fails loudly on the same
+configuration:
+
+```text
+thread 'worker::tests::the_batch_really_does_run_in_parallel' panicked at src/worker.rs:2179:
+batch (13.831012392s) should beat the sequential loop (13.806460512s)
+```
+
+### Finding 10 is half closed, and the half that is closed is the half that was never executed
+
+The audit recorded finding 10 with "**Confidence: high** on the mechanism (the
+arithmetic is wrong for a 3-channel source); **medium** on the end-to-end
+consequence, which I did not execute." The end-to-end consequence has now been
+executed, twice, in both directions: with the old stride in `stream.rs:read_row`
+the whole-image arm differs from the in-memory kernel by **255 code values, mean
+57.0 and 58.8**, on a smooth gradient at q95 — a skew, not a rounding difference.
+With the source's own `bytes_per_pixel()` as the stride it agrees to one
+least-significant bit, which is what `it_agrees_with_the_in_memory_kernel` has
+always measured on the row-at-a-time arm.
+
+**Finding 11 is untouched and still assigned to phase-28.** The 2 GB fallback
+blank at `stream.rs` is a separate function and no test here touches it.
+
+### 27. The old hostile test also never told `image` what format the file was — MEDIUM (found while closing finding 20)
+
+`core/tests/hostile.rs:660` called `ImageReader::new(...)` and then `decode()`
+without `with_guessed_format()`. An `ImageReader` with no format set refuses
+**every** input with `Unsupported(Format(Unknown))`. So the old test was not
+merely discarding its result: every one of its six cases was going through a
+refusal path that has nothing to do with the limit it claimed to exercise. Two
+independent reasons it measured nothing, and only one of them was visible in the
+source.
+
+The rewrite uses `with_guessed_format()`, which means the refusal it now asserts
+is genuinely the limit's.
+
+**Confidence: high.** Read from the `image` 0.25 API, and the rewritten test's
+positive control (the same 17_000x2 PNG decoded without limits) is what proves
+the reader can open it.
+
+### 28. A doubled backslash in a user-facing message — LOW (found while closing finding 19)
+
+`core/src/worker.rs`, the skip notice in `rayon_has_more_than_one_thread`:
+
+```rust
+eprintln!(
+    "skipping: this machine gave rayon one thread ({}) and the batch path \\
+     cannot be parallel here",
+```
+
+`\\` rather than `\`, so the message printed a literal backslash and the
+indentation of the source line:
+
+```text
+skipping: this machine gave rayon one thread (4) and the batch path \
+                 cannot be parallel here
+```
+
+This is the same defect as finding 19's ten literal spaces in
+`StreamingBudgetExceeded` — a string literal broken across source lines with the
+wrong escape — in the one place `error.rs`'s new property test cannot reach,
+because it is not an `Error`. Fixed.
+
+**The property that would have caught it is worth stating:** `error.rs` now
+asserts that no message contains three or more consecutive spaces. A doubled
+backslash is the other half of the same shape, and nothing asserts against it
+outside `error.rs`. Noted rather than fixed, because a check for "no literal
+backslash in a rendered message" belongs on the messages, not on the source, and
+there is no shared renderer between `worker.rs`'s `eprintln!` and `thiserror`.
+
+**Confidence: high.** Observed in the output above.
+
+### 29. The weak `is_err()` cluster is larger than the four sites recorded — LOW
+
+Finding 20 named `lib.rs:281`, `format.rs:2090`, `validate.rs:535` and
+`validate.rs:540`. Grepping the tree for the same shape
+(`assert!(…is_err())` / `assert!(…is_ok())`) found seven more sites where a
+named variant was available and available to the writer: `heic.rs` (two, one of
+them a hard-rule-4 pre-read), `stream.rs`'s streamed-header ceiling,
+`pipeline.rs`'s zero-target and out-of-bounds crop, `animation.rs`'s empty frame
+list, and a `#[cfg(not(unix))]` test in `sandbox.rs` that never compiles on this
+runner. Six were tightened; the Windows-only one was left alone because the
+change could not be compiled or run here.
+
+None of them was green *for the wrong reason* — every one passed — which is the
+distinction that matters for an audit. They were green for **no stated reason**,
+which is the defect finding 20 is about, and the difference between the two is
+whether a future change to the error enum can move them silently.
+
+**Confidence: high**, for the six that were run.
+
+### The check that now gates all of it
+
+`scripts/check-test-assertions.sh`, wired into `verify.sh` as section **2d**.
+It reports every `#[test]` in `core/` whose body contains no assertion macro —
+**375 test functions, 6 with no assertion macro, 6 allowed**, every allowed row
+carrying a one-line reason and a pointer to the test that makes the claim
+instead. The allow-list is the reviewable half and lives in this repository, which
+is why the check is a failure rather than a note.
+
+Two scanner decisions are load-bearing and both are pinned by `--self-test`:
+
+* A body is delimited by the **indentation** of its closing brace, not by counting
+  braces. Braces inside string literals do not balance, and this tree has a real
+  one: proptest generated arguments are written `input in ".{0,60}"`, whose brace
+  comes first and whose body is the whole rest of the function. A counting
+  scanner ends that body before it starts — which is how the scanner found, on its
+  first run over the real tree, a `stream.rs` function blamed for a
+  `properties.rs` name.
+* `.unwrap()` and `.expect()` do **not** count as assertions. A test whose only
+  claim is that nothing returned an `Err` is this same defect in another costume.
 
 ---
 

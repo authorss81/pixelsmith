@@ -845,8 +845,17 @@ mod tests {
             .expect_err("256 MP must be refused by the streamed budget");
         assert!(err.to_string().contains("budget"), "{err}");
         // The per-side ceiling is the header check's own bound, and streaming does
-        // not relax it.
-        assert!(limits.check_streamed_header(30_000, 30_000).is_err());
+        // not relax it. Named, because `StreamingBudgetExceeded` also satisfies
+        // `is_err()` and this case is the other one: 30000 is over
+        // `Limits::mobile().max_dimension`, not over the streamed pixel budget.
+        assert!(
+            matches!(
+                limits.check_streamed_header(30_000, 30_000),
+                Err(Error::SuspiciousDimensions { .. })
+            ),
+            "30000 pixels a side is over the per-side ceiling, and streaming must not \\
+             trade that ceiling for its own budget"
+        );
         // 120 MP is the case this phase exists for, and the mobile profile can
         // open it now that the decode never materialises it.
         assert!(limits.check_streamed_header(12_000, 10_000).is_ok());
@@ -932,11 +941,7 @@ mod tests {
             EncodingOptions::default().with_quality(95),
         )
         .expect("jpeg fixture");
-        assert_matches_the_in_memory_kernel(
-            &bytes,
-            (100, 67),
-            "a JPEG on the whole-image arm",
-        );
+        assert_matches_the_in_memory_kernel(&bytes, (100, 67), "a JPEG on the whole-image arm");
     }
 
     /// The same property at a geometry where a stride error cannot hide.
@@ -952,11 +957,7 @@ mod tests {
             EncodingOptions::default().with_quality(95),
         )
         .expect("jpeg fixture");
-        assert_matches_the_in_memory_kernel(
-            &bytes,
-            (40, 25),
-            "a 97x61 JPEG reduced to 40x25",
-        );
+        assert_matches_the_in_memory_kernel(&bytes, (40, 25), "a 97x61 JPEG reduced to 40x25");
     }
 
     #[test]

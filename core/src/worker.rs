@@ -2212,7 +2212,7 @@ mod tests {
         );
         if threads == 1 {
             eprintln!(
-                "skipping: this machine gave rayon one thread ({}) and the batch path \\
+                "skipping: this machine gave rayon one thread ({}) and the batch path \
                  cannot be parallel here",
                 std::thread::available_parallelism()
                     .map(|n| n.get())
