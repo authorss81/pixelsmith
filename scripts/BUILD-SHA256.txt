@@ -1,0 +1,43 @@
+# Release engine build hashes — one row per shipped target.
+#
+#     <target>  <sha256|NOT-MEASURED>  <artefact>  remap=<on|off>  epoch=<n>  <rustc>  — <why>
+#
+# Written and rewritten in place by
+#     scripts/build-release.sh --record scripts/BUILD-SHA256.txt
+# and compared on every build by the `reproducible-build` job in
+# .github/workflows/build.yml (delivered as
+# workspace/phase-15/supply-chain-ci.patch, for the credential reason every other
+# workflow change in this project is a patch).
+#
+# THIS FILE IS HASHES. Whether each target's build actually reproduces —
+# including the ones where the answer is "not measured" — is stated per target in
+# docs/SUPPLY-CHAIN.md. A row here is not evidence of reproducibility; the CI
+# job comparing a fresh build against it is.
+#
+# A row reading NOT-MEASURED is neither a mismatch nor a failure. It is a target
+# this project has never built on the machine that wrote this file, and the
+# honest entry is an absent measurement rather than a copied one. The CI job
+# prints the hash it obtains; filling the row in is a commit. This is also why
+# one measured target and seven unmeasured ones is the correct state today and
+# not an unfinished one: filling a row from another target's build, or from a
+# build on a machine whose toolchain differs, would be a false claim about a
+# binary nobody built.
+#
+# The hash is of the **cdylib** — the artefact a phone loads, and the one
+# scripts/no-network-report.sh checks for network symbols. The **staticlib**
+# hashes to a different value and is compared separately, because it answers
+# differently: `[profile.release] strip = true` removes the build path from the
+# cdylib and does not reach inside an archive. Both are measured by
+# scripts/repro-check.sh; see docs/SUPPLY-CHAIN.md for the measured pair.
+#
+# Regenerate the measured row with:
+#     bash scripts/repro-check.sh --record scripts/BUILD-SHA256.txt
+
+aarch64-unknown-linux-gnu   NOT-MEASURED  libpixelsmith_core.so  remap=on  epoch=0  n/a  — no aarch64 Linux host and no aarch64-linux-gnu cross toolchain available
+x86_64-pc-windows-msvc      NOT-MEASURED  pixelsmith_core.dll    remap=on  epoch=0  n/a  — needs the MSVC toolchain, which only exists on a Windows runner
+aarch64-pc-windows-msvc     NOT-MEASURED  pixelsmith_core.dll    remap=on  epoch=0  n/a  — needs the MSVC ARM64 libraries, which only exist on a Windows ARM64 runner
+x86_64-apple-darwin         NOT-MEASURED  libpixelsmith_core.dylib  remap=on  epoch=0  n/a  — needs the Apple SDK, which only exists on macOS
+aarch64-apple-darwin        NOT-MEASURED  libpixelsmith_core.dylib  remap=on  epoch=0  n/a  — needs the Apple SDK, which only exists on macOS
+aarch64-linux-android       NOT-MEASURED  libpixelsmith_core.so  remap=on  epoch=0  n/a  — needs the Android NDK for the linker
+aarch64-apple-ios           NOT-MEASURED  libpixelsmith_core.dylib  remap=on  epoch=0  n/a  — needs Xcode for the SDK and the signing toolchain
+x86_64-unknown-linux-gnu       56e0eead84b5238fedb88e053c384a16a5465e559a8385bfc722fb2a4b8395cf  libpixelsmith_core.so  remap=on  epoch=0  rustc 1.99.0 (b940084d7 2026-09-28)

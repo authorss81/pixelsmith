@@ -22,10 +22,23 @@
 #   B2  the same sources copied to another path, remap on  /  does remapping fix it
 #
 # Each pair is compared by sha256, and a mismatch is then localised: the first
-# differing byte offset, how many bytes differ in total, and whether either
-# artefact contains its own build path as a string. That last one is the whole
-# diagnosis — rustc puts `core/src/pipeline.rs` in `panic::Location`, and if the
-# absolute prefix is in there, the hash cannot match across directories.
+# differing byte offset, how many bytes differ, whether the sizes differ, and
+# whether either artefact contains its own build path as a literal string.
+#
+# That last check is worth reading carefully, because on this tree it answers
+# "no" for a pair that genuinely differs, and the reason is the interesting part.
+# MEASURED on x86_64-unknown-linux-gnu, staticlib, no-remap against remap: 1261
+# differing bytes in 165 runs from offset 507411, identical file size, and NOT ONE
+# ABSOLUTE PATH in either artefact. What differs is 81 per-crate 16-hex-digit
+# identity hashes that appear in symbol names — `libc-5ca03e1b3e78aee9.libc.…`
+# against `libc-c1ce7e49860bfa88.libc.…` — one per crate in the graph, and
+# `--remap-path-prefix` is what changes them. The second hex group is stable; the
+# first is not.
+#
+# So the lesson is a negative one worth stating, because it is the assumption that
+# makes people ship unreproducible builds: **grepping the binary for the build
+# path does not detect this**, and neither does building twice in one directory.
+# The path reaches the artefact as a hash. Only comparing the artefacts finds it.
 #
 # Usage:
 #   scripts/repro-check.sh                 all four builds
@@ -93,11 +106,104 @@ mkdir -p "${WORK}/b"
 say "  ${ROOT}"
 say "  ${WORK}/b"
 
+# Where a variant's target directory is. One function, because two conventions
+# in this script is not a style question: `build` was given the directory name
+# (`t-a1`) and everything that reads the artefact back was given the variant name
+# (`A1`), so the build-path diagnostic found no files at all and reported
+# nothing, and `cmp` was handed a path that did not exist and — with its stderr
+# discarded — answered "0 differing bytes". That reads like an identical prefix,
+# which is the one thing it must never say about a pair that just hashed
+# differently. A diagnostic that silently finds nothing is worse than no
+# diagnostic, because its silence reads as a clean result.
+target_dir_for() {
+  case "$1" in
+    A1) printf 't-a1' ;;
+    A2) printf 't-a2' ;;
+    B1) printf 't-b1' ;;
+    B2) printf 't-b2' ;;
+    *)  die "unknown variant: $1" ;;
+  esac
+}
+
+# Report what two artefacts disagree about, in the terms that distinguish a
+# hash-of-the-input problem from a path-length problem. $1 and $2 are files, $3 is
+# a label. Deliberately python rather than shell: comparing two 70 MB binaries
+# byte by byte in bash is a `cmp -l | wc -l` per pair, and the crate-identity
+# extraction needs a regex, and doing either in awk would be three unreadable
+# lines that compute less than this does.
+describe_difference() {
+  local left="$1" right="$2" label="$3"
+  say ""
+  say "--- ${label} ---"
+  if [ ! -f "${left}" ] || [ ! -f "${right}" ]; then
+    say "  SKIPPED: one of the two artefacts is missing"
+    return 0
+  fi
+  if cmp -s "${left}" "${right}"; then
+    say "  identical"
+    return 0
+  fi
+  python3 - "${left}" "${right}" <<'PY' || say "  (could not analyse: python3 or a read error)"
+import re, sys
+
+a = open(sys.argv[1], "rb").read()
+b = open(sys.argv[2], "rb").read()
+print(f"  sizes: {len(a)} vs {len(b)}" +
+      ("  (equal — this is not a path-length difference)"
+       if len(a) == len(b) else "  (DIFFERENT — consistent with a path of a different length)"))
+
+diffs = [i for i in range(min(len(a), len(b))) if a[i] != b[i]]
+extra = abs(len(a) - len(b))
+if not diffs and not extra:
+    print("  no differing bytes")
+    raise SystemExit(0)
+print(f"  differing bytes: {len(diffs) + extra}"
+      + (f"   first at offset {diffs[0] + 1}" if diffs else ""))
+
+runs, start, prev = [], (diffs[0] if diffs else 0), (diffs[0] if diffs else 0)
+for i in diffs[1:]:
+    if i == prev + 1:
+        prev = i
+    else:
+        runs.append((start, prev)); start = prev = i
+if diffs:
+    runs.append((start, prev))
+print(f"  contiguous runs: {len(runs)}")
+
+# crate-identity names: <crate>-<16 hex>.<crate>.<16 hex>
+pat = re.compile(rb"([a-z0-9_]+)-([0-9a-f]{16})\.\1\.([0-9a-f]{16})")
+lo = diffs[0] if diffs else 0
+hi = (diffs[-1] if diffs else 0) + 1
+left, right = set(), set()
+for buf, sink in ((a, left), (b, right)):
+    for m in pat.finditer(buf[lo:hi]):
+        sink.add(m.group(1).decode())
+shared = left & right
+print(f"  crate-identity names in the differing region: {len(left | right)}"
+      f" ({len(shared)} of them in both)")
+sample = sorted(shared)[:4]
+if sample:
+    print("  e.g. " + ", ".join(sample))
+if shared:
+    print("  => per-crate identity hashes: the differing input reaches the artefact as a")
+    print("     HASH, not as a path string. --remap-path-prefix is what neutralises it,")
+    print("     and grepping the binary for the build path cannot find it.")
+else:
+    # The verdict above is only true for a difference that actually consists of
+    # these names. Printing it unconditionally would be a script asserting a
+    # diagnosis it did not make, which is worse than printing nothing.
+    print("  => NOT per-crate identity hashes: no such name occurs in the differing")
+    print("     region, so this is something else. The size line above is the first")
+    print("     thing to read; a size difference points at a path of a different")
+    print("     length and an equal size points at an input this script cannot name.")
+PY
+}
+
 hash_of() {
-  # $1 = variant label. The artefacts sit under <target-dir>/<triple>/release,
-  # because build-release.sh always passes --target: a host build without one
-  # lands in target/release/ where a plain `cargo build` overwrites it, and
-  # "the release binary" has to name one file.
+  # $1 = target directory label. The artefacts sit under
+  # <target-dir>/<triple>/release, because build-release.sh always passes
+  # --target: a host build without one lands in target/release/ where a plain
+  # `cargo build` overwrites it, and "the release binary" has to name one file.
   #
   # BOTH the shared library and the static archive are hashed, because they do
   # not have the same answer and reporting only one of them would be a
@@ -127,7 +233,7 @@ artefact_hash() {
 # Where one variant's artefact actually is, so a mismatch can be localised with
 # `cmp` instead of only reported as two different hashes.
 artefact_path() {
-  local dir="${WORK}/$1/${TARGET}/release"
+  local dir="${WORK}/$(target_dir_for "$1")/${TARGET}/release"
   case "${2}" in
     static) printf '%s' "${dir}/libpixelsmith_core.a" ;;
     *)
@@ -175,21 +281,23 @@ for v in A1 A2 B1 B2; do
 done
 
 # -----------------------------------------------------------------------------
-# Does this artefact embed its own build path? If it does, two checkouts in
-# different directories cannot produce the same bytes, whatever the toolchain.
+# Does this artefact embed its own build path as a literal string? If it does,
+# two checkouts in different directories cannot produce the same bytes.
 #
-# Both artefacts are asked, because they answer differently and the difference
-# is the whole finding: the stripped cdylib does not contain the path while the
-# unstripped archive does.
+# BOTH artefacts are asked, and the honest answer on this tree is "no" for both,
+# even for a pair that differs — see the header. That is reported here rather than
+# hidden, because "the path is not in the binary" is the finding that makes the
+# obvious reproducibility check useless, and a reader who saw only a MATCH line
+# would draw the opposite conclusion.
 say ""
-say "=== 3. does the artefact embed its own build path? ==="
+say "=== 3. does the artefact embed its own build path as a literal string? ==="
 for v in A1 B1 B2; do
   [ -n "${H[$v]:-}" ] || continue
   case "${v}" in
     A1) root="${ROOT}" ;;
     *)  root="${WORK}/b" ;;
   esac
-  dir="${WORK}/${v}/${TARGET}/release"
+  dir="${WORK}/$(target_dir_for "${v}")/${TARGET}/release"
   for artefact in "${dir}"/libpixelsmith_core.so "${dir}"/libpixelsmith_core.a; do
     [ -f "${artefact}" ] || continue
     hits=$(LC_ALL=C grep -c -a -F -- "${root}" "${artefact}" 2>/dev/null || true)
@@ -200,6 +308,42 @@ for v in A1 B1 B2; do
     fi
   done
 done
+# A variant that produced nothing is reported rather than skipped in silence.
+# "This diagnostic found no artefacts" is the one answer here that means the
+# script is broken, and it has to be visible when it happens.
+SAW_ARTEFACT=0
+for v in A1 B1 B2; do
+  [ -n "${H[$v]:-}" ] || continue
+  dir="${WORK}/$(target_dir_for "${v}")/${TARGET}/release"
+  for artefact in "${dir}"/libpixelsmith_core.*; do
+    [ -f "${artefact}" ] && SAW_ARTEFACT=1
+  done
+done
+if [ "${SAW_ARTEFACT}" = "0" ]; then
+  say "  FAIL: this diagnostic inspected no artefacts at all, so its silence below"
+  say "        means nothing. Check target_dir_for() against the directories build created."
+  die "the build-path diagnostic was vacuous"
+fi
+
+# -----------------------------------------------------------------------------
+# And when a pair differs, what actually differs?
+#
+# Section 3 says whether the path appears as a string, and on this tree the
+# answer is "no" even for a pair whose hashes differ — because the path reaches
+# the artefact as a per-crate identity hash rather than as text. So the question
+# this block answers is the one that actually localises it: how many bytes, are
+# the sizes the same, and do the differing regions contain crate-identity names?
+#
+# A pair that differs with identical sizes and a few thousand differing bytes in
+# 16-hex-digit groups is a hash-of-the-input problem. A pair that differs with
+# different sizes is a path-length problem. They have different fixes and the
+# output says which one this is.
+say ""
+say "=== 3b. what differs between A1 and B1 (the pair most likely to differ) ==="
+describe_difference \
+  "$(artefact_path A1 shared)" "$(artefact_path B1 shared)" "shared (cdylib)"
+describe_difference \
+  "$(artefact_path A1 static)" "$(artefact_path B1 static)" "static (staticlib)"
 
 # -----------------------------------------------------------------------------
 FAILURES=0
@@ -231,10 +375,19 @@ compare() {
   say "  DIFFER"
   l=$(artefact_path "${left}" "${kind}")
   r=$(artefact_path "${right}" "${kind}")
+  # Both files must exist before `cmp` is worth running. If they do not, that is
+  # a defect in this script and not a finding about the build, and saying "0
+  # differing bytes" about it would be the most misleading sentence in the file.
+  if [ ! -f "${l}" ] || [ ! -f "${r}" ]; then
+    say "  NOT LOCALISED: ${l} or ${r} does not exist; this script cannot read"
+    say "  back what it built, which is a bug here rather than a property of the build."
+    return 1
+  fi
   if command -v cmp >/dev/null 2>&1; then
     first=$(cmp -l "${l}" "${r}" 2>/dev/null | head -n1 | awk '{print $1}')
     total=$(cmp -l "${l}" "${r}" 2>/dev/null | wc -l)
     say "  first differing byte: ${first:-unknown}   differing bytes: ${total}"
+    say "  sizes: $(stat -c%s "${l}" 2>/dev/null || stat -f%z "${l}") vs $(stat -c%s "${r}" 2>/dev/null || stat -f%z "${r}")"
   fi
   return 1
 }

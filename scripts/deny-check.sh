@@ -116,7 +116,11 @@ if [ -z "${METADATA_MODE}" ]; then
   die "cargo metadata failed; the policy cannot be evaluated against a graph that did not resolve"
 fi
 CRATES=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["packages"]))' "${WORK}/metadata.json")
-say "  ${CRATES} packages resolved from core/Cargo.lock (${METADATA_MODE}, $(printf '%s' "${PLATFORM_FLAGS}" | grep -c -- '--filter-platform') target filters from [graph].targets)"
+# `grep -c` counts *lines*, and PLATFORM_FLAGS is one line carrying one flag per
+# target, so it reports "1 target filters" for an eight-target policy. The number
+# printed here is a claim about this run, so it is counted with -o.
+NTARGETS=$(printf '%s' "${PLATFORM_FLAGS}" | grep -o -- '--filter-platform' | wc -l)
+say "  ${CRATES} packages resolved from core/Cargo.lock (${METADATA_MODE}, ${NTARGETS} target filter(s) from [graph].targets)"
 
 # -----------------------------------------------------------------------------
 say ""

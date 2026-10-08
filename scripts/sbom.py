@@ -195,7 +195,7 @@ def build(lock: dict, metadata: dict | None, platform: str | None, engine_versio
     else:
         root["version"] = engine_version
         root["bom-ref"] = f"pixelsmith_core@{engine_version}"
-        root["licenses"] = spdx_licenses("MIT OR Apache-2.0")
+        root["licenses"] = spdx_licences("MIT OR Apache-2.0")
         root["purl"] = purl("pixelsmith_core", engine_version)
 
     # Every component a dependency edge names must exist, or the document is not
@@ -233,7 +233,7 @@ def build(lock: dict, metadata: dict | None, platform: str | None, engine_versio
                 "bom-ref": root["bom-ref"],
                 "name": "pixelsmith_core",
                 "version": engine_version,
-                "licenses": spdx_licenses("MIT OR Apache-2.0"),
+                "licenses": spdx_licences("MIT OR Apache-2.0"),
                 "purl": purl("pixelsmith_core", engine_version),
             },
             "properties": properties,

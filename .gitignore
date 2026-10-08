@@ -3,6 +3,15 @@
 **/target/
 **/*.rs.bk
 
+# Python
+# scripts/lockfile-policy.py, scripts/deny-negative-control.py and scripts/sbom.py
+# are imported or exec'd by the supply-chain checks, and running them drops a
+# __pycache__ beside the source. That file was committed and then deleted in
+# phase-15, came back on the next run, and is a build artefact of a check rather
+# than part of any policy.
+__pycache__/
+*.pyc
+
 # Fuzzing
 /fuzz/target/
 /fuzz/corpus/

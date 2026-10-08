@@ -78,8 +78,27 @@ Two more properties worth stating plainly:
   `validate::Limits` before any buffer is allocated, so a file claiming
   60000×60000 is rejected on sight rather than costing 14 GB.
 
-The fuzz harness lands in phase-02. Supply-chain policy, an SBOM and reproducible
-builds land in phase-15.
+**To report a vulnerability, see [SECURITY.md](SECURITY.md).** The full policy —
+threat model, what "secure" means here, the fuzzing setup, disclosure route and
+supported versions — is in **[docs/SECURITY.md](docs/SECURITY.md)**, and the
+supply chain behind it (licence and advisory policy, the SBOM, release hashes, and
+**which targets build reproducibly and which are not measured**) is in
+**[docs/SUPPLY-CHAIN.md](docs/SUPPLY-CHAIN.md)**.
+
+To check the no-network claim yourself, against the release artefact rather than
+against this repository's word for it:
+
+```bash
+bash scripts/no-network-report.sh --build
+```
+
+That checks the dependency graph, the source, the release library's dynamic
+imports *and* its undefined dynamic symbols — the last of which is the strongest,
+because `ldd` cannot see a statically linked `socket()` call. The check that
+actually settles it is not a script: install the app, disconnect from the network,
+and use it. It should not notice.
+
+The fuzz harness lands in phase-02.
 
 ## The pipeline
 

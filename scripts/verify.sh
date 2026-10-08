@@ -394,11 +394,22 @@ check "opencode.json declares the model" "grep -q '\"model\"' opencode.json"
 check "docs/SECURITY.md and root SECURITY.md both exist" \
   "[ -f docs/SECURITY.md ] && [ -f SECURITY.md ] && grep -q 'docs/SECURITY.md' SECURITY.md"
 
+# A row is a target triple followed by whitespace, and the triple pattern has to
+# allow more than one hyphen: `^[a-z0-9_]+-[a-z0-9_]+[[:space:]]` cannot match
+# `x86_64-unknown-linux-gnu`, because anchored at `^` the first class stops at the
+# first hyphen and the second one cannot cross the second. That regex was in this
+# file for two attempts of phase-15 and both failed this check against a table
+# that was correct — the same class of defect as phase-01's `check()` and
+# phase-08's `| head -n 40`: a check that cannot report the truth. The grouped
+# form below is the one that matches a triple, and both directions are asserted by
+# the hand test in docs/SUPPLY-CHAIN.md.
+TRIPLE='[a-z0-9_]+(-[a-z0-9_]+)+'
+
 check "docs/SUPPLY-CHAIN.md states a verdict per target" \
-  "[ -f docs/SUPPLY-CHAIN.md ] && [ \"\$(grep -cE '^\\| \`?[a-z0-9_]+-[a-z0-9_]+' docs/SUPPLY-CHAIN.md)\" -ge 6 ]"
+  "[ -f docs/SUPPLY-CHAIN.md ] && [ \"\$(grep -cE '^\\| \`?${TRIPLE}' docs/SUPPLY-CHAIN.md)\" -ge 6 ]"
 
 check "scripts/BUILD-SHA256.txt has a row per target" \
-  "[ -f scripts/BUILD-SHA256.txt ] && [ \"\$(grep -cE '^[a-z0-9_]+-[a-z0-9_]+[[:space:]]' scripts/BUILD-SHA256.txt)\" -ge 6 ]"
+  "[ -f scripts/BUILD-SHA256.txt ] && [ \"\$(grep -cE '^${TRIPLE}[[:space:]]' scripts/BUILD-SHA256.txt)\" -ge 6 ]"
 
 check "vet/ audits present for the crates the advisory DB cannot answer for" \
   "[ -f vet/config.toml ] && grep -q 'libwebp-sys' vet/config.toml && grep -q 'heic-rs' vet/config.toml"
