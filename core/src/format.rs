@@ -232,6 +232,38 @@ impl OutputFormat {
         }
     }
 
+    /// Whether an ICC profile can be written into this format by this build.
+    ///
+    /// True for JPEG and PNG only, and that is a statement about what has been
+    /// written and tested rather than about what the formats allow. WebP has an
+    /// `ICCP` chunk, but placing one turns a simple lossy file into an extended
+    /// `VP8X` one and there is no WebP reader in this tree to check the result
+    /// against, so offering it would be offering a file that might not open.
+    ///
+    /// The profile is dropped rather than embedded by default — see
+    /// [`crate::colour::ColourOptions`] — so this is only consulted when a caller
+    /// explicitly asked to keep it.
+    pub fn supports_icc(self) -> bool {
+        matches!(self, Self::Jpeg | Self::Png)
+    }
+
+    /// What to say when a caller asked to carry a colour profile into a format
+    /// that cannot take one.
+    pub fn icc_note(self) -> &'static str {
+        match self {
+            Self::WebP => {
+                "this build cannot write a colour profile into WebP, so the photo's \
+                          colours would be attached to nothing. Ask for JPEG or PNG to keep \
+                          the profile, or turn the option off to convert the photo to sRGB \
+                          instead"
+            }
+            _ => {
+                "this format cannot carry a colour profile. Ask for JPEG or PNG to keep it, \
+                  or turn the option off to convert the photo to sRGB instead"
+            }
+        }
+    }
+
     /// Maps a file extension to a format. Only trusted after [`detect_format`]
     /// confirms the magic bytes agree.
     pub fn from_extension(ext: &str) -> Option<Self> {
@@ -856,6 +888,120 @@ pub fn append_exif(jpeg: &mut Vec<u8>, exif_tiff: &[u8]) -> Result<()> {
     // Insert immediately after SOI, before any other marker. If the file
     // already carries an APP1 we simply prepend ours; readers take the first.
     jpeg.splice(2..2, segment);
+    Ok(())
+}
+
+/// The most profile bytes one ICC segment can carry: a JPEG segment's payload is
+/// at most 65533 bytes, and 16 of those are the `ICC_PROFILE\0` identifier plus
+/// the sequence and total counts.
+pub const ICC_CHUNK_MAX: usize = 65_533 - 16;
+
+/// Splice a whole ICC profile into a JPEG as `APP2` segments.
+///
+/// Splitting is the profile's own convention, not a limitation here: a profile
+/// longer than one segment is written as several `APP2` segments carrying a
+/// one-based sequence number and the total count, and a reader reassembles them.
+/// Doing it here rather than refusing a big profile is what keeps a modern
+/// phone's profile — several kilobytes — from being un-embeddable.
+///
+/// Not the default: see [`crate::colour::ColourOptions`], which explains why
+/// converting to sRGB and dropping the profile is the right answer for almost
+/// every export.
+pub fn append_icc(jpeg: &mut Vec<u8>, profile: &[u8]) -> Result<()> {
+    if profile.is_empty() {
+        return Err(Error::UnknownFormat);
+    }
+    let chunks = profile.len().div_ceil(ICC_CHUNK_MAX);
+    let total = u16::try_from(chunks).map_err(|_| Error::UnknownFormat)?;
+    if chunks == 1 {
+        return append_icc_chunk(jpeg, 1, 1, profile);
+    }
+    for (index, part) in profile.chunks(ICC_CHUNK_MAX).enumerate() {
+        append_icc_chunk(jpeg, index as u16 + 1, total, part)?;
+    }
+    Ok(())
+}
+
+/// Splice one `APP2` ICC segment in.
+///
+/// Public because the sequence number is a *fact about the profile* rather than
+/// about the file, and the split-profile test in `colour` writes its halves in
+/// the wrong order on purpose.
+pub fn append_icc_chunk(jpeg: &mut Vec<u8>, sequence: u16, total: u16, part: &[u8]) -> Result<()> {
+    /// "ICC_PROFILE\0", the APP2 identifier an ICC reader looks for.
+    const ICC_ID: [u8; 12] = [
+        0x49, 0x43, 0x43, 0x5F, 0x50, 0x52, 0x4F, 0x46, 0x49, 0x4C, 0x45, 0x00,
+    ];
+    if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return Err(Error::UnknownFormat);
+    }
+    let payload_len = part
+        .len()
+        .checked_add(ICC_ID.len() + 4)
+        .ok_or(Error::UnknownFormat)?;
+    let len = u16::try_from(payload_len + 2).map_err(|_| Error::UnknownFormat)?;
+
+    let mut segment = Vec::with_capacity(payload_len + 4);
+    segment.extend_from_slice(&[0xFF, 0xE2]);
+    segment.extend_from_slice(&len.to_be_bytes());
+    segment.extend_from_slice(&ICC_ID);
+    segment.extend_from_slice(&sequence.to_be_bytes());
+    segment.extend_from_slice(&total.to_be_bytes());
+    segment.extend_from_slice(part);
+
+    // Before any other marker, as `append_exif` does: readers take the first.
+    jpeg.splice(2..2, segment);
+    Ok(())
+}
+
+/// Splice an `iCCP` chunk carrying an ICC profile into encoded PNG bytes.
+///
+/// The chunk goes immediately after `IHDR`, which is where the PNG spec requires
+/// it, and its payload is a keyword, a NUL, the compression method and a
+/// **zlib-compressed** profile — so an uncompressed payload would be a chunk
+/// every reader rejects, which is why `flate2` is in the tree.
+///
+/// Takes bytes rather than an image on purpose: the caller has already encoded,
+/// and re-encoding to attach three kilobytes of profile would change the pixels
+/// and the file size for no reason.
+pub fn png_insert_icc(png: &mut Vec<u8>, profile: &[u8]) -> Result<()> {
+    use std::io::Write;
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    /// 4 length + 4 type + 13 IHDR data + 4 CRC.
+    const AFTER_IHDR: usize = 8 + 25;
+
+    if profile.is_empty() {
+        return Err(Error::UnknownFormat);
+    }
+    if !png.starts_with(&SIGNATURE) || png.len() < AFTER_IHDR {
+        return Err(Error::UnknownFormat);
+    }
+
+    let mut compressed = Vec::new();
+    flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::default())
+        .write_all(profile)
+        .map_err(Error::Io)?;
+    if compressed.is_empty() {
+        return Err(Error::UnknownFormat);
+    }
+
+    // keyword \0 compression-method zlib-profile. The keyword is 1-79 printable
+    // Latin-1 characters with no leading or trailing space; the spec reserves
+    // `ICC` and recommends it here.
+    let mut data = Vec::with_capacity(compressed.len() + 5);
+    data.extend_from_slice(b"ICC");
+    data.push(0);
+    data.push(0);
+    data.extend_from_slice(&compressed);
+
+    let len = u32::try_from(data.len()).map_err(|_| Error::UnknownFormat)?;
+    let mut chunk = Vec::with_capacity(data.len() + 12);
+    chunk.extend_from_slice(&len.to_be_bytes());
+    chunk.extend_from_slice(b"iCCP");
+    chunk.extend_from_slice(&data);
+    chunk.extend_from_slice(&crc32fast::hash(&chunk).to_be_bytes());
+
+    png.splice(AFTER_IHDR..AFTER_IHDR, chunk);
     Ok(())
 }
 

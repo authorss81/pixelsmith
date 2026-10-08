@@ -7,6 +7,7 @@
 //! 4. **Predictable pipeline.** Transform order is fixed: crop -> orient -> resize.
 //!    See [`pipeline`].
 
+pub mod colour;
 pub mod error;
 pub mod exif;
 pub mod ffi;
@@ -23,6 +24,7 @@ pub mod target;
 pub mod validate;
 pub mod worker;
 
+pub use colour::{ColourOptions, ColourOutcome, ColourProfile, ColourSpace};
 pub use error::{Error, Result};
 pub use format::{ChromaSubsampling, EncodingOptions, OutputFormat, detect_format};
 pub use pipeline::{CropSpec, FitMode, Orientation, Pipeline, ResampleFilter, ResizeSpec};
@@ -126,8 +128,13 @@ pub fn process(
     encoding: EncodingOptions,
     limits: &Limits,
 ) -> Result<Vec<u8>> {
-    let decoded = decode_bounded(input, limits)?;
-    let out = pipeline.apply(&decoded)?;
+    // The report is read here rather than left to `decode_bounded` so the file's
+    // container is walked once: it carries both the geometry the decoder needs and
+    // the colour profile this function applies.
+    let report = validate::validate_bytes(input, limits)?;
+    let decoded = decode_known(input, limits, report.format)?;
+    let (converted, _) = colour::apply(&decoded, &report.colour, pipeline.colour, format)?;
+    let out = pipeline.apply(&converted)?;
     let stripped = if pipeline.strip_metadata {
         crate::exif::strip(&out)?
     } else {
@@ -145,6 +152,19 @@ pub fn process(
 /// Decode with all limits enforced.
 pub fn decode_bounded(input: &[u8], limits: &Limits) -> Result<image::DynamicImage> {
     let format = validate::validate_bytes(input, limits)?.format;
+    decode_known(input, limits, format)
+}
+
+/// The decode itself, for a caller that already knows the format.
+///
+/// Split out so [`process`] can carry the `ValidateReport` it built anyway into
+/// the decode instead of making the container be walked twice — once for the
+/// geometry and once for the ICC profile.
+fn decode_known(
+    input: &[u8],
+    limits: &Limits,
+    format: OutputFormat,
+) -> Result<image::DynamicImage> {
     let img = match format {
         // A HEIF file's geometry is in a container box, so the decoder that
         // understands the container is also the one that enforces the limits.

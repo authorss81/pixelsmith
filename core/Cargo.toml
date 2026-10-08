@@ -68,6 +68,15 @@ base64 = { version = "0.23.1", features = ["alloc"] }
 # phase-07 needs an encoder that has them; see docs/JPEG.md for why this one.
 # Pure Rust, no C, no build script.
 jpeg-encoder = "0.6"
+# The ICC profile reader in `colour.rs` has to inflate a PNG's `iCCP` chunk, and
+# the writer that puts one there has to deflate it. `flate2` with no features is
+# miniz_oxide, which `image`, `png` and `zip` already pull in at these versions:
+# two lines in the lockfile, no new crate, pure Rust, no build script.
+flate2 = "1"
+# CRC-32 for that same chunk. `png` depends on it at the same version, so it is
+# already compiled; naming it directly is the honest way to write a PNG chunk
+# rather than hand-rolling the checksum.
+crc32fast = "1"
 
 # `setrlimit`/`getrlimit` for the sandbox's address-space ceiling. Unix-only,
 # already in the dependency tree through rayon and friends, and not a

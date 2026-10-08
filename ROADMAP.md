@@ -69,7 +69,10 @@ the user about what it did to their file.
 - **Print sizing**: dimensions in cm/inches at a stated DPI, with a paper-size picker.
 - **RAW** (CR2/CR3/NEF/ARW/DNG) if the licence situation works out.
 - **Developer presets**: full Android density set, iOS app icon, store screenshot sizes.
-- **Colour conversion options**: sRGB / Display-P3, and explicit gamma handling.
+- **[done]** **Colour conversion**: sRGB and Display-P3, with the ICC profile read
+  and reported. Explicit gamma handling is *not* done — the engine uses the sRGB
+  transfer function for every profile, which `docs/ARCHITECTURE.md` states rather
+  than hides.
 - **Progressive JPEG** toggle for web delivery.
 - **Chroma subsampling control** for JPEG, which is often a bigger lever than quality.
 

@@ -25,6 +25,11 @@ pub struct ExifInfo {
     /// Tags a user most likely wants gone, surfaced so the UI can say "this file
     /// carries GPS coordinates" before anything is stripped.
     pub sensitive_tags: Vec<String>,
+    /// The colour profile the file carries, which is metadata in the sense a user
+    /// means but not in the sense this module does: dropping it changes what the
+    /// pixels mean, so it is reported rather than quietly stripped, and the
+    /// pipeline converts before it strips. See [`crate::colour`].
+    pub colour: crate::colour::ColourProfile,
 }
 
 pub fn has_exif(bytes: &[u8]) -> bool {
@@ -33,10 +38,19 @@ pub fn has_exif(bytes: &[u8]) -> bool {
         .is_ok()
 }
 
-/// Read every EXIF tag we can render as text.
+/// Read every EXIF tag we can render as text, plus the colour profile.
+///
+/// The two are read together because both are "what this file says about itself"
+/// and the UI asks for them together — but they are handled differently on the
+/// way out. EXIF is stripped by re-encoding; the ICC profile is converted and
+/// then dropped, because dropping it without converting it is a colour change
+/// rather than a hygiene step. See [`crate::colour`].
 pub fn read(bytes: &[u8]) -> Result<ExifInfo> {
     let reader = exif::Reader::new();
-    let mut info = ExifInfo::default();
+    let mut info = ExifInfo {
+        colour: colour_profile(bytes),
+        ..ExifInfo::default()
+    };
 
     // No EXIF is the common case for PNG and WebP. It is not a failure.
     let Ok(exif) = reader.read_from_container(&mut std::io::Cursor::new(bytes)) else {
@@ -84,6 +98,19 @@ pub fn read(bytes: &[u8]) -> Result<ExifInfo> {
     }
 
     Ok(info)
+}
+
+/// Read a file's colour profile, for callers that have no `OutputFormat` yet.
+///
+/// Format detection is asked for here rather than passed in, because this is the
+/// entry point the FFI's `px_exif` uses and it has nothing but bytes. A file
+/// whose container cannot be identified is untagged, which is the same answer a
+/// file with no profile gets — and neither is a failure.
+fn colour_profile(bytes: &[u8]) -> crate::colour::ColourProfile {
+    match crate::format::detect_format(bytes) {
+        Ok(format) => crate::colour::ColourProfile::read(bytes, format),
+        Err(_) => crate::colour::ColourProfile::untagged(),
+    }
 }
 
 /// Strip the quotes `display_value` wraps around ASCII values.
@@ -236,6 +263,48 @@ mod tests {
         let info = read(b"this is not a jpeg").unwrap();
         assert!(info.entries.is_empty());
         assert!(!info.has_gps);
+        assert_eq!(info.colour, crate::colour::ColourProfile::untagged());
+    }
+
+    /// Metadata and colour profile are read together and reported together,
+    /// because the UI asks about a file and a file has both — but they are
+    /// stripped differently, which is why both answers are on the same struct.
+    #[test]
+    fn a_colour_profile_is_reported_next_to_the_metadata() {
+        let mut jpeg = crate::colour::fixtures::encode_with(
+            &noisy(16, 16),
+            OutputFormat::Jpeg,
+            Some(&crate::colour::fixtures::p3_profile()),
+        );
+        let block =
+            build_block(&[field(exif::Tag::Make, exif::In::PRIMARY, ascii("Nikon"))]).unwrap();
+        crate::format::append_exif(&mut jpeg, &block).unwrap();
+
+        let info = read(&jpeg).unwrap();
+        assert_eq!(info.camera.as_deref(), Some("Nikon"));
+        assert!(info.colour.icc_present);
+        assert_eq!(info.colour.source, crate::colour::ColourSpace::DisplayP3);
+        assert_eq!(
+            info.colour.icc_bytes,
+            crate::colour::fixtures::p3_profile().len()
+        );
+    }
+
+    /// A file with no EXIF still has a colour profile, and reporting one without
+    /// the other is how a user ends up told their P3 photo has no colour
+    /// information in it.
+    #[test]
+    fn a_profile_survives_on_a_file_with_no_exif_at_all() {
+        let png = crate::colour::fixtures::encode_with(
+            &noisy(16, 16),
+            OutputFormat::Png,
+            Some(&crate::colour::fixtures::p3_profile()),
+        );
+        let info = read(&png).unwrap();
+        assert!(info.entries.is_empty());
+        assert!(!has_exif(&png), "the fixture is not meant to carry EXIF");
+        assert!(info.colour.icc_present);
+        assert_eq!(info.colour.source, crate::colour::ColourSpace::DisplayP3);
     }
 
     #[test]

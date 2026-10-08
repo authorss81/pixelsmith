@@ -55,6 +55,34 @@ pub enum Error {
     #[error("this image cannot be written as WebP because {0}.")]
     Webp(&'static str),
 
+    /// The file's colour space cannot be converted into the output's. The message
+    /// is a sentence written for a person and names the space, the alternative
+    /// and the opt-out — see [`crate::colour::unsupported_note`].
+    ///
+    /// Its own variant rather than a string on `UnsupportedFormat` because the
+    /// user's file is perfectly fine and perfectly readable: it is the *export*
+    /// this build cannot carry out, which is a different thing to say and a
+    /// different thing for the user to do about.
+    #[error("{0}")]
+    UnsupportedColourSpace(String),
+
+    /// Two options in one request that contradict each other. Rare in practice
+    /// and impossible from a UI that is in sync, which is exactly why it is
+    /// refused in a sentence rather than resolved by picking a winner.
+    #[error("{0}")]
+    ConflictingOptions(&'static str),
+
+    /// A request to carry the file's ICC profile into the output, which this
+    /// build cannot carry out — either because the format has nowhere to put it or
+    /// because the file has no profile to carry.
+    ///
+    /// Its own variant because both cases need a sentence that says what to do
+    /// next, and neither of them is a decode failure or a format the engine cannot
+    /// write: the export would have worked perfectly well with the option turned
+    /// off.
+    #[error("{0}")]
+    ColourProfile(&'static str),
+
     #[error("output could not be written: {0}")]
     Io(#[source] io::Error),
 

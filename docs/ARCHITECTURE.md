@@ -9,9 +9,9 @@ and `AGENTS.md` disagree, `AGENTS.md` wins.
 
 ## Module map
 
-Fourteen modules, one submodule, no circular references. Dependencies point downward:
-`lib.rs` → `worker.rs` / `pipeline.rs` → `resize.rs` → `validate.rs` / `heic.rs` → `error.rs`.
-Nothing below `error.rs` knows anything exists above it.
+Fifteen modules, one submodule, no circular references. Dependencies point downward:
+`lib.rs` → `worker.rs` / `pipeline.rs` / `colour.rs` → `resize.rs` → `validate.rs` /
+`heic.rs` → `error.rs`. Nothing below `error.rs` knows anything exists above it.
 
 | Module | Owns | Key types |
 | --- | --- | --- |
@@ -23,6 +23,7 @@ Nothing below `error.rs` knows anything exists above it.
 | `core/src/pipeline.rs` | The transform. Owns the crop/orient/resize order and the EXIF orientation table. Knows nothing about files, encoders or Dart. | `Pipeline`, `CropSpec`, `Orientation`, `ResizeSpec`, `FitMode`, `ResampleFilter`, `resize_to()` |
 | `core/src/stream.rs` | The low-peak-memory decode, behind `streaming`: decode a row at a time, resample it into the destination in the same pass. One resampling pass, one output-sized buffer. | `decode_resized()`, `working_set_bytes()`, `Axis` |
 | `core/src/resize.rs` | The single resampling pass and the two kernels that can perform it: `image`'s reference implementation (the default, and the oracle) and `fast_image_resize` behind the `simd` feature. Exists so hard rule 5 has exactly one call site and a benchmark times the same entry point production uses. | `resample()`, `resample_reference()`, `simd::try_resample()` |
+| `core/src/colour.rs` | Colour management: reading an ICC profile out of a container, naming the space, and converting Display-P3 to sRGB with the sRGB transfer function. Not an ICC engine, and says so. | `ColourSpace`, `ColourProfile`, `ColourOptions`, `ColourOutcome`, `convert()`, `apply()` |
 | `core/src/exif.rs` | Metadata. Reading for the report, stripping by re-encoding, and a filtered write-back that never carries GPS or maker notes. | `read()`, `strip()`, `write_back()`, `ExifInfo` |
 | `core/src/target.rs` | "Make this file fit under N bytes", solved by binary search over quality rather than a slider the user has to guess at. | `TargetBytes`, `Encoder` (injected so the search is testable without pixels) |
 | `core/src/presets.rs` | The preset catalogue, grouped by intent and carrying a `category` so the UI can present tabs. Custom values are always allowed. | `Preset`, `PRESETS`, `all_presets()`, `find_preset()`, `to_pipeline()` |
@@ -42,11 +43,14 @@ bytes off disk
   → validate::validate_bytes   input size, magic bytes, header dimensions
                               (heic::header for HEIF, image header otherwise)
   → lib::decode_bounded        decoder limits applied, then decode, then re-check
+  → colour::apply              source space → working space, before the geometry:
+                              a Cow, so an untagged or sRGB file touches no pixel
   → pipeline::Pipeline::apply  crop → orient → resize (one resampling pass)
   → resize::resample           the one resampling pass: reference kernel, or
                               fast_image_resize when `simd` is on
   → exif::strip                re-encode from raw samples (drops EXIF for real)
   → target / format::encode    byte-target search, or a fixed-quality encode
+  → format::append_icc         only if embed_profile was asked for, JPEG/PNG only
   → format::append_exif        only if metadata was explicitly kept, JPEG only
   → worker::sanitise_stem      output name, filtered against traversal
   → Vec<u8>
@@ -90,6 +94,18 @@ cancelled file carries, which is the same claim. Before phase-07 the engine
 reported the *requested* 85 for a PNG, next to a file whose size the slider never
 influenced.
 
+### What would change the chroma default
+
+Phase-12 added colour management, and with it ICC colour in the output that
+4:2:0 was never discarding. The measurement in the section above was taken before
+any of that: a Display-P3 photograph decoded correctly has chroma detail the sRGB
+pipeline never had, so a third of the chroma samples is now a third of something
+visible. The default has not moved on the strength of a prediction. The next
+measurement to take is a P3 fixture through the same bars as
+`format::tests::colour_bars`, and if the blue-difference error at 4:2:0 is
+materially worse on saturated P3 content than the 21.75 recorded above, the
+default moves to 4:2:2 rather than being argued about.
+
 ### Why 4:2:0 is the default
 
 The phase prompt asked for the argument rather than the number, so here it is.
@@ -127,12 +143,6 @@ with text on a coloured background. The JSON request carries
 work, and `ChromaSubsampling::trade_off()` is a tooltip the UI can show verbatim.
 Nothing is applied silently: `ChromaSubsampling` is `#[serde(default)]` at
 4:2:0 and the doc comment on the enum says why.
-
-**What would change it.** Phase-12. Once ICC profiles are applied, a Display-P3
-photograph decoded correctly will have chroma detail the sRGB pipeline never had,
-and 4:2:0 will start discarding something a user can see. If that turns out to be
-visible on real phone photographs, the default has to move to 4:2:2 — the middle
-level exists for exactly that, and it is 18% off 4:4:4 here rather than 33%.
 
 ### Progressive JPEG
 
@@ -305,9 +315,11 @@ the picture by a `cdsc` relation — not in a JPEG APP1 segment and not in a PNG
 chunk. `exif::read` cannot see one, so `heic::header` reports `has_exif` from
 the container and `validate_bytes` uses it, or the UI would tell a user their
 iPhone photo carries no metadata while a GPS fix is sitting in the file. Reading
-the tags themselves is phase-12 work; until then they are neither read nor
-written back, which means they are also not carried through, because the pipeline
-re-encodes from raw samples.
+the tags themselves is not done, and phase-12 — which was about colour — did not do
+it: a HEIF's `Exif` item needs the same box walker a HEIF's `colr` property needs,
+and phase-12 built neither. Until then they are neither read nor written back, which
+means they are also not carried through, because the pipeline re-encodes from raw
+samples.
 
 `exif::strip` strips by **re-encoding from raw samples** — it builds a fresh
 `RgbaImage` and drops the original container — not by clearing tags. Clearing
@@ -321,6 +333,131 @@ when the user explicitly kept metadata, and it filters through `is_sensitive`
 MAKERNOTE, LENS, BODY or THUMBNAIL is dropped. `worker::process_one` calls it
 with `keep_gps: false` and the UI does not offer the flag, so GPS is not
 reachable through the product at all.
+
+## Colour management
+
+An untagged file is assumed to be sRGB, which is right. Before phase-12 a *tagged*
+file simply had its tag dropped: a photograph shot on a wide-gamut phone, whose
+pixels are Display-P3, came out with those same numbers now read as sRGB. That is
+not metadata hygiene — stripping a profile without converting it is a colour
+change, and hard rule 6 does not excuse it.
+
+### The path, and where it runs
+
+```text
+source space  →  working space  →  output space
+(from the file)   (sRGB by default)   (the working space, untagged)
+```
+
+`colour::apply` is the whole decision, and `worker::process_one` calls it
+**after the decode and before `pipeline.apply`**. Before the geometry, because the
+source space is a fact about the file while the working space is where the rest of
+the chain expects to be, and converting after a downscale would resample values in
+the wrong space. It is not part of `Pipeline::apply`, because that function is
+documented as knowing nothing about files — and a file's colour space is a property
+of the file.
+
+The default case touches no pixel at all: `convert` returns a `Cow`, and an
+untagged or sRGB source is borrowed. `worker::tests::an_untagged_photo_exports_byte_for_byte_as_it_did_before`
+is the assertion, because "less memory" is not the claim — *identical bytes* is.
+
+### Three answers, and why the default is the first
+
+| `ColourOptions` | What happens | When to want it |
+| --- | --- | --- |
+| default | convert to the working space (sRGB), drop the profile | almost always: the file's values now mean sRGB, and an untagged JPEG means sRGB to every reader that will ever open it |
+| `keep_source_pixels` | no conversion, no profile, values untouched | when the output is going somewhere that honours the *original* profile, and the user has said so |
+| `embed_profile` | no conversion, the source profile is written into the output | same, but self-contained: a viewer that reads profiles renders it correctly |
+
+The profile is dropped in the default case **because** the pixels were moved into
+the space it described, not in spite of it. The two opt-outs both exist because
+converting is a loss of information: `clipping_is_what_costs_a_p3_colour_its_out_of_gamut_colour`
+asserts what that costs. Asking for both at once is refused
+(`ColourOptions::validate`), because two checkboxes that contradict each other is
+a UI that has got out of sync, not a request to guess at.
+
+Embedding is supported for JPEG and PNG (`format::append_icc`,
+`format::png_insert_icc`) and **refused for WebP** with a sentence naming JPEG and
+PNG. That is a statement about what has been written and tested, not about what
+WebP allows: an `ICCP` chunk turns a simple lossy WebP into an extended `VP8X` one
+and there is no WebP reader in this tree to check the result against. What gets
+embedded is the *original* profile, re-read from the source container, never a
+synthesised one — a profile a phone wrote is the only one this engine has any
+business putting back into a file.
+
+### Which containers are read
+
+`colour::containers_read()` returns both lists, so the gap is declared rather than
+discovered:
+
+| Read | Not read |
+| --- | --- |
+| JPEG `APP2` (`ICC_PROFILE\0`, reassembled in sequence order) | HEIF/HEIC `colr` |
+| PNG `iCCP` (zlib, hence `flate2`) | TIFF |
+| WebP `ICCP` | BMP, GIF, ICO — nowhere to put one |
+
+**HEIF is the one that will be asked about first**, because an iPhone photographs
+HEIC and in Display-P3 when "most compatible" is off. `heic.rs` has no box walker
+to reuse and reading a fourth container is a change to that module's stated job
+rather than to this one, so it is named here instead. A HEIC in this build is
+therefore reported as untagged and exported as sRGB — which is what a reader
+without the profile does with those numbers anyway, and is the safe direction:
+wrong values described as untagged rather than wrong values described as P3.
+
+### What is implemented, and what is approximated
+
+Two matrix-shaper RGB spaces, **sRGB** and **Display-P3**, both using the sRGB
+transfer function, and an untagged input assumed to be sRGB. That is the entire
+claim. Not ICC conformance, and the approximations are listed rather than buried:
+
+* **The transfer function is assumed, not read.** Every profile is treated as
+  using the IEC 61966-2-1 piecewise curve. It is *not* a straight gamma 2.2, which
+  is the most common bug in this whole area — at mid-grey the sRGB curve gives
+  0.7354 and gamma 2.2 gives 0.7296, five code values on an 8-bit scale.
+  `colour::tests::the_transfer_function_is_the_srgb_curve_not_gamma_22` is written
+  to fail if the two ever come out the same, because a round-trip assertion would
+  happily pass for either.
+* **Gamut mapping is clipping.** A P3 colour outside sRGB is clipped per channel,
+  which is what every other tool does and is *not* perceptual: a saturated P3 red
+  clips to pure sRGB red rather than being desaturated towards its own luminance.
+* **Classification is by colorant.** A profile is called sRGB or P3 by comparing
+  its `rXYZ`/`gXYZ`/`bXYZ` chromaticities against two reference sets after undoing
+  ICC's D50 adaptation (Bradford), with the `desc`/`mluc` tag as the fallback.
+  Colorants first because they are a measurement while the description is a string
+  two unrelated profiles share. Tolerance 0.004 in `xy`, where the two spaces are
+  about 0.04 apart.
+* **The matrix is derived, not pasted.** `colour::matrix` inverts the RGB→XYZ
+  matrix built from the reference primaries, so the two sets of primaries are the
+  only numbers in the tree that a reader has to trust.
+  `the_derived_matrix_is_the_published_one` checks the result against CSS Color
+  4's published Display-P3 → sRGB matrix to 5e-4 — the tolerance is that wide
+  because the two published derivations disagree by about 2e-4 on the first
+  coefficient, which is a twentieth of one code value on an 8-bit output.
+* **LUT-based (A2B0/B2A0) display profiles are not evaluated.** They classify from
+  their colorants — which v4 requires of every RGB display profile — but their tone
+  curve is ignored.
+* **CMYK, Lab and grayscale are not converted.** They are recognised and refused
+  in a sentence (`colour::unsupported_note`) rather than mishandled, and the
+  sentence always names the space, the alternative and the opt-out.
+
+### The interaction with stripping
+
+`exif::strip` re-encodes from raw samples and therefore drops the ICC profile as a
+side effect of dropping the container. That is only correct because the pixels were
+converted first: a stripped P3 photo is an sRGB photo with an sRGB body, rather
+than P3 values wearing an sRGB label.
+`worker::tests::a_p3_photo_stripped_of_its_profile_is_converted_rather_than_left_alone`
+is the test that says so, and it compares against the *naive path* — the same photo
+with `keep_source_pixels` — rather than a hard-coded triple, because the naive path
+is exactly what the engine used to do and exactly what it must now not do.
+
+### What the JSON contract carries
+
+| Field | Where | What the UI can say |
+| --- | --- | --- |
+| `colour.icc_present` / `colour.source` / `colour.declared` / `colour.description` / `colour.icc_bytes` | `ValidateReport`, `ExifInfo` | "Display-P3 — this will be converted to sRGB", before the user exports |
+| `colour.working_space`, `keep_source_pixels`, `embed_profile` | `Pipeline` | the three answers above; `#[serde(default)]`, so a request from an older app still means "convert to sRGB" |
+| `Outcome.colour.source` / `.output` / `.converted` / `.profile_embedded` | `Outcome` | what actually happened to the file that was just written |
 
 ## Format detection
 
@@ -716,6 +853,26 @@ named so you can check the handling rather than re-derive it.
     this file quoted as "the SIMD resize kernel is 8× faster" without the ISA is
     a claim about a runner, not about the phone this engine ships to. Handled in
     `core/examples/resize_bench.rs` (`machine()`).
+
+27. **A gamut mapping that "looks right" is not a gamut mapping.** Converting a
+    saturated Display-P3 red to sRGB by clipping per channel gives pure sRGB red,
+    which is *correct* and *not perceptual* — the colour a photographer chose is
+    replaced by one on the sRGB gamut boundary, and no amount of resampling puts it
+    back. A real gamut mapper desaturates towards the achromatic axis and keeps the
+    hue; this one clips, because that is what every other tool does and a hue-
+    preserving mapper is a different and much larger module. The cost is asserted
+    rather than argued about: `clipping_is_what_costs_a_p3_colour_its_out_of_gamut_colour`
+    holds that an out-of-gamut P3 colour does *not* round-trip, so a future
+    replacement has to come with a new expectation rather than silently changing
+    what "converted" means. Handled in `core/src/colour.rs` (`convert`).
+28. **`exif::strip` drops the ICC profile as a side effect, and that is only
+    correct because the pixels were converted first.** The order in
+    `worker::process_one` is decode → colour → geometry, and putting the conversion
+    after `exif::strip` would produce a file that was P3 all the way to the encoder
+    and then untagged sRGB — the exact bug this phase exists to fix, in a place
+    where no test looking at "metadata stripped" would have found it. Handled in
+    `core/src/worker.rs` (`process_one`) and pinned by
+    `a_p3_photo_stripped_of_its_profile_is_converted_rather_than_left_alone`.
 
 ## Verification
 

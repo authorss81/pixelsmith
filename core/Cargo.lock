@@ -910,8 +910,10 @@ name = "pixelsmith_core"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "crc32fast",
  "criterion",
  "fast_image_resize",
+ "flate2",
  "heic-rs",
  "image",
  "jpeg-encoder",

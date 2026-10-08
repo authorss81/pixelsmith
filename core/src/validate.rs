@@ -183,6 +183,11 @@ pub struct ValidateReport {
     pub has_animated: bool,
     pub sensitive_tags: Vec<String>,
     pub orientation: Option<u32>,
+    /// The colour profile the file carries, or that it does not. This is the
+    /// field that lets the UI say "Display-P3: this photo will be converted to
+    /// sRGB" *before* the user exports, which is the whole difference between
+    /// colour management and colour management by surprise.
+    pub colour: crate::colour::ColourProfile,
     /// Human-readable warning. `None` means the file looks ordinary.
     pub suspicious: Option<String>,
 }
@@ -262,6 +267,10 @@ pub fn validate_bytes(input: &[u8], limits: &Limits) -> Result<ValidateReport> {
         has_animated: format.supports_animation() && count_frames(input, format) > 1,
         sensitive_tags: exif.sensitive_tags.clone(),
         orientation: exif.orientation,
+        // Taken from the `exif::read` above rather than re-walked: it read the
+        // same container to find the colour profile, and two walks of a
+        // hostile container per file is two chances to be wrong.
+        colour: exif.colour,
         suspicious,
     })
 }
@@ -283,6 +292,7 @@ fn count_frames(input: &[u8], format: crate::format::OutputFormat) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colour::ColourSpace;
 
     fn jpeg(w: u32, h: u32) -> Vec<u8> {
         crate::encode_fixed(
@@ -367,5 +377,65 @@ mod tests {
         assert!(m.max_pixels < d.max_pixels);
         assert!(m.max_dimension < d.max_dimension);
         assert!(m.max_input_bytes < d.max_input_bytes);
+    }
+
+    /// The report is how the UI learns a photo is wide-gamut *before* the user
+    /// exports, so all three states have to be distinguishable in it: no profile,
+    /// an sRGB profile, and a Display-P3 profile.
+    #[test]
+    fn the_report_names_the_colour_space_of_a_file() {
+        let patch = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            32,
+            32,
+            image::Rgb([200, 100, 90]),
+        ));
+        let cases = [
+            (None, ColourSpace::Untagged, false),
+            (
+                Some(crate::colour::fixtures::srgb_profile()),
+                ColourSpace::Srgb,
+                true,
+            ),
+            (
+                Some(crate::colour::fixtures::p3_profile()),
+                ColourSpace::DisplayP3,
+                true,
+            ),
+        ];
+        for (icc, expected, has_icc) in cases {
+            let bytes = crate::colour::fixtures::encode_with(
+                &patch,
+                crate::format::OutputFormat::Jpeg,
+                icc.as_deref(),
+            );
+            let report = validate_bytes(&bytes, &Limits::default()).unwrap();
+            assert_eq!(report.colour.source, expected);
+            assert_eq!(report.colour.icc_present, has_icc, "{expected:?}");
+            if has_icc {
+                assert_eq!(report.colour.declared.as_deref(), Some("RGB"));
+            } else {
+                assert_eq!(report.colour.declared, None);
+                assert_eq!(report.colour.icc_bytes, 0);
+            }
+        }
+    }
+
+    /// The report and `exif::read` are two doors onto the same reading, and a UI
+    /// that showed the colour from one and the metadata from the other would be
+    /// showing two different facts about one file.
+    #[test]
+    fn the_report_and_the_metadata_read_agree_about_the_colour() {
+        let bytes = crate::colour::fixtures::encode_with(
+            &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                32,
+                32,
+                image::Rgb([1, 2, 3]),
+            )),
+            crate::format::OutputFormat::Jpeg,
+            Some(&crate::colour::fixtures::p3_profile()),
+        );
+        let report = validate_bytes(&bytes, &Limits::default()).unwrap();
+        let exif = crate::exif::read(&bytes).unwrap();
+        assert_eq!(report.colour, exif.colour);
     }
 }

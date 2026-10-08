@@ -186,6 +186,20 @@ pub struct Pipeline {
     /// asked for on the path a UI uses (`Pipeline`) rather than a silent no-op.
     #[serde(default)]
     pub chroma_subsampling: ChromaSubsampling,
+    /// What to do with the file's colour profile: convert to the working space,
+    /// carry the profile through, or keep the raw values. Defaults to converting
+    /// to sRGB and dropping the profile.
+    ///
+    /// It lives here rather than in `Settings` for the same reason
+    /// [`Self::chroma_subsampling`] does: it is a decision about the picture,
+    /// and the source space it is applied to is a fact about *this* file rather
+    /// than about the batch.
+    ///
+    /// `#[serde(default)]` because a request written by an app predating this
+    /// phase has no colour block at all, and it has to keep meaning what it
+    /// meant.
+    #[serde(default)]
+    pub colour: crate::colour::ColourOptions,
 }
 
 impl Pipeline {

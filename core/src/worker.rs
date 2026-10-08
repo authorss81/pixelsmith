@@ -10,6 +10,7 @@
 //! * **Accounting.** Every batch returns per-file success *and* failure, so one
 //!   unreadable file in a folder of 200 does not discard the other 199.
 
+use crate::colour::ColourOutcome;
 use crate::error::{Error, Result};
 use crate::format::{EncodingOptions, OutputFormat};
 use crate::pipeline::{Orientation, Pipeline};
@@ -91,6 +92,10 @@ pub struct Outcome {
     pub quality_used: u8,
     /// False when the byte target could not be met.
     pub target_met: bool,
+    /// What the engine did about colour, so the UI can say "this was a
+    /// Display-P3 photo and is now sRGB" next to the file it just wrote rather
+    /// than leaving the user to notice.
+    pub colour: ColourOutcome,
     pub error: Option<String>,
 }
 
@@ -165,11 +170,24 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
     // decoded, so the user gets a sentence about their settings rather than a
     // file that quietly misses the ceiling they asked for.
     settings.validate()?;
+    // The same for the two colour answers that contradict each other: refused here
+    // rather than resolved by picking a winner at the encode.
+    pipeline.colour.validate()?;
     // Header check first: it rejects a hostile file before we allocate a
     // pixel buffer for it. The streaming path re-reads it rather than trusting
     // this call, because it is the header check that makes row-at-a-time decoding
     // safe.
     let report = crate::validate::validate_bytes(&job.bytes, &settings.limits)?;
+
+    let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
+
+    // Colour first, geometry second, and it has to be first: the source space is a
+    // fact about the file, the working space is where the rest of the chain
+    // expects to be, and converting after a downscale would resample values in the
+    // wrong space. It is also a no-op for an untagged or sRGB file, so the common
+    // path allocates nothing — see `colour::apply`.
+    let (working_colour, colour) =
+        crate::colour::apply(&decoded, &report.colour, pipeline.colour, settings.format)?;
 
     // Behind `streaming`: decode straight into the resized destination instead of
     // materialising the source first. Chosen here rather than inside the pipeline
@@ -181,18 +199,13 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         pipeline,
         &settings.limits,
         (report.width, report.height),
+        colour.converted,
     )? {
         Some(img) => img,
-        None => {
-            let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
-            pipeline.apply(&decoded)?
-        }
+        None => pipeline.apply(&working_colour)?,
     };
     #[cfg(not(feature = "streaming"))]
-    let out = {
-        let decoded = crate::decode_bounded(&job.bytes, &settings.limits)?;
-        pipeline.apply(&decoded)?
-    };
+    let out = pipeline.apply(&working_colour)?;
 
     // Re-encoding from raw samples is what actually removes EXIF. If the user
     // opted to keep metadata we graft it back, minus anything sensitive.
@@ -242,6 +255,25 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         crate::exif::write_back(&job.bytes, &mut bytes, false)?;
     }
 
+    // The opt-in third answer to "what happens to the profile": carry the source
+    // profile into the output so the values keep their meaning for a
+    // colour-managed viewer. The original bytes are re-read rather than cached in
+    // the report, because putting three kilobytes of profile in every
+    // `ValidateReport` the UI receives would be absurd.
+    if colour.profile_embedded
+        && let Some(icc) = crate::colour::profile_bytes(&job.bytes, report.format)
+    {
+        match settings.format {
+            OutputFormat::Jpeg => crate::format::append_icc(&mut bytes, &icc)?,
+            OutputFormat::Png => crate::format::png_insert_icc(&mut bytes, &icc)?,
+            // Refused in `colour::apply` before a pixel was decoded, so this arm
+            // is unreachable rather than merely unlikely.
+            other => {
+                return Err(Error::ColourProfile(other.icc_note()));
+            }
+        }
+    }
+
     let stem = sanitise_stem(&job.name);
     let outcome = Outcome {
         id: job.id.clone(),
@@ -253,6 +285,7 @@ pub fn process_one(job: &Job, pipeline: &Pipeline, settings: &Settings) -> Resul
         height: working.height(),
         quality_used,
         target_met,
+        colour,
         error: None,
     };
     Ok(Processed { outcome, bytes })
@@ -282,6 +315,7 @@ fn streamed_resize(
     pipeline: &Pipeline,
     limits: &Limits,
     (src_w, src_h): (u32, u32),
+    colour_converted: bool,
 ) -> Result<Option<image::DynamicImage>> {
     if pipeline.crop.is_some() {
         return Ok(None);
@@ -290,6 +324,15 @@ fn streamed_resize(
         .orientation
         .is_some_and(Orientation::needs_transform)
     {
+        return Ok(None);
+    }
+    // A colour conversion needs a decoded picture to apply to, and this path
+    // exists so that a large source never becomes one. The two genuinely do not
+    // fit in one pass: converting afterwards would resample values in the source
+    // space and converting beforehand would materialise exactly what the flag was
+    // added to avoid. So a wide-gamut file takes the in-memory path, which is
+    // also where every P3 file went before this phase.
+    if colour_converted {
         return Ok(None);
     }
     let Some(spec) = pipeline.resize.as_ref() else {
@@ -340,6 +383,7 @@ pub fn process_batch(
                 height: 0,
                 quality_used: 0,
                 target_met: false,
+                colour: ColourOutcome::unknown(),
                 error: Some("cancelled".into()),
             },
             Err(e) => Outcome {
@@ -352,6 +396,7 @@ pub fn process_batch(
                 height: 0,
                 quality_used: 0,
                 target_met: false,
+                colour: ColourOutcome::unknown(),
                 error: Some(e.to_string()),
             },
         })
@@ -500,6 +545,7 @@ pub fn sanitise_path_component(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::colour::ColourSpace;
 
     /// A smooth, compressible, photo-like fixture. Real photographs compress
     /// well; fixtures built from hash noise do not, which makes them useless for
@@ -1197,6 +1243,268 @@ mod tests {
                 .count()
                 <= 65,
             "the 64-char cap must still apply"
+        );
+    }
+
+    // ---- colour ---------------------------------------------------------
+
+    /// A flat mid-saturation red: the content that tells a colour conversion from
+    /// a no-op, and a small enough picture that the assertion can name a pixel.
+    fn red_patch() -> image::DynamicImage {
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            32,
+            32,
+            image::Rgb([200, 100, 90]),
+        ))
+    }
+
+    fn colour_job(name: &str, icc: Option<&[u8]>) -> Job {
+        job(
+            "1",
+            name,
+            crate::colour::fixtures::encode_with(&red_patch(), OutputFormat::Jpeg, icc),
+        )
+    }
+
+    fn first_pixel(bytes: &[u8]) -> [u8; 3] {
+        let px = image::load_from_memory(bytes)
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(0, 0)
+            .0;
+        [px[0], px[1], px[2]]
+    }
+
+    /// The phase's central claim, end to end: stripping the metadata of a
+    /// Display-P3 photo must not leave the file's numbers in place.
+    ///
+    /// The comparison is against the naive path — the same photo exported with
+    /// "keep the original colour values" — rather than against a hard-coded
+    /// triple, because the naive path is exactly what the engine used to do and
+    /// exactly what it must now not do. "The output is not identical" would be a
+    /// weak assertion, so the direction is checked too: a P3 colour read as sRGB
+    /// is duller, so the converted file has to be the *more* saturated one.
+    #[test]
+    fn a_p3_photo_stripped_of_its_profile_is_converted_rather_than_left_alone() {
+        let j = colour_job("p3.jpg", Some(&crate::colour::fixtures::p3_profile()));
+        let converted = process_one(&j, &Pipeline::new(), &Settings::default()).unwrap();
+        let naive = process_one(
+            &j,
+            &Pipeline {
+                colour: crate::colour::ColourOptions {
+                    keep_source_pixels: true,
+                    ..Default::default()
+                },
+                ..Pipeline::new()
+            },
+            &Settings::default(),
+        )
+        .unwrap();
+
+        assert_eq!(converted.outcome.colour.source, ColourSpace::DisplayP3);
+        assert_eq!(converted.outcome.colour.output, ColourSpace::Srgb);
+        assert!(
+            converted.outcome.colour.converted,
+            "the report must say the pixels moved"
+        );
+        assert!(!naive.outcome.colour.converted);
+
+        let (after, before) = (first_pixel(&converted.bytes), first_pixel(&naive.bytes));
+        assert_ne!(
+            after, before,
+            "converting to sRGB must change the pixels; {before:?} == {after:?}"
+        );
+        let saturation = |p: [u8; 3]| {
+            let (r, g, b) = (f32::from(p[0]), f32::from(p[1]), f32::from(p[2]));
+            (r.max(g).max(b) - r.min(g).min(b)) / 255.0
+        };
+        assert!(
+            saturation(after) > saturation(before),
+            "the converted file must be the more saturated one: {before:?} -> {after:?}"
+        );
+    }
+
+    /// An untagged file is the overwhelmingly common case, and it has to be
+    /// completely unaffected: the same bytes, because the pipeline never touched a
+    /// pixel. This is the assertion that a colour feature cannot quietly cost the
+    /// ordinary user anything.
+    #[test]
+    fn an_untagged_photo_exports_byte_for_byte_as_it_did_before() {
+        let j = colour_job("plain.jpg", None);
+        let default = process_one(&j, &Pipeline::new(), &Settings::default()).unwrap();
+        let passthrough = process_one(
+            &j,
+            &Pipeline {
+                colour: crate::colour::ColourOptions {
+                    keep_source_pixels: true,
+                    ..Default::default()
+                },
+                ..Pipeline::new()
+            },
+            &Settings::default(),
+        )
+        .unwrap();
+        assert_eq!(default.bytes, passthrough.bytes);
+        assert_eq!(default.outcome.colour.source, ColourSpace::Untagged);
+        assert!(
+            !default.outcome.colour.converted,
+            "nothing was converted, so nothing may be reported as converted"
+        );
+        // And the picture itself is unchanged, not merely the byte count. One code
+        // of tolerance, because the fixture itself is a JPEG and re-encoding one
+        // moves a channel by one; the byte comparison above is the real claim.
+        for (got, want) in first_pixel(&default.bytes).into_iter().zip([200, 100, 90]) {
+            assert!(got.abs_diff(want) <= 1, "{got} against {want}");
+        }
+    }
+
+    /// The same, for a file that *is* tagged sRGB: a no-op conversion is a no-op.
+    #[test]
+    fn an_srgb_tagged_photo_is_left_exactly_as_it_was() {
+        let j = colour_job("srgb.jpg", Some(&crate::colour::fixtures::srgb_profile()));
+        let p = process_one(&j, &Pipeline::new(), &Settings::default()).unwrap();
+        assert_eq!(p.outcome.colour.source, ColourSpace::Srgb);
+        assert!(!p.outcome.colour.converted);
+        // The profile is dropped because the pixels were moved into the space it
+        // described — not because profiles are stripped on sight.
+        let out_profile = crate::colour::ColourProfile::read(&p.bytes, OutputFormat::Jpeg);
+        assert!(!out_profile.icc_present, "the output carries no profile");
+        for (got, want) in first_pixel(&p.bytes).into_iter().zip([200, 100, 90]) {
+            assert!(got.abs_diff(want) <= 1, "{got} against {want}");
+        }
+    }
+
+    /// The explicit opt-out that keeps a wide-gamut photo wide-gamut: the source
+    /// pixels are untouched and the *original* profile is written back, so the
+    /// values keep their meaning for a viewer that reads profiles.
+    #[test]
+    fn carrying_the_profile_through_keeps_the_original_bytes_and_the_original_pixels() {
+        let icc = crate::colour::fixtures::p3_profile();
+        let j = colour_job("p3.jpg", Some(&icc));
+        let settings = Settings::default();
+        let carried = process_one(
+            &j,
+            &Pipeline {
+                colour: crate::colour::ColourOptions {
+                    embed_profile: true,
+                    ..Default::default()
+                },
+                ..Pipeline::new()
+            },
+            &settings,
+        )
+        .unwrap();
+        let converted = process_one(&j, &Pipeline::new(), &settings).unwrap();
+
+        assert!(carried.outcome.colour.profile_embedded);
+        assert!(!carried.outcome.colour.converted);
+        let carried_profile =
+            crate::colour::ColourProfile::read(&carried.bytes, OutputFormat::Jpeg);
+        assert!(carried_profile.icc_present);
+        assert_eq!(
+            crate::colour::profile_bytes(&carried.bytes, OutputFormat::Jpeg).unwrap(),
+            icc,
+            "the embedded profile must be the source profile, byte for byte"
+        );
+        assert_ne!(
+            first_pixel(&carried.bytes),
+            first_pixel(&converted.bytes),
+            "carrying the profile must not also convert the pixels"
+        );
+    }
+
+    /// Refused rather than half-honoured: a file carrying a profile that does not
+    /// describe its pixels is worse than one carrying none.
+    #[test]
+    fn carrying_a_profile_this_build_cannot_write_is_refused_in_plain_english() {
+        let j = colour_job("p3.jpg", Some(&crate::colour::fixtures::p3_profile()));
+        let err = process_one(
+            &j,
+            &Pipeline {
+                colour: crate::colour::ColourOptions {
+                    embed_profile: true,
+                    ..Default::default()
+                },
+                ..Pipeline::new()
+            },
+            &Settings {
+                format: OutputFormat::WebP,
+                ..Settings::default()
+            },
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("JPEG"),
+            "it should name what to choose: {text}"
+        );
+        assert!(!text.contains("error:"), "reads like a diagnostic: {text}");
+    }
+
+    /// A profile this build cannot convert is a refusal, not a wrong colour. The
+    /// alternative — passing the values through untagged — is the exact bug this
+    /// phase exists to fix, and it is the one answer hard rule 9 forbids.
+    #[test]
+    fn a_space_we_cannot_convert_is_refused_rather_than_passed_through() {
+        let j = colour_job("cmyk.jpg", Some(&crate::colour::fixtures::cmyk_profile()));
+        let err = process_one(&j, &Pipeline::new(), &Settings::default()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("CMYK"), "it should name the space: {text}");
+        assert!(
+            text.contains("keep the original"),
+            "and offer the way out: {text}"
+        );
+    }
+
+    /// A batch reports per file, so a wide-gamut photo next to an ordinary one
+    /// cannot take the ordinary one down with it.
+    #[test]
+    fn a_batch_converts_the_wide_gamut_file_and_leaves_the_others_alone() {
+        let jobs = vec![
+            job(
+                "1",
+                "plain.jpg",
+                crate::colour::fixtures::encode_with(&red_patch(), OutputFormat::Jpeg, None),
+            ),
+            job(
+                "2",
+                "p3.jpg",
+                crate::colour::fixtures::encode_with(
+                    &red_patch(),
+                    OutputFormat::Jpeg,
+                    Some(&crate::colour::fixtures::p3_profile()),
+                ),
+            ),
+            job(
+                "3",
+                "cmyk.jpg",
+                crate::colour::fixtures::encode_with(
+                    &red_patch(),
+                    OutputFormat::Jpeg,
+                    Some(&crate::colour::fixtures::cmyk_profile()),
+                ),
+            ),
+        ];
+        let report = process_batch(
+            &jobs,
+            &Pipeline::new(),
+            &Settings::default(),
+            &CancelToken::new(),
+        );
+        assert_eq!(report.succeeded(), 2);
+        assert_eq!(report.failed(), 1);
+        assert!(!report.outcomes[0].colour.converted);
+        assert!(report.outcomes[1].colour.converted);
+        assert_eq!(report.outcomes[1].colour.source, ColourSpace::DisplayP3);
+        // And the failed file says nothing about colour rather than claiming the
+        // default.
+        assert_eq!(report.outcomes[2].colour, ColourOutcome::unknown());
+        assert!(
+            report.outcomes[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("CMYK")
         );
     }
 

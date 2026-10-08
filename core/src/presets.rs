@@ -660,6 +660,11 @@ pub fn to_pipeline(p: &Preset) -> (crate::pipeline::Pipeline, OutputFormat, u8, 
         resize: Some(resize),
         strip_metadata: true,
         chroma_subsampling: p.chroma,
+        // Every preset converts to the working space and drops the profile, which
+        // is the right answer for a preset: a user who picked "Instagram square"
+        // wants a JPEG their phone will show correctly, not one carrying a colour
+        // profile half of them will ignore.
+        colour: crate::colour::ColourOptions::default(),
     };
     let max_bytes = p.max_bytes.filter(|_| p.format.supports_byte_target());
     (pipeline, p.format, p.quality, max_bytes)
