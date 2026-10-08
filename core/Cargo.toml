@@ -238,8 +238,6 @@ avif = ["image/avif"]
 # has always produced RGBA8 whatever the source buffer type was. The flag
 # therefore removes code this build can never call, and nothing else.
 simd = ["dep:fast_image_resize", "fast_image_resize/only_u8x4"]
-# deliberately undeclared in the matrix, for the self-test demo
-thumbnailer = []
 
 [dependencies.fast_image_resize]
 # SIMD convolution resampler. Chosen over `libvips` deliberately: libvips is a

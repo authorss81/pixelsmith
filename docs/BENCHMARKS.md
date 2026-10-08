@@ -369,6 +369,14 @@ how this section came to carry two machines for one table.
 | 800 px to 4000 px upscale | Lanczos3 | 800×600 → 4000×3000 | 504.8 ms | 40.5 ms | **12.45×** | 1 | 0.03 |
 | 24 MP to 1920 wide | Gaussian | 6000×4000 → 1920×1280 | 721.8 ms | 80.3 ms | **8.99×** | 1 | 0.01 |
 
+This table reproduced on a further run of the same binary on the same machine: the
+five reference times came back at 724.1, 612.5, 88.9, 503.3 and 721.9 ms — within
+a millisecond or two of the row above — with `maxdiff` 1 and the same means on
+every row. The SIMD column ran 3–7% slower that day on a shared runner, which puts
+the speedups at 8.25×, 6.93×, 2.60×, 12.03× and 8.41×; that is the runner's noise
+rather than a third machine, and it is the same caveat the first table states about
+its own third significant figure.
+
 **What reproduces, and what does not.** The correctness claim reproduces exactly:
 `maxdiff` is 1 on every row on both machines, with means of 0.01 to 0.04 of 255 —
 the two kernels are the same picture to within rounding, and that is a property of

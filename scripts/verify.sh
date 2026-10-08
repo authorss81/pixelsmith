@@ -218,7 +218,7 @@ if [ -f core/Cargo.toml ]; then
   # One filter, not the whole lib suite: the suite's wall clock is
   # `presets::tests` (41 Lanczos3 resamples of a 12 MP image, about four minutes
   # in this debug profile — docs/ARCHITECTURE.md gotcha 20) and it is the same
-  # arithmetic in every configuration. `format::tests` is 24 tests and 0.6 s, and
+  # arithmetic in every configuration. `format::tests` is 23 tests and 0.6 s, and
   # it is where the capability/refusal agreement lives.
   NOTEST=$( cargo test --manifest-path core/Cargo.toml --no-default-features \
     --lib format::tests --color=never 2>&1 )
