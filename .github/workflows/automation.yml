@@ -12,11 +12,7 @@ on:
         required: false
         type: boolean
         default: true
-  schedule:
-    # Safety net. The `retrigger` job chains runs ~10s apart, so this only fires
-    # when a chain was broken. GitHub throttles scheduled workflows on public
-    # repos, which is exactly why the self-retrigger exists.
-    - cron: "*/20 * * * *"
+
   repository_dispatch:
     types: [px_tick]
   push:
